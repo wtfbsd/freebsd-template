@@ -6,6 +6,7 @@
 # together with overlay/base/packages.list.
 
 xorg
+xf86-input-libinput
 xfce
 lightdm
 lightdm-gtk-greeter

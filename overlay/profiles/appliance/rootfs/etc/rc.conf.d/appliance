@@ -1,7 +1,0 @@
-# rc.conf.d/appliance — services for the headless appliance profile.
-#
-# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
-#
-# SSH: no password logins; install your own keys (see 50-appliance.conf).
-
-sshd_enable="YES"

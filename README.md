@@ -18,12 +18,13 @@ are built with stock release(7)-style tooling:
 └── overlay/                 THE overlay: nothing here patches src/ or ports/
     ├── base/
     │   ├── src.conf         SRCCONF (WITHOUT_ knobs only, conservative)
-    │   ├── packages.list    pkg + ca_root_nss
-    │   └── rootfs/          copied over /: motd.template, rc.conf.d/examplebsd
+    │   ├── packages.list    pkg + ca_root_nss + doas
+    │   └── rootfs/          copied over /: motd.template, rc.conf.d/{hostname,ntpd,firstboot_user},
+    │                        rc.d/firstboot_user, usr/local/sbin/@SLUG@-install
     └── profiles/
         ├── appliance/       headless: packages.list (empty-ish), loader.conf.d,
-        │                    rc.conf.d/appliance, sshd_config.d
-        └── desktop/         X11 only: packages.list, branding.conf, rc.conf.d,
+        │                    rc.conf.d/sshd, sshd_config.d
+        └── desktop/         X11 only: packages.list, branding.conf, rc.conf.d/{dbus,lightdm},
                            lightdm configs under rootfs/usr/local/etc
 ```
 
@@ -35,11 +36,21 @@ are built with stock release(7)-style tooling:
 - Overlay `rootfs` files are copied base-first, then the profile on top.
 - `@DISTRO_NAME@`, `@MOTD@`, `@SLUG@` and `@BRAND_URL@` placeholders in the copied overlay
   files are substituted by `build.sh` from `product.conf`.
+- Files staged with a literal `@SLUG@` in their **name** (e.g.
+  `usr/local/sbin/@SLUG@-install`) are renamed by `build.sh` to the slug.
+- `rc.conf.d` fragments are named **after their service**
+  (`rc.conf.d/sshd`, `.../dbus`, ...): rc(8) `load_rc_config` only reads
+  `/etc/rc.conf.d/<service-name>`, so a fragment named
+  `rc.conf.d/<distro>` or `<profile>` would never be read.
 - `overlay/base/rootfs/etc/motd.template` also becomes the live `/etc/motd`;
   `rc.d/motd` keeps using the template on every boot.
+- `build.sh` touches a `/firstboot` sentinel in the staged image
+  (KEYWORD firstboot scripts only run while it exists); the ISO-only
+  install-image/motd additions are undone again after the ISO is built.
 - The stock `distribution` step leaves root with an empty password;
-  `build.sh` locks root in the staged image. Provision a user or SSH key
-  at first boot (first-boot user creation is not in this template yet).
+  `build.sh` locks root in the staged image and creates the
+  `/firstboot` sentinel. Provision a user or SSH key at first boot
+  (see **First-boot user + install to disk** below).
 - Any `rm -rf` in `build.sh` is guarded: only paths validated non-empty and
   under `OUT` may be removed. Edits such as the `/etc/ttys` change below are
   applied to the STAGED copy only — the upstream tree is never touched.
@@ -56,7 +67,59 @@ mention at all. Keep it that way.
 | profile      | what it builds |
 |--------------|----------------|
 | `appliance`  | headless: serial console (`console="comconsole"`, 115200), sshd with `PermitRootLogin no` / `PasswordAuthentication no`, no extra packages. `build.sh` additionally flips `ttyu0` in the staged `/etc/ttys` from `onifconsole` to `on` (staged copy only) so the serial getty is always up. |
-| `desktop`    | X11 only, **no Wayland anywhere**: Xorg + Xfce + LightDM (`greeter-session=lightdm-gtk-greeter`, `user-session=xfce`), dbus. Greeter branding hooks point at `/usr/local/share/@SLUG@/artwork/...` — see `overlay/profiles/desktop/branding.conf` for the artwork-template contract (palette `PRIMARY ACCENT DARK DARK2 LIGHT MUTED` from wtfbsd/artwork-template `palette.env`, six hex digits, no `#`; install prefix `/usr/local/share/<slug>/artwork/{logo,wallpapers,loader,lightdm}`). **No art files live in this repo.** |
+| `desktop`    | X11 only, **no Wayland anywhere**: Xorg + Xfce + LightDM (`greeter-session=lightdm-gtk-greeter`, `user-session=xfce`), dbus; libinput pointer input (`xf86-input-libinput`). Greeter branding hooks point at `/usr/local/share/@SLUG@/artwork/...` — see `overlay/profiles/desktop/branding.conf` for the artwork-template contract (palette `PRIMARY ACCENT DARK DARK2 LIGHT MUTED` from wtfbsd/artwork-template `palette.env`, six hex digits, no `#`; install prefix `/usr/local/share/<slug>/artwork/{logo,wallpapers,loader,lightdm}`). **No art files live in this repo.** sshd is deliberately NOT auto-enabled on the desktop profile. |
+
+## First-boot user + install to disk
+
+`build.sh` locks root, so every image provisions its login account on the
+first boot via `overlay/base/rootfs/etc/rc.d/firstboot_user` (KEYWORD
+`firstboot`, runs only while the `/firstboot` sentinel exists — which
+`build.sh` touches into the stage). It **parses** (never sources)
+`/boot/firstboot-user.conf` (`KEY=value` lines):
+
+```
+USERNAME=alice        # ^[a-z_][a-z0-9_-]{0,31}$, required
+FULLNAME=Alice        # no ':' / control characters, optional (default: username)
+SSH_KEY=ssh-ed25519 AAAA... # one authorized_keys line, may repeat (required)
+PASSWORD_HASH=$6$...  # crypt(3), $6$ or $2b$ only, optional ($6$|$2b$)
+WHEEL=yes             # yes|no, default yes
+```
+
+The config is validated line by line, the user is created with
+`pw useradd -n USER -c FULLNAME -m -s /bin/sh [-G wheel]`, a given hash is
+fed to `pw usermod -n USER -H 0` over stdin (a locked account cannot ssh,
+so without a hash the password stays `*` — key login works — and `pw lock`
+is never used), keys are installed as `~USER/.ssh/authorized_keys`
+(0700 dir / 0600 file, user-owned), and the conf is renamed to
+`/boot/firstboot-user.conf.done` (chmod 600 — it may contain a hash).
+When `doas` is installed but `/usr/local/etc/doas.conf` is absent, the
+script notes it and deliberately does nothing extra: doas.conf is
+operator territory. Without a conf file the console gets instructions
+(root is locked).
+
+For CI/test images, `build.sh` bakes the same conf in:
+
+```sh
+./build.sh -c product.conf -u ciuser -k ./id_ed25519.pub   # both options together
+```
+
+For real installs, boot the ISO (it carries the raw image as
+`/usr/local/share/<slug>/install/system.img.xz` (xz-compressed; ISO9660 cannot hold files over 4 GiB), added just before the ISO is
+packed and removed again afterwards). Root is locked, so the ISO starts the
+installer on the console by itself (an ISO-only `/etc/rc.local`, like stock
+FreeBSD install media); it can also be run by hand:
+
+```
+<slug>-install [-d disk] [-u user] [-k pubkeyfile] [-p] [-y]
+```
+
+It lists disks from `kern.disks` (menu via `bsddialog` when available),
+refuses the disk holding the running root, confirms unless `-y`, dd's the
+image, recovers/resizes the partition table, grows UFS with `growfs -y`
+or the ZFS pool with `zpool online -e`, writes the same first-boot conf
+(keys prompted or from `-k`, password hashed via `openssl passwd -6`
+with echoing turned off via `stty`), then unmounts/exports and asks you
+to remove the media and reboot.
 
 ## Building
 
@@ -70,6 +133,7 @@ Needs `product.conf` produced by wtfbsd/agents `scripts/apply-answers.sh`
 ./build.sh -c product.conf -n                 # dry run: print the plan
 ./build.sh -c product.conf                    # PROFILE from product.conf
 ./build.sh -c product.conf -p both            # appliance + desktop
+./build.sh -c product.conf -u ci -k ./ci.pub  # bake a CI first-boot user
 ```
 
 Knobs: `KERNCONF` (default `GENERIC`), `ROOTSIZE` (default `12G`), `PKG_ABI`
@@ -77,7 +141,9 @@ Knobs: `KERNCONF` (default `GENERIC`), `ROOTSIZE` (default `12G`), `PKG_ABI`
 VM of the matching arch).
 
 Artifacts land as `out/<profile>/<slug>-<profile>-<arch>.{img,iso}` plus
-`out/SHA256` (`sha256 -r`).
+`out/SHA256` (`sha256 -r`). The ISO additionally carries the raw image as
+`/usr/local/share/<slug>/install/system.img.xz` (xz-compressed; ISO9660 cannot hold files over 4 GiB) (ISO only) with a matching
+`/etc/motd` hint line: run `<slug>-install` as root to install to disk.
 
 ## Bhyve build VM example (FreeBSD host)
 
@@ -114,6 +180,7 @@ vm install test-1 out/appliance/examplebsd-appliance-amd64.iso
 vm console test-1
 ```
 
-The ISO boots the built system directly (installer media comes from
-wtfbsd/installer-template). The appliance profile boots to a serial console (attach with `vm console`).
+The ISO boots the built system directly (or run `<slug>-install` as root
+to install it to disk — see **First-boot user + install to disk**). The
+appliance profile boots to a serial console (attach with `vm console`).
 The desktop profile boots to the LightDM greeter on X11.

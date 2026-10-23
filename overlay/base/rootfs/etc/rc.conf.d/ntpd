@@ -1,0 +1,8 @@
+# rc.conf.d/ntpd — base rc.conf.d fragment, named after the service.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# rc(8) load_rc_config only reads /etc/rc.conf.d/<service-name>; a generic
+# fragment named after the distro would never be read.
+ntpd_enable="YES"
+ntpd_sync_on_start="YES"

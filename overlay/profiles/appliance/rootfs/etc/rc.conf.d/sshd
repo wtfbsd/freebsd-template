@@ -1,0 +1,8 @@
+# rc.conf.d/sshd — services for the headless appliance profile.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# rc(8) load_rc_config only reads /etc/rc.conf.d/<service-name>, so this
+# fragment is named after the sshd rc script (the old generic "appliance"
+# fragment was never read). SSH: no password logins (see sshd_config.d).
+sshd_enable="YES"

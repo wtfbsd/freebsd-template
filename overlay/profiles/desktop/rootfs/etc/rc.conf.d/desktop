@@ -1,6 +1,0 @@
-# rc.conf.d/desktop — services for the desktop profile (X11 only).
-#
-# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
-
-dbus_enable="YES"
-lightdm_enable="YES"

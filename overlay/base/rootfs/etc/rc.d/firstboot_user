@@ -1,0 +1,221 @@
+#!/bin/sh
+#
+# firstboot_user — provision the operator user + SSH keys on the first boot.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# build.sh locks root in the image (the stock distribution leaves it with
+# an EMPTY password), so login happens through an operator-provisioned
+# account with SSH keys. rc(8) runs scripts carrying the "firstboot"
+# KEYWORD only while /firstboot exists and removes the sentinel after
+# processing — the sentinel is what build.sh touches into the stage.
+#
+# /boot/firstboot-user.conf (path overridable via the firstboot_user_conf
+# rc variable) is read as KEY=value lines, parsed one line at a time and
+# NEVER sourced: the file is operator data and may contain a crypt(3)
+# password hash.
+#
+#   USERNAME=alice        ^[a-z_][a-z0-9_-]{0,31}$           (required)
+#   FULLNAME=Alice        no ':' and no control characters   (optional)
+#   SSH_KEY=ssh-...       one authorized_keys line, repeatable
+#   PASSWORD_HASH=$6$...  crypt(3) starting with $6$ or $2b$ (optional)
+#   WHEEL=yes|no          default yes
+#
+# With a PASSWORD_HASH the hash is fed to pw(8) over stdin; without one
+# the password stays '*' (the pw useradd default) so SSH key login works.
+# pw lock is WRONG here: a locked account cannot ssh at all.
+#
+# doas: WHEEL=yes puts the user in wheel; the overlay ships
+# /usr/local/etc/doas.conf with "permit persist :wheel".
+#
+# On success the conf is renamed to <conf>.done and chmod 600 (it may
+# contain a password hash).
+
+# PROVIDE: firstboot_user
+# REQUIRE: FILESYSTEMS NETWORKING
+# BEFORE: LOGIN
+# KEYWORD: firstboot nojail
+
+. /etc/rc.subr
+
+name=firstboot_user
+rcvar=firstboot_user_enable
+
+: ${firstboot_user_enable:="YES"}
+: ${firstboot_user_conf:="/boot/firstboot-user.conf"}
+load_rc_config "$name"
+
+note() { # note <msg> — to the console and to syslog
+	echo "firstboot_user: $*"
+	logger -t firstboot_user "$*"
+}
+
+firstboot_user_start() {
+	local _conf=$firstboot_user_conf
+	local _k _l _v _user _full _keys _nkeys _hash _wheel _home _n
+	if [ ! -f "$_conf" ]; then
+		echo 'firstboot_user: no first-boot user was provisioned.'
+		echo '  root is locked. To get a login account, do ONE of:'
+		echo '    * write the first-boot config /boot/firstboot-user.conf with'
+		echo '      USERNAME=<name> and SSH_KEY=<an authorized_keys line>, then reboot'
+		echo '    * boot the install ISO and run the on-disk install utility as root'
+		echo '    * rebuild the image with: build.sh -u USER -k PUBKEYFILE'
+		return 0
+	fi
+
+	# pass 1: parse + validate EVERYTHING before touching the system
+	_user=''
+	_full=''
+	_keys=''
+	_nkeys=0
+	_hash=''
+	_wheel='yes'
+	while IFS= read -r _l || [ -n "$_l" ]; do
+		case $_l in
+		'' | '#'*) continue ;;
+		[A-Z_]*=*) ;;
+		*)
+			note "not a KEY=value line: $_l"
+			return 1
+			;;
+		esac
+		_k=${_l%%=*}
+		_v=${_l#*=}
+		case $_k in
+		USERNAME)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'; then
+				note 'USERNAME must match ^[a-z_][a-z0-9_-]{0,31}$'
+				return 1
+			fi
+			_user=$_v
+			;;
+		FULLNAME)
+			case $_v in
+			*:*)
+				note 'FULLNAME may not contain ":"'
+				return 1
+				;;
+			esac
+			if [ -n "$(printf '%s' "$_v" | grep -E '[[:cntrl:]]')" ]; then
+				note 'FULLNAME may not contain control characters'
+				return 1
+			fi
+			_full=$_v
+			;;
+		SSH_KEY)
+			case $_v in
+			ssh-ed25519* | ssh-rsa* | ecdsa-sha2-nistp256* | ecdsa-sha2-nistp384* | ecdsa-sha2-nistp521* | sk-ssh-ed25519@openssh.com* | sk-ecdsa-sha2-nistp256@openssh.com*) ;;
+			*)
+				note 'SSH_KEY must be one authorized_keys line starting with ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256/384/521 or an sk-*@openssh.com type'
+				return 1
+				;;
+			esac
+			_keys="$_keys
+$_v"
+			_nkeys=$((_nkeys + 1))
+			;;
+		PASSWORD_HASH)
+			case $_v in
+			'$6$'* | '$2b$'*) ;;
+			*)
+				note 'PASSWORD_HASH must be a crypt(3) string starting with $6$ or $2b$'
+				return 1
+				;;
+			esac
+			_hash=$_v
+			;;
+		WHEEL)
+			case $_v in
+			yes | no) ;;
+			*)
+				note "WHEEL must be yes or no (got: $_v)"
+				return 1
+				;;
+			esac
+			_wheel=$_v
+			;;
+		*)
+			note "unknown key in $_conf: $_k"
+			return 1
+			;;
+		esac
+	done < "$_conf"
+
+	if [ -z "$_user" ]; then
+		note 'USERNAME is missing'
+		return 1
+	fi
+	if [ "$_nkeys" -lt 1 ] && [ -z "$_hash" ]; then
+		note 'at least one SSH_KEY line or a PASSWORD_HASH is required'
+		return 1
+	fi
+
+	# pass 2: apply
+	if ! pw usershow -n "$_user" > /dev/null 2>&1; then
+		set -- -n "$_user" -c "${_full:-$_user}" -s /bin/sh -m
+		if [ "$_wheel" = yes ]; then
+			set -- "$@" -G wheel
+		fi
+		if ! pw useradd "$@"; then
+			note "pw useradd $_user failed"
+			return 1
+		fi
+		note "created user $_user (shell /bin/sh, wheel=$_wheel)"
+	fi
+
+	if [ -n "$_hash" ]; then
+		# pw(8) -H 0: read the encrypted password from stdin so the hash
+		# never appears in argv or in the command line
+		if printf '%s\n' "$_hash" | pw usermod -n "$_user" -H 0; then
+			note "password hash applied to $_user"
+		else
+			note "pw usermod -H 0 failed for $_user"
+			return 1
+		fi
+	else
+		# no hash: the password stays '*' — key login works, and the
+		# account is deliberately NOT pw-locked: locked accounts cannot
+		# ssh at all.
+		note "no PASSWORD_HASH: password of $_user stays '*' (key-only login)"
+	fi
+
+	# /etc/passwd is 7 fields: the home directory is field 6
+	# (the FULLNAME value is validated to never contain ':', so -F: is safe)
+	_home=$(awk -F: -v u="$_user" '$1 == u { print $6 }' /etc/passwd)
+	case $_home in
+	/*) ;;
+	*) _home="/home/$_user" ;;
+	esac
+	if ! mkdir -p "$_home/.ssh"; then
+		note "cannot create $_home/.ssh"
+		return 1
+	fi
+	if chmod 700 "$_home/.ssh" \
+		&& printf '%s\n' "${_keys#?}" > "$_home/.ssh/authorized_keys" \
+		&& chmod 600 "$_home/.ssh/authorized_keys" \
+		&& chown "$_user" "$_home/.ssh" "$_home/.ssh/authorized_keys"; then
+		note "installed $_nkeys SSH key(s) for $_user at $_home/.ssh/authorized_keys"
+	else
+		note "failed to write $_home/.ssh/authorized_keys"
+		return 1
+	fi
+
+	# key-only wheel user (no password to type): let doas accept the
+	# SSH-authenticated session, otherwise the account could never get root
+	if [ "$_wheel" = yes ] && [ -z "$_hash" ] && [ -f /usr/local/etc/doas.conf ]; then
+		printf 'permit nopass %s\n' "$_user" >> /usr/local/etc/doas.conf
+		note "doas: key-only wheel user $_user may run commands as root without a password"
+	fi
+
+	if mv "$_conf" "$_conf.done" && chmod 600 "$_conf.done"; then
+		note "first-boot provisioning complete (conf moved to $_conf.done)"
+	else
+		note "could not move $_conf out of the way (user $_user is set up)"
+		return 1
+	fi
+	return 0
+}
+
+start_cmd=firstboot_user_start
+
+run_rc_command "$1"

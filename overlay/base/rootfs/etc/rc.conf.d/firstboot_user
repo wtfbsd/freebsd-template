@@ -1,0 +1,7 @@
+# rc.conf.d/firstboot_user — enable the first-boot provisioning script.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# rc(8) load_rc_config only reads /etc/rc.conf.d/<service-name>, so this
+# fragment is named after the rc.d/firstboot_user script it configures.
+firstboot_user_enable="YES"

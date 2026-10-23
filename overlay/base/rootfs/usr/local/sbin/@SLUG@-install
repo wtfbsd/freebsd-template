@@ -1,0 +1,321 @@
+#!/bin/sh
+#
+# @SLUG@-install — copy this live system image onto a local disk.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Run as root from the live ISO. build.sh stages the raw disk image as
+# /usr/local/share/@SLUG@/install/system.img.xz and renames staged files
+# whose NAME contains @SLUG@ so this script belongs to the product.
+#
+# It dd's the raw image onto the target disk, repairs and grows the
+# partition table (gpart recover/resize), grows the root filesystem
+# (growfs for UFS, zpool online -e for ZFS), mounts the root under /mnt
+# and writes /boot/firstboot-user.conf (the format parsed by
+# etc/rc.d/firstboot_user) so the first boot of the installed system
+# provisions the user + SSH key.
+#
+# Every destructive step is guarded: the target must be a real disk,
+# must never be the disk holding the running root, and is confirmed
+# interactively unless -y is given.
+
+set -u
+
+prog=${0##*/}
+img=/usr/local/share/@SLUG@/install/system.img.xz
+
+warn() { echo "$prog: $*" >&2; }
+die() { warn "$*"; exit 1; }
+
+_rootstty=''
+usage() {
+	echo "usage: $prog [-d disk] [-u user] [-k pubkeyfile] [-p] [-y]"
+	echo ''
+	echo '  -d disk        target disk, e.g. ada0 (default: pick from a menu)'
+	echo '  -u user        user for the first-boot account (needs -k)'
+	echo '  -k pubkeyfile  ssh public keys, one authorized_keys line each'
+	echo '  -p             also prompt for an optional password'
+	echo '  -y             proceed without typing yes'
+	echo ''
+	echo "image: $img"
+	exit "${1:-0}"
+}
+
+# the same username/key checks that rc.d/firstboot_user applies
+is_username() {
+	printf '%s\n' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'
+}
+
+keyprefix() {
+	case $1 in
+	ssh-ed25519* | ssh-rsa* | ecdsa-sha2-nistp256* | ecdsa-sha2-nistp384* | ecdsa-sha2-nistp521* | sk-ssh-ed25519@openssh.com* | sk-ecdsa-sha2-nistp256@openssh.com*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+inlist() { # inlist <word> <words...> — is <word> one of the following words?
+	_w=$1
+	shift
+	for _i in "$@"; do
+		[ "$_i" = "$_w" ] && return 0
+	done
+	return 1
+}
+
+pwread() { # pwread <prompt> — read one line with echoing disabled
+	local _s
+	_s=$(stty -g) || die 'stty unavailable'
+	printf '%s' "$1" >&2
+	stty -echo || true
+	local _p
+	if ! IFS= read -r _p; then
+		_p=''
+	fi
+	stty "$_s"
+	echo '' >&2
+	printf '%s' "$_p"
+}
+
+if [ -t 0 ]; then
+	_rootstty=$(stty -g)
+fi
+trap '[ -n "$_rootstty" ] && stty "$_rootstty"' EXIT HUP INT TERM
+
+while getopts 'd:u:k:pyh' _o; do
+	case $_o in
+	d) disk=$OPTARG ;;
+	u) user=$OPTARG ;;
+	k) keyfile=$OPTARG ;;
+	p) askpw=1 ;;
+	y) assume=1 ;;
+	h) usage 0 ;;
+	*) usage 2 >&2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || die "unexpected argument: $1"
+
+[ "$(id -u)" = 0 ] || die 'must be run as root'
+[ -f "$img" ] || die "missing $img (run this from the live install image)"
+
+[ -n "${user:-}" ] || [ -z "${keyfile:-}" ] || die '-k needs -u'
+[ -n "${keyfile:-}" ] || [ -z "${user:-}" ] || die '-u needs -k (they go together)'
+: ${askpw:=0}
+: ${assume:=0}
+user=${user:-}
+keyfile=${keyfile:-}
+disk=${disk:-}
+
+if [ -n "$user" ]; then
+	is_username "$user" || die "bad username: $user (must match ^[a-z_][a-z0-9_-]{0,31}\$)"
+fi
+
+keys=''
+nkeys=0
+if [ -n "$keyfile" ]; then
+	while IFS= read -r _l || [ -n "$_l" ]; do
+		case $_l in
+		'' | '#'*) continue ;;
+		esac
+		keyprefix "$_l" || die "$keyfile: not a supported ssh public key line: $_l"
+		keys="$_l
+$keys"
+		nkeys=$((nkeys + 1))
+	done < "$keyfile"
+	[ "$nkeys" -gt 0 ] || die "no ssh public key lines in $keyfile"
+fi
+
+fullname=$user
+
+# interactive user/key/password (when -u/-k are not given)
+if [ -z "$user" ]; then
+	[ -t 0 ] || die 'no terminal: use -u USER -k PUBKEYFILE'
+	while :; do
+		printf ' Username for the new account: ' >&2
+		IFS= read -r _u || die 'aborted'
+		case ${_u:-} in
+		'') continue ;;
+		esac
+		if is_username "$_u"; then
+			user=$_u
+			fullname=$_u
+			break
+		fi
+		warn 'bad username ([a-z_][a-z0-9_-]{0,31}); try again'
+	done
+	_prev_keys=$keys
+	while :; do
+		printf ' Paste ONE ssh public key line: ' >&2
+		IFS= read -r _l || die 'aborted'
+		case ${_l:-} in
+		'') continue ;;
+		esac
+		if keyprefix "$_l"; then
+			keys="$_l
+$_prev_keys"
+			nkeys=1
+			break
+		fi
+		warn 'not a supported key type; paste ONE line starting with ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256/384/521 or an sk-*@openssh.com type'
+	done
+	askpw=1
+fi
+
+pwhash=''
+if [ "$askpw" -eq 1 ]; then
+	[ -t 0 ] || die 'a password prompt needs a terminal'
+	_p1=''
+	while :; do
+		printf ' Optional password for %s (Return to skip)\n' "$user" >&2
+		_p1=$(pwread '  password: ')
+		[ -n "$_p1" ] || break
+		_p2=$(pwread '  confirm:  ')
+		if [ "$_p1" = "$_p2" ]; then
+			pwhash=$(printf '%s\n' "$_p1" | openssl passwd -6 -stdin) || die 'openssl passwd failed'
+			break
+		fi
+		warn 'passwords do not match; please try again'
+	done
+	_p1=''
+	_p2=''
+fi
+
+# ---- target disk selection -------------------------------------------------
+
+disks=$(sysctl -n kern.disks 2>/dev/null)
+[ -n "$disks" ] || die 'cannot read kern.disks'
+_list=''
+for _d in $disks; do
+	case $_d in
+	cd* | md*) continue ;;
+	*) _list="$_list $_d" ;;
+	esac
+done
+disks=${_list# }
+[ -n "$disks" ] || die 'no disks to install to (only cd*/md* devices present)'
+
+# the disk backing the running root ("" on the live ISO); never destroyed
+_rootdev=$(mount | awk '$2 == "/" && $1 ~ /^\/dev\// { print $1 }' \
+	| sed -e 's|^/dev/||' -e 's|p[0-9][0-9]*$||' -e 's|s[0-9][0-9a-h]*$||')
+
+if [ -n "$disk" ]; then
+	case $disk in
+	/dev/*) disk=${disk#/dev/} ;;
+	esac
+	case $disk in
+	'' | *[!a-zA-Z0-9]*) die "bad disk name: $disk" ;;
+	esac
+	[ -e "/dev/$disk" ] || die "no such device: /dev/$disk"
+	inlist "$disk" $disks || die "$disk is not a known disk (kern.disks: $disks)"
+elif command -v bsddialog >/dev/null 2>&1; then
+	_menu=''
+	for _d in $disks; do
+		_menu="$_menu $_d DESTROYS-ALL-DATA"
+	done
+	while :; do
+		disk=$(bsddialog --backtitle "$prog" --title 'Target disk' \
+			--menu 'ALL data on the selected disk will be destroyed' \
+			16 64 8 $_menu 2>/dev/null) || die 'dialog cancelled'
+		disk=$(printf %s "${disk:-}" | tr -dc 'a-zA-Z0-9')
+		[ -n "$disk" ] || die 'dialog cancelled'
+		inlist "$disk" $disks && break
+		warn " unexpected dialog result: $disk"
+	done
+else
+	while :; do
+		printf 'Available disks: %s\n' "$disks" >&2
+		printf 'Disk to overwrite: ' >&2
+		IFS= read -r disk || die 'aborted'
+		case $disk in
+		/dev/*) disk=${disk#/dev/} ;;
+		esac
+		case ${disk:-} in
+		'') continue ;;
+		*[!a-zA-Z0-9]*) warn 'bad disk name'; continue ;;
+		esac
+		inlist "$disk" $disks || { warn 'not one of the available disks'; continue; }
+		break
+	done
+fi
+
+[ "$disk" != "$_rootdev" ] || die "refusing to overwrite /dev/$disk: it holds the running root"
+
+if [ "$assume" -ne 1 ]; then
+	printf 'ALL DATA ON /dev/%s WILL BE DESTROYED, type yes: ' "$disk" >&2
+	IFS= read -r _a || die 'aborted'
+	[ "${_a:-}" = yes ] || die 'cancelled'
+fi
+
+# ---- destructive steps ------------------------------------------------------
+
+ddstatus=''
+if dd if=/dev/null of=/dev/null status=progress 2>/dev/null; then
+	ddstatus=status=progress
+fi
+echo "Writing $img to /dev/$disk ..." >&2
+# set -o pipefail is not POSIX: check xz separately via a status file
+_xzst=$(mktemp -t install) || die 'mktemp failed'
+{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus || die "dd to /dev/$disk failed"
+[ ! -s "$_xzst" ] || die "xz -dc $img failed"
+rm -f "$_xzst"
+sync
+
+if ! gpart recover /dev/"$disk"; then
+	die "gpart recover /dev/$disk failed"
+fi
+lastidx=$(gpart show -p /dev/"$disk" \
+	| awk '/^=>/ { next } $1 ~ /^[0-9]+$/ { print $3 }' | tail -n 1)
+[ -n "$lastidx" ] || die 'could not determine the last partition index (gpart show)'
+gpart resize -i "$lastidx" /dev/"$disk" || die "gpart resize -i $lastidx failed"
+ptype=$(gpart show -p /dev/"$disk" \
+	| awk -v idx="$lastidx" '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 == idx { print $4 }')
+[ -n "$ptype" ] || die "could not read the type of partition $lastidx (gpart show)"
+
+mkdir -p /mnt
+ftype=''
+case $ptype in
+freebsd-ufs)
+	growfs -y "/dev/${disk}p${lastidx}" || die 'growfs failed'
+	mount "/dev/${disk}p${lastidx}" /mnt || die "mount /dev/${disk}p${lastidx} failed"
+	ftype=ufs
+	;;
+freebsd-zfs)
+	pool=$(zpool import -d "/dev/${disk}p${lastidx}" 2>/dev/null | awk '/pool:/ { print $2 }')
+	[ -n "$pool" ] || die 'zpool import: could not read the pool name'
+	zpool import -f -N -R /mnt "$pool" || die "zpool import $pool failed"
+	zpool online -e "$pool" "/dev/${disk}p${lastidx}" || die "zpool online -e $pool failed"
+	zfs mount "$pool" || die "zfs mount $pool failed"
+	ftype=zfs
+	;;
+*) die "unexpected type of partition $lastidx: $ptype" ;;
+esac
+
+# ---- first-boot user config (same format rc.d/firstboot_user parses) -------
+
+dst=/mnt/boot/firstboot-user.conf
+{
+	printf 'USERNAME=%s\n' "$user"
+	printf 'FULLNAME=%s\n' "$fullname"
+	while IFS= read -r _l || [ -n "$_l" ]; do
+		[ -n "$_l" ] || continue
+		printf 'SSH_KEY=%s\n' "$_l"
+	done <<KEYS
+$keys
+KEYS
+	if [ -n "$pwhash" ]; then
+		printf 'PASSWORD_HASH=%s\n' "$pwhash"
+	fi
+} > "$dst" || die "cannot write $dst"
+chmod 600 "$dst" || die "chmod 600 $dst failed"
+
+case $ftype in
+ufs)
+	umount /mnt || warn 'umount /mnt failed'
+	;;
+zfs)
+	zpool export "$pool" || warn "zpool export $pool failed"
+	;;
+esac
+sync
+echo 'done, remove the install media and reboot'
+exit 0

@@ -21,7 +21,7 @@
 #
 # Usage:
 #   ./build.sh -c product.conf [-s /usr/src] [-o ./out] \
-#              [-p desktop|appliance|both] [-n]
+#              [-p desktop|appliance|both] [-u USER -k PUBKEYFILE] [-n]
 #
 #   -c  product.conf (required; DISTRO_OS must be freebsd)
 #   -s  unmodified FreeBSD source tree (default /usr/src)
@@ -43,12 +43,15 @@ die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 usage() {
 	log "usage: $PROG -c product.conf [-s /usr/src] [-o ./out]"
-	log '       [-p desktop|appliance|both] [-n]'
+	log '       [-p desktop|appliance|both] [-u USER -k PUBKEYFILE] [-n]'
 	log ''
 	log '  -c  product.conf from wtfbsd/agents scripts/apply-answers.sh'
 	log '  -s  unmodified FreeBSD src tree (default /usr/src)'
 	log '  -o  output directory (default ./out)'
 	log '  -p  profile: desktop, appliance or both (default: product.conf PROFILE)'
+	log '  -u + -k  bake firstboot-user.conf (USERNAME=USER and one SSH_KEY= line'
+	log '           per line of PUBKEYFILE, mode 600) into the staged image; both'
+	log '           options are required together. Intended for CI/test images.'
 	log '  -n  dry run: print the plan, change nothing'
 	exit "${1:-2}"
 }
@@ -58,13 +61,17 @@ CONF=''
 SRC=/usr/src
 OUT=./out
 CHOSEN=''
+CIUSER=''
+CIKEY=''
 
-while getopts 'c:s:o:p:nh' _opt; do
+while getopts 'c:s:o:p:u:k:nh' _opt; do
 	case $_opt in
 	c) CONF=$OPTARG ;;
 	s) SRC=$OPTARG ;;
 	o) OUT=$OPTARG ;;
 	p) CHOSEN=$OPTARG ;;
+	u) CIUSER=$OPTARG ;;
+	k) CIKEY=$OPTARG ;;
 	n) DRY=1 ;;
 	h) usage 0 ;;
 	*) usage 2 >&2 ;;
@@ -135,6 +142,16 @@ chk() { # chk <anchored-ere> <value> <message>
 	printf '%s\n' "$2" | grep -qE -- "$1" || die "$3 (got: $2)"
 }
 
+USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
+
+keyprefix() { # keyprefix <line> — an authorized_keys key type accepted by
+	# firstboot_user and the installer (same list in both)
+	case $1 in
+	ssh-ed25519* | ssh-rsa* | ecdsa-sha2-nistp256* | ecdsa-sha2-nistp384* | ecdsa-sha2-nistp521* | sk-ssh-ed25519@openssh.com* | sk-ecdsa-sha2-nistp256@openssh.com*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
 # slug: lowercase/digits/hyphens, starts with a letter, 2..32 chars
 chk '^[a-z][a-z0-9-]*$' "${DISTRO_SLUG:-}" 'DISTRO_SLUG must match ^[a-z][a-z0-9-]*$'
 [ "$(printf %s "$DISTRO_SLUG" | wc -c)" -ge 2 ] || die 'DISTRO_SLUG too short (min 2)'
@@ -178,6 +195,25 @@ INSTALLER=${INSTALLER:-tui}
 MOTD=${MOTD:-built from the wtfbsd templates}
 case $MOTD in *[[:cntrl:]]*) die 'MOTD contains control characters' ;; esac
 [ "$(printf %s "$MOTD" | wc -c)" -le 120 ] || die 'MOTD too long (max 120)'
+
+# optional -u/-k: bake a firstboot-user.conf (mode 600) into the staged
+# image with USERNAME=USER and one SSH_KEY= line per line of PUBKEYFILE.
+# Validation is identical to rc.d/firstboot_user, in the dry run too.
+if [ -n "${CIUSER:-}" ] || [ -n "${CIKEY:-}" ]; then
+	[ -n "$CIUSER" ] && [ -n "$CIKEY" ] || die 'build.sh: -u USER and -k PUBKEYFILE must be given together'
+	chk "$USER_RE" "$CIUSER" 'build.sh: -u: bad username'
+	[ -f "$CIKEY" ] || die "build.sh: no such pubkey file: $CIKEY"
+	_nkeys=0
+	while IFS= read -r _kl || [ -n "$_kl" ]; do
+		case $_kl in
+		'' | '#'*) continue ;;
+		esac
+		keyprefix "$_kl" || die "build.sh: $CIKEY: not a supported ssh public key line: $_kl"
+		_nkeys=$((_nkeys + 1))
+	done < "$CIKEY"
+	[ "$_nkeys" -gt 0 ] || die "build.sh: no ssh public key lines in $CIKEY"
+	log "note: baking firstboot-user.conf (user $CIUSER, keys from $CIKEY)"
+fi
 
 # --------------------------------------------------------------------------
 # static checks
@@ -336,6 +372,7 @@ for p in $profiles; do
 		printf '    + cp -Rp %s/rootfs/. %s/\n' "$ROOT/overlay/base" "$STAGE"
 		printf '    + cp -Rp %s/rootfs/. %s/\n' "$ROOT/overlay/profiles/$p" "$STAGE"
 		printf '    + sed -f %s (every staged overlay file: @DISTRO_NAME@ @MOTD@ @SLUG@ @BRAND_URL@)\n' "$OUT/.subst.sed"
+		printf '    + rename staged files/dirs whose NAME contains @SLUG@ -> %s\n' "$DISTRO_SLUG"
 		printf '    + cp %s/etc/motd.template -> %s/etc/motd\n' "$STAGE" "$STAGE"
 	else
 		mk_subst
@@ -343,15 +380,74 @@ for p in $profiles; do
 		cp -Rp "$ROOT/overlay/profiles/$p/rootfs/." "$STAGE/"
 		subst_overlay "$STAGE" "$ROOT/overlay/base/rootfs"
 		subst_overlay "$STAGE" "$ROOT/overlay/profiles/$p/rootfs"
+		# staged files whose NAME contains @SLUG@ (e.g.
+		# usr/local/sbin/@SLUG@-install) belong to the product: rename
+		# them to the slug (content placeholders were substituted above,
+		# which is why the rename comes after subst_overlay)
+		_slugs=$(find "$STAGE" -depth -name '*@SLUG@*')
+		for _sf in $_slugs; do
+			_sf_new=$(printf %s "$_sf" | sed -e "s%@SLUG@%$DISTRO_SLUG%g")
+			if [ "$_sf" != "$_sf_new" ]; then
+				mv "$_sf" "$_sf_new"
+			fi
+		done
 		# motd.template stays installed (rc.d/motd reuses it each boot);
 		# also make it the live /etc/motd for the first login
 		cp "$STAGE/etc/motd.template" "$STAGE/etc/motd"
+	fi
+
+	# 3a. root filesystem wiring: the stock distribution writes no fstab
+	# and no ZFS loader knobs, so an image would not find or mount its root
+	log "  [3a] root fs wiring for $FILESYSTEM_ROOT"
+	if [ "$DRY" -eq 1 ]; then
+		case $FILESYSTEM_ROOT in
+		zfs) printf '    + boot/loader.conf.d/zfs.conf: zfs_load="YES"; etc/rc.conf.d/zfs: zfs_enable="YES"\n' ;;
+		*) printf '    + etc/fstab: /dev/ufs/%s-root / ufs rw 1 1\n' "$DISTRO_SLUG" ;;
+		esac
+	else
+		case $FILESYSTEM_ROOT in
+		zfs)
+			mkdir -p "$STAGE/boot/loader.conf.d" "$STAGE/etc/rc.conf.d"
+			printf 'zfs_load="YES"\n' > "$STAGE/boot/loader.conf.d/zfs.conf"
+			printf 'zfs_enable="YES"\n' > "$STAGE/etc/rc.conf.d/zfs"
+			;;
+		*)
+			printf '/dev/ufs/%s-root\t/\tufs\trw\t1\t1\n' "$DISTRO_SLUG" > "$STAGE/etc/fstab"
+			;;
+		esac
 	fi
 
 	# 3b. stock distribution leaves root with an EMPTY password: lock it.
 	# Login is by an operator-provisioned account / SSH key (first boot).
 	log '  [3b] lock root in the stage (pw -R ... lock root)'
 	step pw -R "$STAGE" lock root
+
+	# 3c. first-boot sentinel: rc(8) only runs KEYWORD firstboot scripts
+	# while /firstboot exists and removes it after processing.
+	log '  [3c] touch $STAGE/firstboot (first-boot sentinel)'
+	step touch "$STAGE/firstboot"
+
+	# 3d. optional -u/-k: bake a CI/test first-boot user into the image
+	if [ -n "${CIUSER:-}" ]; then
+		log "  [3d] write $STAGE/boot/firstboot-user.conf (mode 600)"
+		if [ "$DRY" -eq 1 ]; then
+			printf '    + write %s/boot/firstboot-user.conf (mode 600; USERNAME=%s, SSH_KEY lines from %s)\n' \
+				"$STAGE" "$CIUSER" "$CIKEY"
+		else
+			_ci="$STAGE/boot/firstboot-user.conf"
+			_oldumask=$(umask)
+			umask 077 # no world-readable window on a (potential) hash
+			printf 'USERNAME=%s\n' "$CIUSER" > "$_ci"
+			while IFS= read -r _kl || [ -n "$_kl" ]; do
+				case $_kl in
+				'' | '#'*) continue ;;
+				esac
+				printf 'SSH_KEY=%s\n' "$_kl" >> "$_ci"
+			done < "$CIKEY"
+			umask "$_oldumask"
+			chmod 600 "$_ci"
+		fi
+	fi
 
 	# 4. packages: base list + profile list, installed into the stage
 	log '  [4] pkg install (base + profile lists)'
@@ -445,10 +541,53 @@ for p in $profiles; do
 	fi
 	log "    -> $img"
 
+	# 6b. ISO-only: carry the raw image for the on-disk installer + a motd
+	# hint. The raw image [6] was built from the stage BEFORE system.img
+	# was copied in, so the finished .img stays as small as possible.
+	imgdir="$STAGE/usr/local/share/$DISTRO_SLUG/install"
+	log '  [6b] stage system.img + motd hint (ISO only)'
+	if [ "$DRY" -eq 1 ]; then
+		printf '    + mkdir -p %s; xz -c %s > %s/system.img.xz\n' "$imgdir" "$img" "$imgdir"
+		printf '    + append "Install to disk: run %s-install as root" to %s/etc/motd\n' "$DISTRO_SLUG" "$STAGE"
+		printf '    + write %s/etc/rc.local (ISO only: run the installer on the console)\n' "$STAGE"
+		printf '    + (after the ISO) rm -rf %s; rm etc/rc.local; restore /etc/motd\n' "$imgdir"
+	else
+		mkdir -p "$imgdir"
+		# xz: ISO9660 cannot hold a file over 4 GiB and the raw image is
+		# mostly zeroes; the installer streams it back with xz -dc
+		xz -T0 -c "$img" > "$imgdir/system.img.xz"
+		cp "$STAGE/etc/motd" "$PSUB/.motd.iso"
+		printf 'Install to disk: run %s-install as root.\n' "$DISTRO_SLUG" >> "$STAGE/etc/motd"
+		# root is locked, so the live ISO starts the installer itself on
+		# the console (like stock FreeBSD install media); ISO only
+		cat > "$STAGE/etc/rc.local" <<RCLOCAL
+#!/bin/sh
+# ISO only (written by build.sh [6b]): run the installer on the console.
+exec < /dev/console > /dev/console 2>&1
+while :; do
+	/usr/local/sbin/$DISTRO_SLUG-install
+	printf '\n[i]nstall again, [s]hell, [r]eboot, [p]oweroff? '
+	read -r _a || _a=r
+	case \$_a in
+	s) /bin/sh ;;
+	r) shutdown -r now; exit 0 ;;
+	p) shutdown -p now; exit 0 ;;
+	esac
+done
+RCLOCAL
+	fi
+
 	# 7. ISO with the stock release script
 	log "  [7] ISO via stock src/release/$KARC/mkisoimages.sh" # KARC = machine name = release/ subdir
 	step sh "$SRC/release/$KARC/mkisoimages.sh" -b "$VOL" "$iso" "$STAGE"
 	log "    -> $iso"
+	if [ "$DRY" -ne 1 ]; then
+		# the install image lives on the ISO only; the raw image was
+		# already written without it (and the motd hint is ISO-only)
+		rmrf "$imgdir" "$OUT"
+		rm -f "$STAGE/etc/rc.local"
+		mv "$PSUB/.motd.iso" "$STAGE/etc/motd"
+	fi
 
 	log "profile done: $p (kernel $KERNCONF, root $FILESYSTEM_ROOT)"
 done
