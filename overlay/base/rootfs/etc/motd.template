@@ -1,0 +1,11 @@
+@DISTRO_NAME@ — an overlay distribution on unmodified FreeBSD base.
+
+@MOTD@
+
+  * Built with stock release(7) tooling: no patched src/, no patched ports/.
+  * Third-party software comes from pkg(8); the base system is the real thing.
+
+  Docs:    @BRAND_URL@
+
+  Try:  pkg update          # sync the package catalogue
+        pkg search <name>   # find more software

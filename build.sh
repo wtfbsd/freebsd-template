@@ -1,0 +1,479 @@
+#!/bin/sh
+#
+# build.sh — build ExampleBSD-style images from an UNMODIFIED FreeBSD tree.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# OVERLAY RULE: src/ and ports/ are never patched. This script applies
+# overlay/base and overlay/profiles/<profile> on top of stock FreeBSD and
+# drives stock release(7)-style tooling:
+#
+#   make SRCCONF=overlay/base/src.conf buildworld buildkernel
+#   make DESTDIR=<stage> installworld installkernel distribution
+#   copy overlay rootfs over the stage; substitute @DISTRO_NAME@ @MOTD@ @SLUG@
+#   pkg -r <stage> install -y   (the packages.list files)
+#   makefs / mkimg             -> raw disk image (makefs -t zfs for ZFS roots)
+#   sh src/release/<arch>/mkisoimages.sh -b  -> bootable ISO (-b = bootable)
+#   sha256 -r                  -> out/SHA256
+#
+# product.conf is flat KEY=value output (parsed, never sourced) of wtfbsd/agents
+# scripts/apply-answers.sh; the key list lives in wtfbsd/agents questions.yaml.
+#
+# Usage:
+#   ./build.sh -c product.conf [-s /usr/src] [-o ./out] \
+#              [-p desktop|appliance|both] [-n]
+#
+#   -c  product.conf (required; DISTRO_OS must be freebsd)
+#   -s  unmodified FreeBSD source tree (default /usr/src)
+#   -o  output directory (default ./out)
+#   -p  profile(s) to build; overrides PROFILE from product.conf
+#   -n  dry run: validate config, print the plan, change nothing
+#
+# Environment knobs:
+#   KERNCONF   kernel to build/install (default GENERIC)
+#   ROOTSIZE   root filesystem size in the raw image (default 12G)
+#   PKG_ABI    override package ABI for cross-arch pkg installs,
+#              e.g. FreeBSD:15:aarch64 (same-arch builds ignore it)
+
+set -eu
+
+PROG=$(basename -- "$0")
+log() { printf '%s\n' "$*"; }
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() {
+	log "usage: $PROG -c product.conf [-s /usr/src] [-o ./out]"
+	log '       [-p desktop|appliance|both] [-n]'
+	log ''
+	log '  -c  product.conf from wtfbsd/agents scripts/apply-answers.sh'
+	log '  -s  unmodified FreeBSD src tree (default /usr/src)'
+	log '  -o  output directory (default ./out)'
+	log '  -p  profile: desktop, appliance or both (default: product.conf PROFILE)'
+	log '  -n  dry run: print the plan, change nothing'
+	exit "${1:-2}"
+}
+
+DRY=0
+CONF=''
+SRC=/usr/src
+OUT=./out
+CHOSEN=''
+
+while getopts 'c:s:o:p:nh' _opt; do
+	case $_opt in
+	c) CONF=$OPTARG ;;
+	s) SRC=$OPTARG ;;
+	o) OUT=$OPTARG ;;
+	p) CHOSEN=$OPTARG ;;
+	n) DRY=1 ;;
+	h) usage 0 ;;
+	*) usage 2 >&2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || usage 2 >&2
+[ -n "$CONF" ] || { log "$PROG: missing -c product.conf" >&2; usage 2 >&2; }
+case $OUT in *[[:space:]]*) die "-o: output path may not contain whitespace: $OUT" ;; esac
+[ -f "$CONF" ] || die "no such product.conf: $CONF"
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# --------------------------------------------------------------------------
+# load + validate product.conf (flat shell KEY=value from apply-answers.sh)
+# --------------------------------------------------------------------------
+
+# product.conf is NEVER sourced: it is parsed line by line, only the known
+# questions.yaml keys are accepted, and values may not contain shell
+# metacharacters. One pair of outer double quotes is stripped.
+KNOWN_KEYS='DISTRO_OS DISTRO_NAME DISTRO_SLUG DISTRO_ARCH FILESYSTEM_ROOT
+ZFS_DATA_POOL ZFS_POOL_NAME PROFILE PACKAGE_SET INSTALLER MOTD BRAND_COLOR
+BRAND_URL CI_ENABLED PUBLISH_METHOD PUBLISH_TARGET PUBLISHER_ORG'
+for _k in $KNOWN_KEYS; do unset "$_k"; done
+while IFS= read -r _line || [ -n "$_line" ]; do
+	case $_line in '' | '#'*) continue ;; esac
+	case $_line in
+	[A-Z]*=*) ;;
+	*) die "product.conf: not a KEY=value line: $_line" ;;
+	esac
+	_k=${_line%%=*}
+	_v=${_line#*=}
+	case " $(printf %s "$KNOWN_KEYS" | tr '\n' ' ') " in
+	*" $_k "*) ;;
+	*) die "product.conf: unknown key: $_k (known: $(printf %s "$KNOWN_KEYS" | tr '\n' ' '); see wtfbsd/agents questions.yaml)" ;;
+	esac
+	case $_v in \"*\") _v=${_v#\"}; _v=${_v%\"} ;; esac
+	case $_v in
+	*[\$\`\\\"]* | *[[:cntrl:]]*) die "product.conf: $_k contains a forbidden character (\$, backquote, backslash, double quote or control character)" ;;
+	esac
+	# plain assignments, no eval: the value is pure data
+	case $_k in
+	DISTRO_OS) DISTRO_OS=$_v ;;
+	DISTRO_NAME) DISTRO_NAME=$_v ;;
+	DISTRO_SLUG) DISTRO_SLUG=$_v ;;
+	DISTRO_ARCH) DISTRO_ARCH=$_v ;;
+	FILESYSTEM_ROOT) FILESYSTEM_ROOT=$_v ;;
+	ZFS_DATA_POOL) ZFS_DATA_POOL=$_v ;;
+	ZFS_POOL_NAME) ZFS_POOL_NAME=$_v ;;
+	PROFILE) PROFILE=$_v ;;
+	PACKAGE_SET) PACKAGE_SET=$_v ;;
+	INSTALLER) INSTALLER=$_v ;;
+	MOTD) MOTD=$_v ;;
+	BRAND_COLOR) BRAND_COLOR=$_v ;;
+	BRAND_URL) BRAND_URL=$_v ;;
+	CI_ENABLED) CI_ENABLED=$_v ;;
+	PUBLISH_METHOD) PUBLISH_METHOD=$_v ;;
+	PUBLISH_TARGET) PUBLISH_TARGET=$_v ;;
+	PUBLISHER_ORG) PUBLISHER_ORG=$_v ;;
+	esac
+done < "$CONF"
+
+[ "${DISTRO_OS:-}" = freebsd ] \
+	|| die "DISTRO_OS must be freebsd (got ${DISTRO_OS:-<empty>}); this template builds FreeBSD only"
+
+# anchored checks without interval expressions (portable ERE)
+chk() { # chk <anchored-ere> <value> <message>
+	printf '%s\n' "$2" | grep -qE -- "$1" || die "$3 (got: $2)"
+}
+
+# slug: lowercase/digits/hyphens, starts with a letter, 2..32 chars
+chk '^[a-z][a-z0-9-]*$' "${DISTRO_SLUG:-}" 'DISTRO_SLUG must match ^[a-z][a-z0-9-]*$'
+[ "$(printf %s "$DISTRO_SLUG" | wc -c)" -ge 2 ] || die 'DISTRO_SLUG too short (min 2)'
+[ "$(printf %s "$DISTRO_SLUG" | wc -c)" -le 32 ] || die 'DISTRO_SLUG too long (max 32)'
+
+case ${DISTRO_NAME:-} in *[[:cntrl:]]*) die 'DISTRO_NAME contains control characters' ;; esac
+[ -n "${DISTRO_NAME:-}" ] || die 'DISTRO_NAME is empty'
+[ "$(printf %s "$DISTRO_NAME" | wc -c)" -le 64 ] || die 'DISTRO_NAME too long (max 64)'
+
+FILESYSTEM_ROOT=${FILESYSTEM_ROOT:-zfs}
+case $FILESYSTEM_ROOT in
+ufs | zfs) ;;
+*) die "FILESYSTEM_ROOT must be ufs or zfs for freebsd (got: $FILESYSTEM_ROOT)" ;;
+esac
+
+ZDP=${ZFS_DATA_POOL:-no}
+case $ZDP in
+yes | no) ;;
+*) die "ZFS_DATA_POOL must be yes or no (got: $ZDP)" ;;
+esac
+[ "$ZDP" = no ] || {
+	[ -n "${ZFS_POOL_NAME:-}" ] || die 'ZFS_DATA_POOL=yes requires ZFS_POOL_NAME'
+	chk '^[a-z][a-z0-9-]*$' "$ZFS_POOL_NAME" 'ZFS_POOL_NAME must match ^[a-z][a-z0-9-]*$'
+	[ "$(printf %s "$ZFS_POOL_NAME" | wc -c)" -le 29 ] || die 'ZFS_POOL_NAME too long (max 29)'
+}
+
+chk '^[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$' \
+	"${BRAND_COLOR:-3b6ea5}" 'BRAND_COLOR must be six hex digits'
+BRAND_URL=${BRAND_URL:-https://example.org}
+chk '^https://[A-Za-z0-9.-]+$' "$BRAND_URL" 'BRAND_URL must be https, hostname only'
+
+PROF=${CHOSEN:-${PROFILE:-appliance}}
+case $PROF in
+desktop | appliance | both) ;;
+*) die "-p must be desktop, appliance or both (got: $PROF)" ;;
+esac
+
+# informational defaults mirroring questions.yaml (used downstream)
+PACKAGE_SET=${PACKAGE_SET:-minimal}
+INSTALLER=${INSTALLER:-tui}
+MOTD=${MOTD:-built from the wtfbsd templates}
+case $MOTD in *[[:cntrl:]]*) die 'MOTD contains control characters' ;; esac
+[ "$(printf %s "$MOTD" | wc -c)" -le 120 ] || die 'MOTD too long (max 120)'
+
+# --------------------------------------------------------------------------
+# static checks
+# --------------------------------------------------------------------------
+
+# The mt76 rule: the wireless driver is never enabled, loaded or configured
+# by this template; an overlay file may not mention it at all.
+[ -d "$ROOT/overlay" ] || die "mt76 guard: missing $ROOT/overlay"
+_rc=0
+grep -rna 'mt76' "$ROOT/overlay" || _rc=$?
+case $_rc in
+1) ;; # no match: good
+0) die 'mt76 guard: an overlay file references the mt76 wireless driver; it must never be enabled or loaded by this template' ;;
+*) die "mt76 guard: could not scan $ROOT/overlay (grep exit $_rc)" ;;
+esac
+
+SRCCONF="$ROOT/overlay/base/src.conf"
+[ -f "$SRCCONF" ] || die "missing $SRCCONF"
+
+: "${DISTRO_ARCH:=amd64}" # questions.yaml per_os default
+MARC='' KARC='' BASEEFIBOOT=''
+case $DISTRO_ARCH in
+amd64) MARC=amd64; KARC=amd64; BASEEFIBOOT=BOOTX64.EFI ;;
+aarch64) MARC=aarch64; KARC=arm64; BASEEFIBOOT=BOOTAA64.EFI ;;
+*) die "DISTRO_ARCH must be amd64 or aarch64 (got: ${DISTRO_ARCH:-<empty>})" ;;
+esac
+
+if [ "$DRY" -ne 1 ]; then
+	[ "$(uname -s)" = FreeBSD ] || die 'real builds need a FreeBSD host (use -n for a dry-run plan)'
+	for t in make mkimg makefs pkg pw sha256; do
+		command -v "$t" > /dev/null 2>&1 || die "required tool missing: $t (stock on FreeBSD; pkg is bootstrapped with: pkg bootstrap)"
+	done
+	[ -d "$SRC" ] || die "no such src tree: $SRC (clone an unmodified FreeBSD src there, or pass -s <path>)"
+	[ -f "$SRC/Makefile" ] || die "$SRC does not look like a FreeBSD src tree"
+fi
+
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+KERNCONF=${KERNCONF:-GENERIC}
+ROOTSIZE=${ROOTSIZE:-12G}
+ROOT_POOL="${DISTRO_SLUG}-root" # pool name for makefs -t zfs (root fs only)
+
+# TARGET/TARGET_ARCH only for cross builds
+MAKETGT=''
+if [ "$(uname -m)" != "$KARC" ]; then
+	MAKETGT="TARGET=$KARC TARGET_ARCH=$MARC"
+	log "note: cross build $(uname -m) -> $DISTRO_ARCH (advanced; package installs need ABI care)"
+fi
+
+# cd9660 volume label: uppercase alnum/underscore, <= 32 chars
+VOL=$(printf %s "$DISTRO_NAME" | tr '[:lower:]' '[:upper:]' | tr -cs '[:upper:][:digit:]' '_' | cut -c1-32)
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+step() { # step <cmd...> — execute, or print in a dry run
+	if [ "$DRY" -eq 1 ]; then printf '    + %s\n' "$*"; else "$@"; fi
+}
+
+rmrf() { # rmrf <path> <guardroot> — rm -rf only for non-empty paths under root
+	[ -n "${1:-}" ] || die 'rmrf: empty path'
+	[ -n "${2:-}" ] || die 'rmrf: empty guard root'
+	[ "$1" != "$2" ] || die "rmrf: refusing guard root itself: $1"
+	case $1 in "$2"/*) ;; *) die "rmrf: refusing path outside $2: $1" ;; esac
+	[ -d "$1" ] || return 0
+	rm -rf -- "$1"
+}
+
+pkg_list() { # pkg_list file... — flatten lists to shell words
+	sed -e 's/[[:space:]]*#.*$//' \
+		-e 's/^[[:space:]]*//' \
+		-e 's/[[:space:]]*$//' "$@" | grep -v '^$' | tr '\n' ' '
+}
+
+sed_esc() { # escape a value for use inside a sed replacement
+	printf '%s' "$1" | sed -e 's/[\\&]/\\&/g'
+}
+
+SUBFILE=''
+mk_subst() { # write a sed program under OUT; pick a delimiter absent from values
+	SUBFILE="$OUT/.subst.sed"
+	d=''
+	for cand in '|' ',' ';' ':' '%'; do
+		case "$DISTRO_NAME$MOTD$DISTRO_SLUG$BRAND_URL" in *"$cand"*) ;; *) d=$cand; break ;; esac
+	done
+	[ -n "$d" ] || die 'DISTRO_NAME/MOTD/DISTRO_SLUG/BRAND_URL contain every candidate sed delimiter (| , ; : %); remove one of those characters in product.conf'
+	{
+		printf 's%s@DISTRO_NAME@%s%s%sg\n' "$d" "$d" "$(sed_esc "$DISTRO_NAME")" "$d"
+		printf 's%s@MOTD@%s%s%sg\n' "$d" "$d" "$(sed_esc "$MOTD")" "$d"
+		printf 's%s@SLUG@%s%s%sg\n' "$d" "$d" "$(sed_esc "$DISTRO_SLUG")" "$d"
+		printf 's%s@BRAND_URL@%s%s%sg\n' "$d" "$d" "$(sed_esc "$BRAND_URL")" "$d"
+	} > "$SUBFILE"
+}
+
+subst_overlay() { # subst_overlay <stage> <overlay-rootfs-dir>
+	_stg=$1 _ovr=$2
+	find "$_ovr" -type f | while read -r f; do
+		r=${f#"$_ovr"/}
+		t="$_stg/$r"
+		[ -f "$t" ] || continue
+		sed -f "$SUBFILE" "$t" > "$t.new" && mv "$t.new" "$t"
+	done
+}
+
+# --------------------------------------------------------------------------
+# plan header
+# --------------------------------------------------------------------------
+
+log ''
+log 'plan:'
+log "  distro   $DISTRO_NAME ($DISTRO_SLUG), freebsd/$DISTRO_ARCH"
+log "  rootfs   $FILESYSTEM_ROOT (pool: $ROOT_POOL, data pool: $ZDP${ZFS_POOL_NAME:+ ($ZFS_POOL_NAME)})"
+log "  profile  $PROF (package set: $PACKAGE_SET, installer: $INSTALLER)"
+log "  src      $SRC (unmodified; SRCCONF=$SRCCONF)"
+log "  out      $OUT  (jobs: $JOBS, kernel: $KERNCONF, rootsize: $ROOTSIZE)"
+
+case $PROF in both) profiles='appliance desktop' ;; *) profiles=$PROF ;; esac
+
+# --------------------------------------------------------------------------
+# per-profile pipeline
+# --------------------------------------------------------------------------
+
+RELS='' # relative artifact paths; safe to word-split: DISTRO_SLUG is [a-z0-9-]
+
+# world and kernel are profile-independent: build them once
+log ''
+log '==> buildworld/buildkernel (SRCCONF, -j'"$JOBS"')'
+step make -C "$SRC" -j "$JOBS" "SRCCONF=$SRCCONF" $MAKETGT "KERNCONF=$KERNCONF" buildworld
+step make -C "$SRC" -j "$JOBS" "SRCCONF=$SRCCONF" $MAKETGT "KERNCONF=$KERNCONF" buildkernel
+
+for p in $profiles; do
+	log ''
+	log "==> profile: $p"
+
+	PSUB="$OUT/$p"
+	STAGE="$PSUB/stage"
+	PARTS="$PSUB/parts"
+	img="$PSUB/$DISTRO_SLUG-$p-$DISTRO_ARCH.img"
+	iso="$PSUB/$DISTRO_SLUG-$p-$DISTRO_ARCH.iso"
+
+	[ "$DRY" -eq 1 ] || {
+		rmrf "$STAGE" "$OUT"
+		rmrf "$PARTS" "$OUT"
+		mkdir -p "$STAGE" "$PARTS"
+	}
+
+	# 2. install world/kernel/distribution into the stage
+	log "  [2] installworld/installkernel/distribution -> stage"
+	step make -C "$SRC" -j "$JOBS" "SRCCONF=$SRCCONF" $MAKETGT "KERNCONF=$KERNCONF" "DESTDIR=$STAGE" installworld
+	step make -C "$SRC" -j "$JOBS" "SRCCONF=$SRCCONF" $MAKETGT "KERNCONF=$KERNCONF" "DESTDIR=$STAGE" installkernel
+	step make -C "$SRC" "SRCCONF=$SRCCONF" $MAKETGT "DESTDIR=$STAGE" distribution
+
+	# 3. copy overlay rootfs: base first, then the profile on top
+	log '  [3] overlay copy + placeholder substitution'
+	if [ "$DRY" -eq 1 ]; then
+		printf '    + cp -Rp %s/rootfs/. %s/\n' "$ROOT/overlay/base" "$STAGE"
+		printf '    + cp -Rp %s/rootfs/. %s/\n' "$ROOT/overlay/profiles/$p" "$STAGE"
+		printf '    + sed -f %s (every staged overlay file: @DISTRO_NAME@ @MOTD@ @SLUG@ @BRAND_URL@)\n' "$OUT/.subst.sed"
+		printf '    + cp %s/etc/motd.template -> %s/etc/motd\n' "$STAGE" "$STAGE"
+	else
+		mk_subst
+		cp -Rp "$ROOT/overlay/base/rootfs/." "$STAGE/"
+		cp -Rp "$ROOT/overlay/profiles/$p/rootfs/." "$STAGE/"
+		subst_overlay "$STAGE" "$ROOT/overlay/base/rootfs"
+		subst_overlay "$STAGE" "$ROOT/overlay/profiles/$p/rootfs"
+		# motd.template stays installed (rc.d/motd reuses it each boot);
+		# also make it the live /etc/motd for the first login
+		cp "$STAGE/etc/motd.template" "$STAGE/etc/motd"
+	fi
+
+	# 3b. stock distribution leaves root with an EMPTY password: lock it.
+	# Login is by an operator-provisioned account / SSH key (first boot).
+	log '  [3b] lock root in the stage (pw -R ... lock root)'
+	step pw -R "$STAGE" lock root
+
+	# 4. packages: base list + profile list, installed into the stage
+	log '  [4] pkg install (base + profile lists)'
+	pkgs=$(pkg_list "$ROOT/overlay/base/packages.list" "$ROOT/overlay/profiles/$p/packages.list")
+	if [ -n "$pkgs" ]; then
+		# cross-arch builds: set PKG_ABI (e.g. FreeBSD:15:aarch64); the
+		# recommended path is to build on a VM of the matching arch.
+		if [ -n "${PKG_ABI:-}" ]; then
+			step env "ABI=$PKG_ABI" pkg -r "$STAGE" install -y $pkgs
+		else
+			step pkg -r "$STAGE" install -y $pkgs
+		fi
+	fi
+	rimg=${img#"$OUT"/}
+	riso=${iso#"$OUT"/}
+	RELS="$RELS $rimg $riso"
+
+	# 5. appliance: serial getty always enabled — on the STAGED copy only
+	if [ "$p" = appliance ]; then
+		log '  [5] staged /etc/ttys: ttyu0 onifconsole -> on (upstream tree untouched)'
+		ttys="$STAGE/etc/ttys"
+		if [ "$DRY" -eq 1 ]; then
+			printf '    + sed -E "s/^(ttyu0.*[[:space:]])onifconsole([[:space:]]+secure[[:space:]]*)$/\\1on\\2/" %s\n' "$ttys"
+		else
+			[ -f "$ttys" ] || die "missing staged $ttys"
+			sed -E 's/^(ttyu0.*[[:space:]])onifconsole([[:space:]]+secure[[:space:]]*)$/\1on\2/' \
+				"$ttys" > "$ttys.new"
+			mv "$ttys.new" "$ttys"
+		fi
+		# FreeBSD's stock sshd_config has no Include line; add one to the
+		# STAGED copy so overlay sshd_config.d drop-ins take effect
+		sshc="$STAGE/etc/ssh/sshd_config"
+		if [ "$DRY" -ne 1 ] && [ ! -f "$sshc" ]; then
+			die "missing staged $sshc (is OpenSSH disabled in src.conf?)"
+		fi
+		if [ "$DRY" -eq 1 ]; then
+			printf '    + append "Include /etc/ssh/sshd_config.d/*.conf" to %s\n' "$sshc"
+		elif ! grep -q '^Include /etc/ssh/sshd_config.d/' "$sshc"; then
+			printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> "$sshc"
+		fi
+	else
+		log '  [5] tty handling: vt(4) default, nothing to change'
+	fi
+
+	# 6. raw image: pmbr + boot + EFI + root partition, via makefs/mkimg
+	log '  [6] raw image (makefs/mkimg)'
+	case $FILESYSTEM_ROOT in
+	zfs)
+		img_type='freebsd-zfs'
+		img_boot="$STAGE/boot/gptzfsboot"
+		case $DRY in
+		1) printf '    + makefs -t zfs -s %s -o poolname=%s -o bootfs=%s %s %s\n' \
+			"$ROOTSIZE" "$ROOT_POOL" "$ROOT_POOL" "$PARTS/root.img" "$STAGE" ;;
+		*)
+			# ZFS root: one pool via makefs(8) zfs backend; the loader
+			# imports it automatically off bootfs at boot time.
+			makefs -t zfs -s "$ROOTSIZE" \
+				-o "poolname=$ROOT_POOL" \
+				-o "bootfs=$ROOT_POOL" \
+				"$PARTS/root.img" "$STAGE"
+			;;
+		esac
+		;;
+	*)
+		img_type='freebsd-ufs'
+		img_boot="$STAGE/boot/gptboot"
+		step makefs -t ffs -B little -s "$ROOTSIZE" \
+			-o version=2 -o "label=${DISTRO_SLUG}-root" \
+			"$PARTS/root.img" "$STAGE"
+		;;
+	esac
+	if [ "$DRY" -eq 1 ]; then
+		printf '    + cp %s/boot/loader.efi EFI/BOOT/%s; makefs -t msdos -s 100m\n' "$STAGE" "$BASEEFIBOOT"
+		printf '    + mkimg -s gpt (pmbr, freebsd-boot, efi, %s) -o %s\n' "$img_type" "$img"
+	else
+		if [ "$KARC" = amd64 ]; then
+			[ -f "$img_boot" ] || die "missing BIOS boot block $img_boot"
+			BIOSPARTS="-b $STAGE/boot/pmbr -p freebsd-boot:=$img_boot"
+		else
+			BIOSPARTS='' # arm64 boots UEFI only: no pmbr/gptboot
+		fi
+		mkdir -p "$PARTS/efi/EFI/BOOT"
+		cp "$STAGE/boot/loader.efi" "$PARTS/efi/EFI/BOOT/$BASEEFIBOOT"
+		makefs -t msdos -s 100m -o volume_label=EFISYS "$PARTS/efi.img" "$PARTS/efi"
+		# BIOSPARTS is unquoted on purpose: it is empty on arm64 and
+		# its paths come from OUT (whitespace refused above) and the slug
+		mkimg -s gpt $BIOSPARTS \
+			-p "efi:=$PARTS/efi.img" \
+			-p "$img_type:=$PARTS/root.img" \
+			-o "$img"
+	fi
+	log "    -> $img"
+
+	# 7. ISO with the stock release script
+	log "  [7] ISO via stock src/release/$KARC/mkisoimages.sh" # KARC = machine name = release/ subdir
+	step sh "$SRC/release/$KARC/mkisoimages.sh" -b "$VOL" "$iso" "$STAGE"
+	log "    -> $iso"
+
+	log "profile done: $p (kernel $KERNCONF, root $FILESYSTEM_ROOT)"
+done
+
+# --------------------------------------------------------------------------
+# checksums
+# --------------------------------------------------------------------------
+
+log ''
+log '== checksums =='
+if [ "$DRY" -eq 1 ]; then
+	printf '    + (cd %s && sha256 -r %s) > %s/SHA256\n' "$OUT" "${RELS# }" "$OUT"
+else
+	(cd "$OUT" && sha256 -r $RELS) > "$OUT/SHA256"
+	log "wrote: $OUT/SHA256"
+fi
+log 'artifacts:'
+for rel in $RELS; do
+	log "  $OUT/$rel"
+done
+
+if [ "$DRY" -eq 1 ]; then
+	log ''
+	log 'dry run: plan printed above; nothing was built'
+else
+	log ''
+	log "done: $profiles under $OUT"
+fi

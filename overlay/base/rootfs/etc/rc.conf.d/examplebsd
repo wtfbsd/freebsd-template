@@ -1,0 +1,10 @@
+# rc.conf.d/examplebsd — base system rc.conf.d fragment.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Applied on top of stock /etc/rc.conf; rc_conf reads /etc/rc.conf.d/*.
+
+# Placeholder is substituted by build.sh (slug, e.g. examplebsd).
+hostname="@SLUG@"
+ntpd_enable="YES"
+ntpd_sync_on_start="YES"

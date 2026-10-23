@@ -1,0 +1,12 @@
+# packages.list — desktop profile (X11 only, no Wayland anywhere).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Fixed set: Xorg + Xfce on X11, LightDM greeter. Installed by build.sh
+# together with overlay/base/packages.list.
+
+xorg
+xfce
+lightdm
+lightdm-gtk-greeter
+dbus

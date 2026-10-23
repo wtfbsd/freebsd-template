@@ -1,0 +1,10 @@
+# packages.list — minimal third-party bootstrap, installed by build.sh
+# with: pkg -r <stage> install -y
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# One pkg name per line; '#' starts a comment. Profiles add their own
+# packages.list on top of this one.
+
+pkg
+ca_root_nss

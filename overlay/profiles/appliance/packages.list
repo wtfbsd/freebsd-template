@@ -1,0 +1,9 @@
+# packages.list — appliance profile (headless).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Empty by design: overlay/base already installs the essentials (pkg,
+# ca_root_nss). Add one pkg name per line to grow the appliance, e.g.:
+#   curl
+#   jq
+#   python3
