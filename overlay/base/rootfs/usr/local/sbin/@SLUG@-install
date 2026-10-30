@@ -27,6 +27,14 @@ prog=${0##*/}
 img=${INSTALL_IMG:-/usr/local/share/@SLUG@/install/system.img.xz}
 mnt=${INSTALL_MNT:-/mnt}
 
+# rc(8) starts the installer with no TERM, and bsddialog then draws
+# without cursor movement and reads an arrow key as ESC (cancel): give
+# the console a terminal type when it has none
+case ${TERM:-} in
+'' | dumb | unknown) TERM=vt100 ;;
+esac
+export TERM
+
 warn() { echo "$prog: $*" >&2; }
 die() { warn "$*"; exit 1; }
 

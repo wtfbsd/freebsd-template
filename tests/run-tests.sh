@@ -2102,6 +2102,18 @@ if [ "$_nd" -eq 1 ]; then
 else
 	no "installer: the dialog is asked once (asked $_nd times)"
 fi
+# (k2b) rc(8) starts the installer without TERM: bsddialog gets one, or it
+#       reads an arrow key as ESC and cancels
+_term_saved=${TERM-}
+unset TERM
+irun noterm "$INSTDIR/mnt-noterm" -y -u ciuser -k "$work/inst.pub"
+TERM=$_term_saved
+export TERM
+if grep -q '^bsddialog-term vt100$' "$INSTDIR/noterm.log"; then
+	ok "installer: bsddialog gets a terminal type when rc(8) gave none"
+else
+	no "installer: bsddialog gets a terminal type when rc(8) gave none"
+fi
 IR_BSDDIALOG_RC=1
 irun cancel default -y -u ciuser -k "$work/inst.pub"
 IR_BSDDIALOG_RC=0

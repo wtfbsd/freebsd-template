@@ -17,6 +17,7 @@
 # that reads the screen instead of the answer must not loop for ever.
 
 printf 'bsddialog %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf 'bsddialog-term %s\n' "${TERM:-}" >> "${STUB_LOG:-/dev/null}"
 
 _n=0
 if [ -n "${STUB_LOG:-}" ] && [ -f "$STUB_LOG" ]; then
