@@ -6,7 +6,40 @@
 # together with overlay/base/packages.list.
 
 xorg
+# Every X video driver (DDX) and input driver FreeBSD ships, so X starts on
+# any GPU, VM display or input device. drm-kmod's modules (amdgpu, i915kms,
+# radeonkms) are loaded at boot by devmatch(8) from their PNP data.
+drm-kmod
+mesa-dri
+mesa-libs
+libva-intel-media-driver
+libva-intel-driver
+nvidia-driver
+nvidia-drm-kmod
+nvidia-settings
+nvidia-xconfig
+xf86-video-amdgpu
+xf86-video-ati
+xf86-video-intel
+xf86-video-nv
+xf86-video-ast
+xf86-video-mga
+xf86-video-qxl
+xf86-video-vmware
+xf86-video-vesa
+xf86-video-scfb
+xf86-video-dummy
 xf86-input-libinput
+xf86-input-evdev
+xf86-input-keyboard
+xf86-input-mouse
+xf86-input-synaptics
+xf86-input-vmmouse
+xf86-input-wacom
+xf86-input-elographics
+xf86-input-egalax
+xf86-input-joystick
+xf86-input-void
 xfce
 lightdm
 lightdm-gtk-greeter

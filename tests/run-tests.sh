@@ -2252,5 +2252,24 @@ else
 	no "build.sh: the dry run writes the fstab of a zfs root"
 fi
 
+# (k7) the desktop profile ships every X video and input driver FreeBSD
+#      has (x11-drivers/xf86-video-* and xf86-input-*), drm-kmod and the
+#      NVIDIA driver, so X starts on any GPU, VM display or input device
+_dl="$repo/overlay/profiles/desktop/packages.list"
+for _p in drm-kmod mesa-dri nvidia-driver nvidia-drm-kmod \
+	xf86-video-amdgpu xf86-video-ati xf86-video-intel xf86-video-nv \
+	xf86-video-ast xf86-video-mga xf86-video-qxl xf86-video-vmware \
+	xf86-video-vesa xf86-video-scfb xf86-video-dummy \
+	xf86-input-libinput xf86-input-evdev xf86-input-keyboard \
+	xf86-input-mouse xf86-input-synaptics xf86-input-vmmouse \
+	xf86-input-wacom xf86-input-elographics xf86-input-egalax \
+	xf86-input-joystick xf86-input-void; do
+	if sed 's/#.*//' "$_dl" | grep -qx "[[:space:]]*$_p[[:space:]]*"; then
+		ok "desktop profile ships $_p"
+	else
+		no "desktop profile ships $_p"
+	fi
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
