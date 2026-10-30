@@ -1,1 +1,15 @@
 out/
+# Round reports are per-round artifacts: they quote session material and are
+# not part of the shipped template. Keeping them out of git also keeps the
+# no_internal_refs check meaningful for every file that is tracked.
+ROUND-REPORT*.md
+# The artifacts of a CI run. The workspace of a job holds the product
+# configuration of the site, the file parameter of the pipeline, the
+# console logs of the VMs and the scratch files of the tooling. They carry
+# addresses and targets that belong to one site, they are never part of
+# the template, and the leak check reads the tree and not the debris of a
+# run.
+product.conf
+PRODUCT_CONF
+console-logs/
+.wtfbsd-*

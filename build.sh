@@ -31,7 +31,7 @@
 #
 # Environment knobs:
 #   KERNCONF   kernel to build/install (default GENERIC)
-#   ROOTSIZE   root filesystem size in the raw image (default 12G)
+#   ROOTSIZE   root filesystem size in the raw image (default 12g)
 #   PKG_ABI    override package ABI for cross-arch pkg installs,
 #              e.g. FreeBSD:15:aarch64 (same-arch builds ignore it)
 
@@ -81,6 +81,7 @@ shift $((OPTIND - 1))
 [ $# -eq 0 ] || usage 2 >&2
 [ -n "$CONF" ] || { log "$PROG: missing -c product.conf" >&2; usage 2 >&2; }
 case $OUT in *[[:space:]]*) die "-o: output path may not contain whitespace: $OUT" ;; esac
+[ -n "$OUT" ] || die '-o: output path may not be empty'
 [ -f "$CONF" ] || die "no such product.conf: $CONF"
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -91,7 +92,10 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 # product.conf is NEVER sourced: it is parsed line by line, only the known
 # questions.yaml keys are accepted, and values may not contain shell
-# metacharacters. One pair of outer double quotes is stripped.
+# metacharacters. Exactly one outer pair of quotes is stripped: single or
+# double, never a mix of the two and never a quote inside the pair.
+# apply-answers.sh writes KEY='value', so the single quotes are the normal
+# case.
 KNOWN_KEYS='DISTRO_OS DISTRO_NAME DISTRO_SLUG DISTRO_ARCH FILESYSTEM_ROOT
 ZFS_DATA_POOL ZFS_POOL_NAME PROFILE PACKAGE_SET INSTALLER MOTD BRAND_COLOR
 BRAND_URL CI_ENABLED PUBLISH_METHOD PUBLISH_TARGET PUBLISHER_ORG'
@@ -108,7 +112,29 @@ while IFS= read -r _line || [ -n "$_line" ]; do
 	*" $_k "*) ;;
 	*) die "product.conf: unknown key: $_k (known: $(printf %s "$KNOWN_KEYS" | tr '\n' ' '); see wtfbsd/agents questions.yaml)" ;;
 	esac
-	case $_v in \"*\") _v=${_v#\"}; _v=${_v%\"} ;; esac
+	case $_v in
+	\'*\')
+		_v=${_v#\'}
+		_v=${_v%\'}
+		_quoted=yes
+		;;
+	\"*\")
+		_v=${_v#\"}
+		_v=${_v%\"}
+		_quoted=yes
+		;;
+	\'*\" | \"*\')
+		die "product.conf: $_k has a mix of single and double quotes"
+		;;
+	*)
+		_quoted=no
+		;;
+	esac
+	if [ "$_quoted" = yes ]; then
+		case $_v in
+		*\'* | *\"*) die "product.conf: $_k has a quote inside its quotes" ;;
+		esac
+	fi
 	case $_v in
 	*[\$\`\\\"]* | *[[:cntrl:]]*) die "product.conf: $_k contains a forbidden character (\$, backquote, backslash, double quote or control character)" ;;
 	esac
@@ -252,8 +278,14 @@ fi
 
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
 KERNCONF=${KERNCONF:-GENERIC}
-ROOTSIZE=${ROOTSIZE:-12G}
-ROOT_POOL="${DISTRO_SLUG}-root" # pool name for makefs -t zfs (root fs only)
+# makefs(8) reads the size of the filesystem with a lowercase suffix
+# only: '12G' is an illegal number to it. The default is lowercase and a
+# value that is given in uppercase is normalised before it reaches
+# makefs(8) or mkimg(8).
+ROOTSIZE=${ROOTSIZE:-12g}
+chk '^[0-9]+[kKmMgGtT]?$' "$ROOTSIZE" 'ROOTSIZE must match ^[0-9]+[kKmMgGtT]?$ (a number with an optional k, m, g or t suffix)'
+ROOTSIZE=$(printf '%s' "$ROOTSIZE" | tr 'A-Z' 'a-z')
+ROOT_POOL="$(printf %s "$DISTRO_SLUG" | tr - _)_root" # makefs -t zfs pool name: a letter, then [A-Za-z0-9_] only (usr.sbin/makefs/zfs.c)
 
 # TARGET/TARGET_ARCH only for cross builds
 MAKETGT=''
@@ -313,10 +345,42 @@ subst_overlay() { # subst_overlay <stage> <overlay-rootfs-dir>
 	find "$_ovr" -type f | while read -r f; do
 		r=${f#"$_ovr"/}
 		t="$_stg/$r"
-		[ -f "$t" ] || continue
-		sed -f "$SUBFILE" "$t" > "$t.new" && mv "$t.new" "$t"
+		[ -f "$t" ] && [ ! -L "$t" ] || continue
+		# the result is written back INTO the file, so that it keeps its
+		# mode: a new file would get the mode of the umask, and a script
+		# would lose its exec bit
+		sed -f "$SUBFILE" "$t" > "$t.new" && cat "$t.new" > "$t" && rm -f "$t.new"
 	done
 }
+
+abspath() { # abspath <path> — the absolute form of a path, without creating it
+	case $1 in
+	/*) printf '%s\n' "$1" ;;
+	*)
+		_d=$(dirname -- "$1")
+		_b=$(basename -- "$1")
+		if [ -d "$_d" ]; then
+			printf '%s\n' "$(CDPATH='' cd -- "$_d" && pwd)/$_b"
+		else
+			case $1 in
+			./*) printf '%s\n' "$(pwd)/${1#./}" ;;
+			*) printf '%s\n' "$(pwd)/$1" ;;
+			esac
+		fi
+		;;
+	esac
+}
+
+# The output directory is made absolute before the build starts: the build
+# runs make(1) inside the source tree, where a relative DESTDIR lands in
+# the source tree instead of in the output directory. A dry run changes
+# nothing, so there the path is resolved without creating anything.
+if [ "$DRY" -eq 1 ]; then
+	OUT=$(abspath "$OUT")
+else
+	mkdir -p -- "$OUT" || die "cannot create the output directory: $OUT"
+	OUT=$(CDPATH='' cd -- "$OUT" && pwd) || die "cannot enter the output directory: $OUT"
+fi
 
 # --------------------------------------------------------------------------
 # plan header

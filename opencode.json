@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "agent": {
+    "builder": {
+      "description": "Plan and run an ExampleBSD image build with build.sh",
+      "mode": "subagent",
+      "prompt": "{file:./.opencode/agent/builder.md}"
+    },
+    "tester": {
+      "description": "Run the repository test suite and report red or green",
+      "mode": "subagent",
+      "prompt": "{file:./.opencode/agent/tester.md}"
+    }
+  }
+}

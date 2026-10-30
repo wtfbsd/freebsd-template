@@ -1,0 +1,47 @@
+FreeBSD/amd64 EFI loader, Revision 1.1
+Consoles: userboot
+Trying to mount root from ufs:/dev/ufs/rootfs [rw]...
+---<<BOOT>>---
+Copyright (c) 1992-2026 The FreeBSD Project.
+FreeBSD 15.0-RELEASE #0: Fri Jan  2 03:04:05 UTC 2026     root@build.example.org:/usr/obj/usr/src/amd64.amd64/sys/GENERIC
+
+KDB: debugger backends: ddb
+KDB: debugger backends: ddb
+gdb: no gdb support in this kernel
+gdb: no gdb support in this kernel
+---<<BOOT>>---
+
+Copyright (c) 1992-2026 The FreeBSD Project.
+FreeBSD 15.0-RELEASE #0: Fri Jan  2 03:04:05 UTC 2026     root@build.example.org:/usr/obj/usr/src/amd64.amd64/sys/GENERIC
+
+kern.geom.label.disk_ident.MAC: 0x1
+kern.random.pid.collision_bias: 2
+hostid: 0
+module kernel loaded
+FreeBSD 15.0-RELEASE #0: Fri Jan  2 03:04:05 UTC 2026
+
+real memory  = 2147483648 (2048 MB)
+rootfs mounted from ufs:/dev/ufs/rootfs [rw]
+random: unblocking device.
+Trying to mount root from ufs:/dev/ufs/rootfs [rw]...
+Mounting from ufs:/dev/ufs/rootfs [rw]...
+/dev/ufs/rootfs: ?? (null)
+lo0: link state changed to UP
+vtnet0: <VirtIO Networking Adapter> on virtio_pci0
+vtnet0: inet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255
+ vtnet0: <VirtIO Networking Adapter> on virtio_pci0
+vtnet0: host MTU 1500
+pflog: load module
+pflog: enabling logging
+lo0: link state changed to UP
+pmsiosc: ACPI Enable
+pmsiosc: attaching as ADDR: 0x41
+pmsiosc: ACPI: PM Timer
+pmsiosc: PM Config
+nvd0: 976773MB <16777216 16K sectors>
+Trying to mount root from ufs:/dev/ufs/rootfs [rw]...
+Mounting from ufs:/dev/ufs/rootfs [rw]...
+Setting up the boot scripts...
+Starting ntpd.
+Starting sshd.
+login:

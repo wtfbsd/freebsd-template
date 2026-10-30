@@ -1,0 +1,6 @@
+This file is a placeholder, not a disk image.
+
+tests/boot-test.sh only checks that the image it is given exists; the fake
+provider (tests/fixtures/fake-provider.sh) serves a canned serial console log
+instead of booting anything. The real boot test runs in CI on a FreeBSD host
+against a real image built by build.sh.
