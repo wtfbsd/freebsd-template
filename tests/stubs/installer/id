@@ -1,0 +1,12 @@
+#!/bin/sh
+# id — test stub for id(1).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and reports the user id 0: the
+# installer refuses to run as a normal user, and the test suite runs
+# without root.
+
+printf 'id %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf '0\n'
+exit 0

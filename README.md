@@ -24,6 +24,7 @@ are built with stock release(7)-style tooling:
 ├── tests/
 │   ├── run-tests.sh         the test suite (any POSIX host, no root)
 │   ├── boot-test.sh         boot an image and wait for it to be usable
+│   ├── stubs/installer/     the stub commands the installer tests run against
 │   └── fixtures/            the fake provider and the canned serial logs
 └── overlay/                 THE overlay: nothing here patches src/ or ports/
     ├── base/

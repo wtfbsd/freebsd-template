@@ -1,0 +1,11 @@
+#!/bin/sh
+# xz — test stub for xz(1).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and prints a short payload: the
+# installer pipes the decompressed image into dd(1).
+
+printf 'xz %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf 'test disk image payload\n'
+exit 0

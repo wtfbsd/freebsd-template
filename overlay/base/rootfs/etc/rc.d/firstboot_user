@@ -50,9 +50,18 @@ note() { # note <msg> — to the console and to syslog
 	logger -t firstboot_user "$*"
 }
 
+root_writable() { # root_writable — is the root filesystem writable?
+	# the live image is mounted read-only: access(2) answers EROFS
+	[ -w /etc ]
+}
+
 firstboot_user_start() {
 	local _conf=$firstboot_user_conf
 	local _k _l _v _user _full _keys _nkeys _hash _wheel _home _n
+	if ! root_writable; then
+		echo 'firstboot_user: read-only root (live media), skipped'
+		return 0
+	fi
 	if [ ! -f "$_conf" ]; then
 		echo 'firstboot_user: no first-boot user was provisioned.'
 		echo '  root is locked. To get a login account, do ONE of:'

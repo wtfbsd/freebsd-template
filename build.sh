@@ -353,6 +353,31 @@ subst_overlay() { # subst_overlay <stage> <overlay-rootfs-dir>
 	done
 }
 
+own_overlay() { # own_overlay <stage> <overlay-rootfs-dir>
+	# the overlay is copied with cp -Rp, so the owner and the modes of
+	# the checkout end up in the image: every path that came from the
+	# overlay is given to root:wheel and loses its group-write bit
+	_stg=$1 _ovr=$2
+	_lst=$(mktemp "${TMPDIR:-/tmp}/own_overlay.XXXXXX") || die 'mktemp failed'
+	find "$_ovr" -print > "$_lst" || { rm -f "$_lst"; die "find $_ovr failed"; }
+	while read -r _f; do
+		_r=${_f#"$_ovr"/}
+		[ "$_r" = "$_f" ] && continue
+		_t="$_stg/$_r"
+		# the staged name carries the slug, not the placeholder
+		_t=$(printf '%s' "$_t" | sed -e "s%@SLUG@%$DISTRO_SLUG%g")
+		[ -e "$_t" ] || [ -L "$_t" ] || continue
+		chown -h 0:0 "$_t" || { rm -f "$_lst"; die "chown 0:0 $_t failed"; }
+		# a symlink has no mode of its own: chmod would follow it out
+		# of the stage
+		if [ ! -L "$_t" ]; then
+			chmod go-w "$_t" || { rm -f "$_lst"; die "chmod go-w $_t failed"; }
+		fi
+	done < "$_lst"
+	rm -f "$_lst"
+	return 0
+}
+
 abspath() { # abspath <path> — the absolute form of a path, without creating it
 	case $1 in
 	/*) printf '%s\n' "$1" ;;
@@ -437,6 +462,7 @@ for p in $profiles; do
 		printf '    + cp -Rp %s/rootfs/. %s/\n' "$ROOT/overlay/profiles/$p" "$STAGE"
 		printf '    + sed -f %s (every staged overlay file: @DISTRO_NAME@ @MOTD@ @SLUG@ @BRAND_URL@)\n' "$OUT/.subst.sed"
 		printf '    + rename staged files/dirs whose NAME contains @SLUG@ -> %s\n' "$DISTRO_SLUG"
+		printf '    + chown 0:0 + chmod go-w on every path of the overlay (base, profile)\n'
 		printf '    + cp %s/etc/motd.template -> %s/etc/motd\n' "$STAGE" "$STAGE"
 	else
 		mk_subst
@@ -455,6 +481,11 @@ for p in $profiles; do
 				mv "$_sf" "$_sf_new"
 			fi
 		done
+		# the overlay was copied with cp -Rp: the owner and the modes of
+		# the checkout are in the image, so every path that came from the
+		# overlay is given to root:wheel and loses its group-write bit
+		own_overlay "$STAGE" "$ROOT/overlay/base/rootfs"
+		own_overlay "$STAGE" "$ROOT/overlay/profiles/$p/rootfs"
 		# motd.template stays installed (rc.d/motd reuses it each boot);
 		# also make it the live /etc/motd for the first login
 		cp "$STAGE/etc/motd.template" "$STAGE/etc/motd"
@@ -463,9 +494,15 @@ for p in $profiles; do
 	# 3a. root filesystem wiring: the stock distribution writes no fstab
 	# and no ZFS loader knobs, so an image would not find or mount its root
 	log "  [3a] root fs wiring for $FILESYSTEM_ROOT"
+	# the fstab of a ZFS root: the header line the stock installer writes
+	# and nothing else (the root dataset is mounted by the loader)
+	FSTAB_ZFS=$(printf '# Device\tMountpoint\tFStype\tOptions\tDump\tPass#')
 	if [ "$DRY" -eq 1 ]; then
 		case $FILESYSTEM_ROOT in
-		zfs) printf '    + boot/loader.conf.d/zfs.conf: zfs_load="YES"; etc/rc.conf.d/zfs: zfs_enable="YES"\n' ;;
+		zfs)
+			printf '    + boot/loader.conf.d/zfs.conf: zfs_load="YES"; etc/rc.conf.d/zfs: zfs_enable="YES"\n'
+			printf '    + etc/fstab: %s\n' "$FSTAB_ZFS"
+			;;
 		*) printf '    + etc/fstab: /dev/ufs/%s-root / ufs rw 1 1\n' "$DISTRO_SLUG" ;;
 		esac
 	else
@@ -474,6 +511,7 @@ for p in $profiles; do
 			mkdir -p "$STAGE/boot/loader.conf.d" "$STAGE/etc/rc.conf.d"
 			printf 'zfs_load="YES"\n' > "$STAGE/boot/loader.conf.d/zfs.conf"
 			printf 'zfs_enable="YES"\n' > "$STAGE/etc/rc.conf.d/zfs"
+			printf '%s\n' "$FSTAB_ZFS" > "$STAGE/etc/fstab"
 			;;
 		*)
 			printf '/dev/ufs/%s-root\t/\tufs\trw\t1\t1\n' "$DISTRO_SLUG" > "$STAGE/etc/fstab"

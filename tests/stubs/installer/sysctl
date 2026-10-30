@@ -1,0 +1,15 @@
+#!/bin/sh
+# sysctl — test stub for sysctl(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. `sysctl -n kern.disks` prints the
+# disks of the live system: the bhyve guest disk and the NVMe disk of
+# the host, which the installer offers as well.
+
+printf 'sysctl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+case "$*" in
+'-n kern.disks') printf 'vtbd0 nvd0\n' ;;
+esac
+exit 0

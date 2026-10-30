@@ -1,0 +1,35 @@
+#!/bin/sh
+# bsddialog — test stub for bsddialog(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. bsddialog(8) draws its screen on
+# stdout and writes the answer on stderr; the stub does the same. The
+# text of the screen, the text of the answer and the exit status are
+# taken from the environment, so that one stub covers the cases:
+#
+#   STUB_BSDDIALOG_SCREEN  the screen (default: SCREEN)
+#   STUB_BSDDIALOG_ANSWER  the answer (default: vtbd0)
+#   STUB_BSDDIALOG_RC      the exit status (default: 0)
+#
+# The first call draws the screen, a second call (the caller did not
+# take the answer of the first one) answers with the disk: a caller
+# that reads the screen instead of the answer must not loop for ever.
+
+printf 'bsddialog %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+_n=0
+if [ -n "${STUB_LOG:-}" ] && [ -f "$STUB_LOG" ]; then
+	_n=$(grep -c '^bsddialog ' "$STUB_LOG" 2>/dev/null)
+fi
+case $_n in
+'' | *[!0-9]*) _n=0 ;;
+esac
+
+if [ "$_n" -le 1 ]; then
+	printf '%s\n' "${STUB_BSDDIALOG_SCREEN:-SCREEN}"
+else
+	printf '%s\n' "${STUB_BSDDIALOG_ANSWER:-vtbd0}"
+fi
+printf '%s\n' "${STUB_BSDDIALOG_ANSWER:-vtbd0}" >&2
+exit "${STUB_BSDDIALOG_RC:-0}"

@@ -1,0 +1,16 @@
+#!/bin/sh
+# mount — test stub for mount(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. Without arguments it prints the
+# mount table of the live system (the root of the live image is a ramfs,
+# not a device under /dev, so the table has no entry for "/").
+
+printf 'mount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+if [ $# -eq 0 ]; then
+	printf 'devfs /dev devfs rw 0 0\n'
+	printf 'tmpfs /tmp tmpfs rw 0 0\n'
+fi
+exit 0

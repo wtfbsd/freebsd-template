@@ -1,0 +1,9 @@
+#!/bin/sh
+# umount — test stub for umount(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG.
+
+printf 'umount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0

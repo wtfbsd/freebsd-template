@@ -1,0 +1,11 @@
+#!/bin/sh
+# pw — test stub for pw(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and changes nothing: the suite runs
+# without root. The log must stay empty when the first-boot script
+# skips its work (read-only root).
+
+printf 'pw %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0

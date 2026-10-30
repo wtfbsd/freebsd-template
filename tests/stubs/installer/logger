@@ -1,0 +1,9 @@
+#!/bin/sh
+# logger — test stub for logger(1).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and prints nothing.
+
+printf 'logger %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0
