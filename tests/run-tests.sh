@@ -148,6 +148,23 @@ else
 	no "a root size without a suffix is passed on as it is"
 fi
 
+# (j4) the job count: build.sh defaults JOBS to hw.ncpu, but the caller may
+#       override it. An override is honoured; a value that is not a positive
+#       integer is refused.
+JOBS=3 sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > "$work/jobs-good.log" 2>&1
+if grep -q -- '-j 3' "$work/jobs-good.log"; then
+	ok "the JOBS override is planned as -j 3"
+else
+	no "the JOBS override is planned as -j 3"
+fi
+JOBS=abc sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > "$work/jobs-bad.log" 2>&1
+_rc=$?
+if [ "$_rc" -ne 0 ] && grep -q 'JOBS must be a positive integer' "$work/jobs-bad.log"; then
+	ok "a non-integer JOBS is refused"
+else
+	no "a non-integer JOBS is refused (rc=$_rc)"
+fi
+
 # (j2) the product configuration that apply-answers.sh writes: a comment
 #      header and one KEY='value' line per answer.
 cat > "$work/answers.conf" <<'EOF'

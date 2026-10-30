@@ -152,11 +152,12 @@ quote inside the pair are refused.
 ./build.sh -c product.conf -u ci -k ./ci.pub  # bake a CI first-boot user
 ```
 
-Knobs: `KERNCONF` (default `GENERIC`), `ROOTSIZE` (default `12g`), `PKG_ABI`
+Knobs: `KERNCONF` (default `GENERIC`), `ROOTSIZE` (default `12g`), `PKG_ABI`, `JOBS`
 (e.g. `FreeBSD:15:aarch64` for cross-arch pkg installs — prefer building in a
 VM of the matching arch). `ROOTSIZE` is a number with an optional `k`, `m`, `g`
 or `t` suffix; the suffix is lowercased, because `makefs(8)` reads a size only
-with a lowercase suffix (`12G` is an illegal number to it).
+with a lowercase suffix (`12G` is an illegal number to it). `JOBS` is the
+`make(1)` job count, defaulting to `hw.ncpu` and overridable to any positive integer.
 
 The output directory (`-o`, default `./out`) is made absolute before the
 build starts: the build runs `make(1)` inside the source tree, where a
