@@ -1,0 +1,42 @@
+#!/bin/sh
+# gpart — test stub for gpart(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and prints the real output of
+# `gpart show` on a 60 GiB disk that carries a GPT: an EFI partition,
+# a freebsd-boot partition, a 12 GiB freebsd-zfs partition and 48 GiB
+# of free space. `gpart show -p` prints the same table with the
+# partition names (vtbd0p1, vtbd0p2, vtbd0p3) in column 3 instead of
+# the indexes; the stub prints that form when it is asked for it, so a
+# caller that reads column 3 gets the wrong answer here exactly as it
+# would on a real system.
+
+printf 'gpart %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+case $1 in
+show)
+	_p=''
+	for _a in "$@"; do
+		[ "$_a" = '-p' ] && _p=yes
+	done
+	if [ -n "$_p" ]; then
+		cat <<'TABLE'
+=>       40  125829040  vtbd0  GPT  (60G)
+         40     204800 vtbd0p1  efi  (100M)
+     204840       1024 vtbd0p2  freebsd-boot  (512K)
+     205864   25165824 vtbd0p3  freebsd-zfs  (12G)
+   25371688  100457392         - free -  (48G)
+TABLE
+	else
+		cat <<'TABLE'
+=>       40  125829040  vtbd0  GPT  (60G)
+         40     204800      1  efi  (100M)
+     204840       1024      2  freebsd-boot  (512K)
+     205864   25165824      3  freebsd-zfs  (12G)
+   25371688  100457392         - free -  (48G)
+TABLE
+	fi
+	;;
+esac
+exit 0

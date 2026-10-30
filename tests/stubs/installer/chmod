@@ -1,0 +1,10 @@
+#!/bin/sh
+# chmod — test stub for chmod(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and changes nothing: the suite runs
+# without root. What is checked is the call the build makes.
+
+printf 'chmod %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0

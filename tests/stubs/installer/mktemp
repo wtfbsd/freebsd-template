@@ -1,0 +1,39 @@
+#!/bin/sh
+# mktemp — test stub for mktemp(1).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and creates a file the way FreeBSD's
+# mktemp(1) does with -t: the template is a prefix and the name of the
+# file gets the pid and a counter. GNU mktemp(1) refuses a template
+# without an X in it, so the call of the installer ("mktemp -t install")
+# cannot run as it is on a host that is not FreeBSD.
+
+printf 'mktemp %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+_dir=${TMPDIR:-/tmp}
+_prefix=tmp
+while [ $# -gt 0 ]; do
+	case $1 in
+	-d)
+		_dir=$2
+		shift
+		;;
+	-t) ;;
+	*) _prefix=$1 ;;
+	esac
+	shift
+done
+_n=0
+while :; do
+	if [ "$_n" -eq 0 ]; then
+		_f="$_dir/$_prefix.$$"
+	else
+		_f="$_dir/$_prefix.$$.$_n"
+	fi
+	[ ! -e "$_f" ] && break
+	_n=$((_n + 1))
+done
+: > "$_f" || exit 1
+printf '%s\n' "$_f"
+exit 0

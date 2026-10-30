@@ -22,7 +22,18 @@
 set -u
 
 prog=${0##*/}
-img=/usr/local/share/@SLUG@/install/system.img.xz
+# the image and the mount point can be overridden with the
+# environment; the defaults are the ones of the live system
+img=${INSTALL_IMG:-/usr/local/share/@SLUG@/install/system.img.xz}
+mnt=${INSTALL_MNT:-/mnt}
+
+# rc(8) starts the installer with no TERM, and bsddialog then draws
+# without cursor movement and reads an arrow key as ESC (cancel): give
+# the console a terminal type when it has none
+case ${TERM:-} in
+'' | dumb | unknown) TERM=vt100 ;;
+esac
+export TERM
 
 warn() { echo "$prog: $*" >&2; }
 die() { warn "$*"; exit 1; }
@@ -213,9 +224,12 @@ elif command -v bsddialog >/dev/null 2>&1; then
 		_menu="$_menu $_d DESTROYS-ALL-DATA"
 	done
 	while :; do
+		# bsddialog(8) draws its screen on stdout and writes the
+		# answer on stderr: swap the two streams, so that the screen
+		# goes to the terminal and the answer is captured
 		disk=$(bsddialog --backtitle "$prog" --title 'Target disk' \
 			--menu 'ALL data on the selected disk will be destroyed' \
-			16 64 8 $_menu 2>/dev/null) || die 'dialog cancelled'
+			16 64 8 $_menu 3>&1 1>&2 2>&3) || die 'dialog cancelled'
 		disk=$(printf %s "${disk:-}" | tr -dc 'a-zA-Z0-9')
 		[ -n "$disk" ] || die 'dialog cancelled'
 		inlist "$disk" $disks && break
@@ -263,28 +277,35 @@ sync
 if ! gpart recover /dev/"$disk"; then
 	die "gpart recover /dev/$disk failed"
 fi
-lastidx=$(gpart show -p /dev/"$disk" \
-	| awk '/^=>/ { next } $1 ~ /^[0-9]+$/ { print $3 }' | tail -n 1)
+# `gpart show -p` prints the partition NAMES (vtbd0p3) in column 3 and
+# a dash on the free space row: the index is read from the plain table,
+# and only from a row whose first and third columns are both numbers
+lastidx=$(gpart show /dev/"$disk" \
+	| awk '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { print $3 }' | tail -n 1)
 [ -n "$lastidx" ] || die 'could not determine the last partition index (gpart show)'
 gpart resize -i "$lastidx" /dev/"$disk" || die "gpart resize -i $lastidx failed"
-ptype=$(gpart show -p /dev/"$disk" \
+ptype=$(gpart show /dev/"$disk" \
 	| awk -v idx="$lastidx" '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 == idx { print $4 }')
 [ -n "$ptype" ] || die "could not read the type of partition $lastidx (gpart show)"
 
-mkdir -p /mnt
+mkdir -p "$mnt"
 ftype=''
 case $ptype in
 freebsd-ufs)
 	growfs -y "/dev/${disk}p${lastidx}" || die 'growfs failed'
-	mount "/dev/${disk}p${lastidx}" /mnt || die "mount /dev/${disk}p${lastidx} failed"
+	mount "/dev/${disk}p${lastidx}" "$mnt" || die "mount /dev/${disk}p${lastidx} failed"
 	ftype=ufs
 	;;
 freebsd-zfs)
 	pool=$(zpool import -d "/dev/${disk}p${lastidx}" 2>/dev/null | awk '/pool:/ { print $2 }')
 	[ -n "$pool" ] || die 'zpool import: could not read the pool name'
-	zpool import -f -N -R /mnt "$pool" || die "zpool import $pool failed"
+	zpool import -f -N -R "$mnt" "$pool" || die "zpool import $pool failed"
 	zpool online -e "$pool" "/dev/${disk}p${lastidx}" || die "zpool online -e $pool failed"
-	zfs mount "$pool" || die "zfs mount $pool failed"
+	# the root dataset of the pool keeps its own mountpoint (/<pool>),
+	# so under the altroot above it would land in <mnt>/<pool> and the
+	# first-boot config would be written into an empty directory: the
+	# dataset is mounted on the mount point itself
+	mount -t zfs "$pool" "$mnt" || die "mount -t zfs $pool $mnt failed"
 	ftype=zfs
 	;;
 *) die "unexpected type of partition $lastidx: $ptype" ;;
@@ -292,7 +313,7 @@ esac
 
 # ---- first-boot user config (same format rc.d/firstboot_user parses) -------
 
-dst=/mnt/boot/firstboot-user.conf
+dst=$mnt/boot/firstboot-user.conf
 {
 	printf 'USERNAME=%s\n' "$user"
 	printf 'FULLNAME=%s\n' "$fullname"
@@ -310,9 +331,10 @@ chmod 600 "$dst" || die "chmod 600 $dst failed"
 
 case $ftype in
 ufs)
-	umount /mnt || warn 'umount /mnt failed'
+	umount "$mnt" || warn "umount $mnt failed"
 	;;
 zfs)
+	umount "$mnt" || warn "umount $mnt failed"
 	zpool export "$pool" || warn "zpool export $pool failed"
 	;;
 esac

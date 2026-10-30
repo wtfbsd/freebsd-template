@@ -1,0 +1,32 @@
+#!/bin/sh
+# zpool — test stub for zpool(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. `zpool import -d <device>` prints
+# the real import table of a pool that cannot be fully attached (the
+# device is not there), which is where the pool name is read from.
+
+printf 'zpool %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+case $1 in
+import)
+	if [ "$2" = '-d' ]; then
+		cat <<'TABLE'
+   pool: examplebsd_root
+     state: ONLINE
+    status: One or more devices could not be opened.
+    action: Attach the missing device and online it.
+   scan: none requested
+ config:
+
+	NAME                     STATE     READ WRITE CKSUM
+	examplebsd_root         ONLINE       0     0     0
+	  vtbd0p3               ONLINE       0     0     0
+
+errors: No known data errors
+TABLE
+	fi
+	;;
+esac
+exit 0

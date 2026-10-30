@@ -1,0 +1,11 @@
+#!/bin/sh
+# zfs — test stub for zfs(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and prints nothing. The log is what
+# the installer tests read: a `zfs mount` call must NOT show up there,
+# the root dataset is mounted with mount(8) instead.
+
+printf 'zfs %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0

@@ -1999,5 +1999,258 @@ else
 	ok "the artifacts of a CI run are ignored by git (not a git checkout)"
 fi
 
+# ------------------------------------------------------------------
+# (k) installer: the on-disk install utility, run against stubs
+# ------------------------------------------------------------------
+# The installer talks to the system through gpart(8), zpool(8), zfs(8),
+# mount(8), umount(8), growfs(8), dd(1), xz(1), sysctl(3) and
+# bsddialog(8). Each of those is replaced here by a stub that logs its
+# arguments and prints the real output of the command, so that the
+# behaviour of the installer itself can be checked on any host, without
+# root, without a disk and without a FreeBSD.
+STUBS="$repo/tests/stubs/installer"
+INSTALLER="$repo/overlay/base/rootfs/usr/local/sbin/@SLUG@-install"
+INSTDIR="$work/inst"
+
+# irun — run the installer against the stubs.
+#   irun <name> <mount point|default> <args...>
+# The installer is the staged file: build.sh substitutes the
+# placeholders in it and renames it to the slug, so the test does the
+# same. The mount point is given to the installer with INSTALL_MNT; the
+# word "default" leaves it out, and the installer uses its own (/mnt).
+irun() {
+	_ir_n=$1
+	_ir_m=$2
+	shift 2
+	_ir_bin="$INSTDIR/$_ir_n.bin"
+	_ir_log="$INSTDIR/$_ir_n.log"
+	_ir_out="$INSTDIR/$_ir_n.out"
+	_ir_err="$INSTDIR/$_ir_n.err"
+	_ir_img="$INSTDIR/$_ir_n.img"
+	mkdir -p "$_ir_bin"
+	for _s in gpart zpool zfs mount umount growfs dd xz sysctl bsddialog id logger mktemp; do
+		cp "$STUBS/$_s" "$_ir_bin/$_s"
+		chmod +x "$_ir_bin/$_s"
+	done
+	sed -e 's|@SLUG@|examplebsd|g' "$INSTALLER" > "$_ir_bin/examplebsd-install"
+	chmod +x "$_ir_bin/examplebsd-install"
+	: > "$_ir_log"
+	printf 'test image\n' > "$_ir_img"
+	if [ "$_ir_m" = default ]; then
+		INSTALL_MNT=
+	else
+		mkdir -p "$_ir_m/boot"
+		INSTALL_MNT="$_ir_m"
+	fi
+	PATH="$_ir_bin:$PATH" STUB_LOG="$_ir_log" \
+		STUB_BSDDIALOG_RC="${IR_BSDDIALOG_RC:-0}" \
+		INSTALL_IMG="$_ir_img" INSTALL_MNT="$INSTALL_MNT" \
+		"$_ir_bin/examplebsd-install" "$@" > "$_ir_out" 2> "$_ir_err" < /dev/null
+	_ir_rc=$?
+}
+
+# the key the installer accepts (it checks the type of the line only)
+printf 'ssh-ed25519 %sAC3NzaC1l test@example\n' AAA > "$work/inst.pub"
+
+# (k1) the last partition index: the plain `gpart show` table, and only
+#      the rows whose first and third columns are numbers. With -p the
+#      third column holds the partition NAME and a dash on the free
+#      space row, so the resize would be called with "-i -".
+# a mount point of its own: the default /mnt is never written by the suite
+irun gpart "$INSTDIR/mnt-gpart" -y -u ciuser -k "$work/inst.pub"
+if grep -q 'gpart resize -i 3 /dev/vtbd0' "$INSTDIR/gpart.log"; then
+	ok "installer: the last partition index is 3 (gpart resize -i 3)"
+else
+	no "installer: the last partition index is 3 (gpart resize -i 3)"
+fi
+if grep -q 'zpool import' "$INSTDIR/gpart.log" && ! grep -q 'growfs' "$INSTDIR/gpart.log"; then
+	ok "installer: the type of the partition is read as freebsd-zfs"
+else
+	no "installer: the type of the partition is read as freebsd-zfs"
+fi
+
+# (k2) the disk menu: bsddialog draws its screen on stdout and writes
+#      the answer on stderr, so the two streams have to be swapped
+_flow="$INSTDIR/flow.mnt"
+irun flow "$_flow" -y -u ciuser -k "$work/inst.pub"
+if [ "$_ir_rc" -eq 0 ]; then
+	ok "installer: the install of a zfs root runs to the end"
+else
+	no "installer: the install of a zfs root runs to the end (rc=$_ir_rc)"
+fi
+if grep -q 'of=/dev/vtbd0' "$INSTDIR/flow.log"; then
+	ok "installer: the chosen disk is the answer of the dialog (vtbd0)"
+else
+	no "installer: the chosen disk is the answer of the dialog (vtbd0)"
+fi
+if grep -qx 'SCREEN' "$INSTDIR/flow.err"; then
+	ok "installer: the screen of the dialog goes to stderr"
+else
+	no "installer: the screen of the dialog goes to stderr"
+fi
+if grep -q 'SCREEN' "$INSTDIR/flow.log"; then
+	no "installer: the screen of the dialog is not the chosen disk"
+else
+	ok "installer: the screen of the dialog is not the chosen disk"
+fi
+_nd=$(grep -c '^bsddialog ' "$INSTDIR/flow.log" 2>/dev/null)
+case $_nd in
+'' | *[!0-9]*) _nd=0 ;;
+esac
+if [ "$_nd" -eq 1 ]; then
+	ok "installer: the dialog is asked once"
+else
+	no "installer: the dialog is asked once (asked $_nd times)"
+fi
+# (k2b) rc(8) starts the installer without TERM: bsddialog gets one, or it
+#       reads an arrow key as ESC and cancels
+_term_saved=${TERM-}
+unset TERM
+irun noterm "$INSTDIR/mnt-noterm" -y -u ciuser -k "$work/inst.pub"
+TERM=$_term_saved
+export TERM
+if grep -q '^bsddialog-term vt100$' "$INSTDIR/noterm.log"; then
+	ok "installer: bsddialog gets a terminal type when rc(8) gave none"
+else
+	no "installer: bsddialog gets a terminal type when rc(8) gave none"
+fi
+IR_BSDDIALOG_RC=1
+irun cancel default -y -u ciuser -k "$work/inst.pub"
+IR_BSDDIALOG_RC=0
+if [ "$_ir_rc" -ne 0 ] && grep -q 'dialog cancelled' "$INSTDIR/cancel.err"; then
+	ok "installer: a cancelled dialog stops the install"
+else
+	no "installer: a cancelled dialog stops the install (rc=$_ir_rc)"
+fi
+
+# (k3) the root dataset: the pool root keeps its own mountpoint, so it
+#      has to be mounted on the mount point of the installer
+if grep -q "mount -t zfs examplebsd_root $_flow" "$INSTDIR/flow.log"; then
+	ok "installer: the root dataset is mounted on the mount point"
+else
+	no "installer: the root dataset is mounted on the mount point"
+fi
+if grep -q 'zfs mount' "$INSTDIR/flow.log"; then
+	no "installer: the root dataset is not mounted with zfs mount"
+else
+	ok "installer: the root dataset is not mounted with zfs mount"
+fi
+if grep -q "umount $_flow" "$INSTDIR/flow.log"; then
+	ok "installer: the mount point is unmounted at the end"
+else
+	no "installer: the mount point is unmounted at the end"
+fi
+if grep -q 'zpool export examplebsd_root' "$INSTDIR/flow.log"; then
+	ok "installer: the pool is exported at the end"
+else
+	no "installer: the pool is exported at the end"
+fi
+if grep -q '^USERNAME=ciuser$' "$_flow/boot/firstboot-user.conf" 2>/dev/null; then
+	ok "installer: the first-boot config is written into the mounted root"
+else
+	no "installer: the first-boot config is written into the mounted root"
+fi
+# the same, with the mount point of the installer itself (/mnt)
+# (only as a user that cannot write there: as root it would write the real /mnt)
+if [ "$(id -u)" -eq 0 ] || { [ -d /mnt/boot ] && [ -w /mnt/boot ]; }; then
+	ok "installer: the root dataset is mounted on /mnt (not asserted: this host could write /mnt)"
+else
+	irun dflt default -y -u ciuser -k "$work/inst.pub"
+	if grep -q 'mount -t zfs examplebsd_root /mnt' "$INSTDIR/dflt.log"; then
+		ok "installer: the root dataset is mounted on /mnt (the default mount point)"
+	else
+		no "installer: the root dataset is mounted on /mnt (the default mount point)"
+	fi
+fi
+
+# (k4) the overlay of the stage: root:wheel and no group-write bit.
+#      The copy of the overlay keeps the owner and the modes of the
+#      checkout, so the build has to repair them.
+_ovl="$work/ovl/rootfs"
+_stg="$work/ovl/stage"
+mkdir -p "$_ovl/usr/local/sbin" "$_stg/usr/local/sbin" "$work/ovl/bin"
+# the overlay carries the placeholder in its name, the stage carries the
+# slug: the rename of the staged files happens before the ownership of
+# the overlay is repaired
+: > "$_ovl/usr/local/sbin/@SLUG@-install"
+: > "$_stg/usr/local/sbin/examplebsd-install"
+chmod 0775 "$_ovl/usr/local/sbin/@SLUG@-install" "$_stg/usr/local/sbin/examplebsd-install"
+cp "$STUBS/chown" "$STUBS/chmod" "$work/ovl/bin/"
+chmod +x "$work/ovl/bin/chown" "$work/ovl/bin/chmod"
+# the function is taken out of build.sh and run against the fake stage
+# the real build calls own_overlay for the base and the profile overlay,
+# after the copy and after the @SLUG@ rename (which it maps itself)
+_l_ren=$(grep -n 'mv "$_sf" "$_sf_new"' "$repo/build.sh" | head -1 | cut -d: -f1)
+_l_ob=$(grep -n '^[[:space:]]*own_overlay "$STAGE" "$ROOT/overlay/base/rootfs"' "$repo/build.sh" | head -1 | cut -d: -f1)
+_l_op=$(grep -n '^[[:space:]]*own_overlay "$STAGE" "$ROOT/overlay/profiles/$p/rootfs"' "$repo/build.sh" | head -1 | cut -d: -f1)
+if [ -n "$_l_ren" ] && [ -n "$_l_ob" ] && [ -n "$_l_op" ] && [ "$_l_ren" -lt "$_l_ob" ] && [ "$_l_ren" -lt "$_l_op" ]; then
+	ok "build.sh gives every overlay path to root:wheel after the copy and the rename"
+else
+	no "build.sh gives every overlay path to root:wheel after the copy and the rename"
+fi
+awk '/^own_overlay\(\) \{/,/^\}/' "$repo/build.sh" > "$work/ovl/own_overlay.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	DISTRO_SLUG=examplebsd
+	STUB_LOG="$work/ovl/log"
+	PATH="$work/ovl/bin:$PATH"
+	export DISTRO_SLUG STUB_LOG PATH
+	. "$work/ovl/own_overlay.sh"
+	own_overlay "$_stg" "$_ovl"
+) > "$work/ovl/out" 2>&1
+if grep -q "chown -h 0:0 $_stg/usr/local/sbin/examplebsd-install" "$work/ovl/log" 2>/dev/null; then
+	ok "build.sh: the overlay is given to root:wheel (the renamed path)"
+else
+	no "build.sh: the overlay is given to root:wheel (the renamed path)"
+fi
+if grep -q "chmod go-w $_stg/usr/local/sbin/examplebsd-install" "$work/ovl/log" 2>/dev/null; then
+	ok "build.sh: the group-write bit is removed from the overlay (the renamed path)"
+else
+	no "build.sh: the group-write bit is removed from the overlay (the renamed path)"
+fi
+
+# (k5) the first-boot script on the live media: the root is read-only,
+#      so the script has to skip its work
+_fbrc="$repo/overlay/base/rootfs/etc/rc.d/firstboot_user"
+awk '/^root_writable\(\) \{/,/^\}/' "$_fbrc" > "$work/fb_rootwritable.sh"
+awk '/^firstboot_user_start\(\) \{/,/^\}/' "$_fbrc" > "$work/fb_start.sh"
+if [ -s "$work/fb_rootwritable.sh" ]; then
+	ok "firstboot_user: the writability of the root is checked by root_writable"
+else
+	no "firstboot_user: the writability of the root is checked by root_writable"
+fi
+mkdir -p "$work/rc/bin"
+cp "$STUBS/pw" "$work/rc/bin/"
+chmod +x "$work/rc/bin/pw"
+: > "$work/rc/pw.log"
+{
+	echo 'root_writable() { return 1; }'
+	echo 'firstboot_user_conf=/boot/firstboot-user.conf'
+	cat "$work/fb_start.sh"
+	echo 'firstboot_user_start'
+} > "$work/fb_run.sh"
+PATH="$work/rc/bin:$PATH" STUB_LOG="$work/rc/pw.log" sh "$work/fb_run.sh" > "$work/fb.out" 2> "$work/fb.err"
+_fb_rc=$?
+if [ "$_fb_rc" -eq 0 ] && grep -q 'read-only root (live media), skipped' "$work/fb.out"; then
+	ok "firstboot_user: a read-only root is skipped"
+else
+	no "firstboot_user: a read-only root is skipped (rc=$_fb_rc)"
+fi
+if [ -s "$work/rc/pw.log" ]; then
+	no "firstboot_user: no pw call on a read-only root"
+else
+	ok "firstboot_user: no pw call on a read-only root"
+fi
+
+# (k6) a ZFS root gets an /etc/fstab: the header line the stock
+#      installer writes and nothing else
+sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > "$work/k6.log" 2>&1
+_fstab=$(printf '# Device\tMountpoint\tFStype\tOptions\tDump\tPass#')
+if grep -qF "etc/fstab: $_fstab" "$work/k6.log"; then
+	ok "build.sh: the dry run writes the fstab of a zfs root"
+else
+	no "build.sh: the dry run writes the fstab of a zfs root"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

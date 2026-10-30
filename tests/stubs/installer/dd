@@ -1,0 +1,13 @@
+#!/bin/sh
+# dd — test stub for dd(1).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and writes nothing: the disk of the
+# test does not exist and must not be created. The input is read to the
+# end so that the writer on the other end of the pipe (xz) is not killed
+# by a SIGPIPE, which the installer would see as a failed image.
+
+printf 'dd %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+cat > /dev/null 2>/dev/null || true
+exit 0
