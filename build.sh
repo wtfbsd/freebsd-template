@@ -53,6 +53,7 @@ usage() {
 	log '           per line of PUBKEYFILE, mode 600) into the staged image; both'
 	log '           options are required together. Intended for CI/test images.'
 	log '  -n  dry run: print the plan, change nothing'
+	log '  JOBS=<n>  make(1) job count, defaulting to hw.ncpu (a positive integer)'
 	exit "${1:-2}"
 }
 
@@ -276,7 +277,10 @@ if [ "$DRY" -ne 1 ]; then
 	[ -f "$SRC/Makefile" ] || die "$SRC does not look like a FreeBSD src tree"
 fi
 
-JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+# JOBS is the make(1) job count. It defaults to hw.ncpu; the caller may
+# override it, but the result has to be a positive integer.
+JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 1)}
+chk '^[1-9][0-9]*$' "$JOBS" 'JOBS must be a positive integer'
 KERNCONF=${KERNCONF:-GENERIC}
 # makefs(8) reads the size of the filesystem with a lowercase suffix
 # only: '12G' is an illegal number to it. The default is lowercase and a
