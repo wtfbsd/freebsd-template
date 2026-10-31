@@ -1,0 +1,7 @@
+# rc.conf.d/xorg_fallback — desktop profile fragment, named after the service.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# rc(8) load_rc_config only reads /etc/rc.conf.d/<service-name>, so this
+# fragment is named after the rc.d/xorg_fallback script it enables.
+xorg_fallback_enable="YES"

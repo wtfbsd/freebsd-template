@@ -1,0 +1,107 @@
+#!/bin/sh
+#
+# xorg_fallback — the X fallback of a display that has no DRM device.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Without /dev/dri/card0 (present only with a KMS driver: drm-kmod or the
+# NVIDIA driver) the X autoconfiguration matches modesetting, scfb and
+# vesa together and exits "Cannot run in framebuffer mode. Please specify
+# busIDs", so LightDM shows no greeter (a UEFI bhyve guest is one such
+# display). The desktop profile ships the fallback
+# /usr/local/share/@SLUG@/xorg/20-scfb.conf (Driver "scfb"). The script
+# runs at every boot, after the kernel modules are loaded and before
+# LightDM starts:
+#   - with no DRM device, the fallback is copied into
+#     /usr/local/etc/X11/xorg.conf.d/ when no file of that name is there
+#     yet (a file the administrator put there is kept) and the directory
+#     is writable or can be created (a read-only tree, the live ISO, is
+#     left alone);
+#   - with a DRM device (a KMS driver appeared later), the installed
+#     fallback is removed, so it never shadows the real driver, but only
+#     when it is byte-identical to the shipped source (the copy this
+#     script made); a file that differs belongs to the administrator and
+#     is kept.
+#
+# xf86-video-qxl creates xorg.conf.d/spiceqxl.xorg.conf from its sample
+# (an @sample line), so a pkg upgrade brings it back after build.sh took
+# it out of the image; it makes Xspice the only screen and Xorg dies with
+# signal 11. At every boot the script removes it, but only while it is
+# byte-identical to the sample next to it (spiceqxl.xorg.conf.sample or
+# spiceqxl.xorg.conf.example); a file the administrator edited is kept.
+#
+# The paths are rc variables (xorg_fallback_src, xorg_fallback_dir,
+# xorg_fallback_drm), with the paths above as their defaults.
+
+# PROVIDE: xorg_fallback
+# REQUIRE: FILESYSTEMS kld devmatch
+# BEFORE: LOGIN
+# KEYWORD: nojail
+
+. /etc/rc.subr
+
+name=xorg_fallback
+rcvar=xorg_fallback_enable
+start_cmd=xorg_fallback_start
+stop_cmd=:
+
+load_rc_config "$name"
+
+: ${xorg_fallback_enable:="YES"}
+: ${xorg_fallback_src:="/usr/local/share/@SLUG@/xorg/20-scfb.conf"}
+: ${xorg_fallback_dir:="/usr/local/etc/X11/xorg.conf.d"}
+: ${xorg_fallback_drm:="/dev/dri/card0"}
+
+note() { # note <msg> — to the console and to syslog
+	echo "xorg_fallback: $*"
+	logger -t xorg_fallback "$*"
+}
+
+strip_xspice() { # strip_xspice <dir> — the unedited Xspice config goes
+	local _x _s
+	_x="$1/spiceqxl.xorg.conf"
+	[ -f "$_x" ] || return 0
+	for _s in "$_x.sample" "$_x.example"; do
+		if [ -f "$_s" ] && cmp -s "$_s" "$_x"; then
+			if rm -f -- "$_x"; then
+				note "removed $_x (the unedited Xspice sample; it stops Xorg)"
+			else
+				note "could not remove $_x (the unedited Xspice sample; it stops Xorg)"
+			fi
+			return 0
+		fi
+	done
+	return 0
+}
+
+xorg_fallback_start() {
+	local _src _dir _dst
+	_src=$xorg_fallback_src
+	_dir=$xorg_fallback_dir
+	_dst="$_dir/$(basename -- "$_src")"
+	strip_xspice "$_dir"
+	[ -f "$_src" ] || return 0
+	if [ -e "$xorg_fallback_drm" ]; then
+		if [ -f "$_dst" ] && cmp -s "$_src" "$_dst"; then
+			if rm -f -- "$_dst"; then
+				note "removed the X fallback $_dst: the display has a DRM device"
+			else
+				note "could not remove the X fallback $_dst (the display has a DRM device)"
+			fi
+		fi
+		return 0
+	fi
+	if [ -e "$_dst" ] || [ -L "$_dst" ]; then
+		return 0
+	fi
+	mkdir -p -- "$_dir" 2> /dev/null || return 0
+	[ -w "$_dir" ] || return 0
+	if cp -- "$_src" "$_dst"; then
+		note "installed the X fallback $_dst: the display has no DRM device"
+	else
+		note "could not install the X fallback $_dst (the display has no DRM device)"
+	fi
+	return 0
+}
+
+run_rc_command "$1"

@@ -12,6 +12,8 @@
 #   make DESTDIR=<stage> installworld installkernel distribution
 #   copy overlay rootfs over the stage; substitute @DISTRO_NAME@ @MOTD@ @SLUG@
 #   pkg -r <stage> install -y   (the packages.list files)
+#   pkg -c <stage> triggers     (the triggers pkg -r deferred), then the
+#                               package cache and the debug files go
 #   makefs / mkimg             -> raw disk image (makefs -t zfs for ZFS roots)
 #   sh src/release/<arch>/mkisoimages.sh -b  -> bootable ISO (-b = bootable)
 #   sha256 -r                  -> out/SHA256
@@ -34,6 +36,13 @@
 #   ROOTSIZE   root filesystem size in the raw image (default 12g)
 #   PKG_ABI    override package ABI for cross-arch pkg installs,
 #              e.g. FreeBSD:15:aarch64 (same-arch builds ignore it)
+#   ALLOW_KMOD_MISMATCH  yes builds although a kmod package was built for
+#              another __FreeBSD_version than the kernel (default no: fail)
+#   KMOD_REBUILD  yes (default) rebuilds a kmod package built for another
+#              __FreeBSD_version from the ports tree against the src tree
+#   PORTS      the ports tree of KMOD_REBUILD (default /usr/ports)
+#   KEEP_DEBUG yes keeps /usr/lib/debug (kernel.debug and the debug files
+#              of world) in the image (default no: they are removed)
 
 set -eu
 
@@ -54,6 +63,10 @@ usage() {
 	log '           options are required together. Intended for CI/test images.'
 	log '  -n  dry run: print the plan, change nothing'
 	log '  JOBS=<n>  make(1) job count, defaulting to hw.ncpu (a positive integer)'
+	log '  ALLOW_KMOD_MISMATCH=yes  warn instead of failing on a kmod package built for another kernel'
+	log '  KMOD_REBUILD=no  keep the repository kmods (default yes: rebuild a mismatched one from PORTS)'
+	log '  PORTS=<dir>  the ports tree KMOD_REBUILD uses (default /usr/ports)'
+	log '  KEEP_DEBUG=yes  keep /usr/lib/debug and kernel.debug in the image (default no)'
 	exit "${1:-2}"
 }
 
@@ -282,6 +295,29 @@ fi
 JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 1)}
 chk '^[1-9][0-9]*$' "$JOBS" 'JOBS must be a positive integer'
 KERNCONF=${KERNCONF:-GENERIC}
+# KEEP_DEBUG=yes keeps the standalone debug files of world and kernel
+# (/usr/lib/debug, kernel.debug) in the image; the default removes them
+KEEP_DEBUG=${KEEP_DEBUG:-no}
+case $KEEP_DEBUG in
+yes | no) ;;
+*) die "KEEP_DEBUG must be yes or no (got: $KEEP_DEBUG)" ;;
+esac
+# ALLOW_KMOD_MISMATCH=yes turns a kmod package that was built for
+# another __FreeBSD_version than the kernel of the image into a warning
+ALLOW_KMOD_MISMATCH=${ALLOW_KMOD_MISMATCH:-no}
+case $ALLOW_KMOD_MISMATCH in
+yes | no) ;;
+*) die "ALLOW_KMOD_MISMATCH must be yes or no (got: $ALLOW_KMOD_MISMATCH)" ;;
+esac
+# KMOD_REBUILD=yes rebuilds a kmod package built for another
+# __FreeBSD_version from the ports tree PORTS against the src tree
+KMOD_REBUILD=${KMOD_REBUILD:-yes}
+case $KMOD_REBUILD in
+yes | no) ;;
+*) die "KMOD_REBUILD must be yes or no (got: $KMOD_REBUILD)" ;;
+esac
+PORTS=${PORTS:-/usr/ports}
+case $PORTS in *[[:space:]]*) die "PORTS may not contain whitespace: $PORTS" ;; esac
 # makefs(8) reads the size of the filesystem with a lowercase suffix
 # only: '12G' is an illegal number to it. The default is lowercase and a
 # value that is given in uppercase is normalised before it reaches
@@ -382,6 +418,233 @@ own_overlay() { # own_overlay <stage> <overlay-rootfs-dir>
 	return 0
 }
 
+rename_slug() { # rename_slug <stage> — rename every staged path whose NAME
+	# carries @SLUG@ (e.g. usr/local/sbin/@SLUG@-install,
+	# lightdm.conf.d/50-@SLUG@.conf) to the slug; -depth renames the
+	# children of a directory before the directory itself
+	find "$1" -depth -name '*@SLUG@*' | while IFS= read -r _sf; do
+		_sf_new=$(printf %s "$_sf" | sed -e "s%@SLUG@%$DISTRO_SLUG%g")
+		if [ "$_sf" != "$_sf_new" ]; then
+			mv "$_sf" "$_sf_new" || die "rename $_sf failed"
+		fi
+	done
+}
+
+strip_xspice_conf() { # strip_xspice_conf <stage>
+	# xf86-video-qxl installs xorg.conf.d/spiceqxl.xorg.conf from its
+	# sample: that file makes the Xspice driver the only screen, and
+	# Xorg dies with signal 11 on every machine. The driver itself stays
+	# installed; only the configuration file is removed (the .example
+	# copy next to it does not end in .conf, so Xorg does not read it).
+	_x="$1/usr/local/etc/X11/xorg.conf.d/spiceqxl.xorg.conf"
+	if [ -e "$_x" ] || [ -L "$_x" ]; then
+		rm -f -- "$_x" || die "cannot remove $_x"
+	fi
+	return 0
+}
+
+has_entries() { # has_entries <dir> — does the directory hold a visible entry?
+	[ -d "$1" ] && [ -n "$(ls -- "$1")" ]
+}
+
+stage_cache() { # stage_cache <stage> <output> <tool> <args...>
+	# runs <tool> inside the stage with chroot(8) when the tool is in
+	# the stage and <output> is not; fails the build when the tool fails
+	# or leaves no <output>
+	_st=$1 _o=$2 _t=$3
+	shift 3
+	[ -x "$_st$_t" ] || return 0
+	[ -e "$_st$_o" ] && return 0
+	chroot "$_st" "$_t" "$@" || die "chroot $_st $_t $* failed"
+	[ -e "$_st$_o" ] || die "chroot $_st $_t $* left no $_o"
+}
+
+pkg_triggers() { # pkg_triggers <stage>
+	# pkg -r installs into the stage but defers every trigger that is
+	# not sandboxed: it writes it to <stage>/var/db/pkg/triggers instead
+	# of running it, because its commands (gdk-pixbuf-query-loaders,
+	# glib-compile-schemas, update-mime-database, fc-cache, ...) have to
+	# run against the files of the stage. pkg -c chroots into the stage
+	# first, so "pkg triggers" runs each deferred trigger with the
+	# binaries and the files of the stage, and deletes the ones that
+	# succeeded; one that is left over has failed.
+	# a cross-arch stage (PKG_ABI) holds binaries the build host cannot
+	# run: the triggers, the caches and the chroot steps are skipped
+	if [ -n "${PKG_ABI:-}" ]; then
+		printf '%s\n' "WARNING: PKG_ABI=$PKG_ABI: the stage binaries cannot run here; the package triggers, the caches and the dbus helper group are left undone" >&2
+		return 0
+	fi
+	_td="$1/var/db/pkg/triggers"
+	if has_entries "$_td"; then
+		pkg -c "$1" triggers || die "pkg -c $1 triggers failed"
+		if has_entries "$_td"; then
+			die "deferred package triggers failed in the stage: $(ls -- "$_td" | tr '\n' ' ')"
+		fi
+	fi
+	# the caches the greeter needs, built in the stage when a trigger did
+	# not build them (a pkg that ran the trigger outside the stage)
+	stage_cache "$1" /usr/local/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache \
+		/usr/local/bin/gdk-pixbuf-query-loaders --update-cache
+	stage_cache "$1" /usr/local/share/glib-2.0/schemas/gschemas.compiled \
+		/usr/local/bin/glib-compile-schemas /usr/local/share/glib-2.0/schemas
+	stage_cache "$1" /usr/local/share/mime/mime.cache \
+		/usr/local/bin/update-mime-database /usr/local/share/mime
+	# pkg -r looks the group of a packaged file up on the build host,
+	# which has no messagebus group: the dbus launch helper ends up
+	# root:wheel and dbus refuses to start Accounts and ConsoleKit. Its
+	# plist sets root:messagebus 4750; chroot resolves the group in the
+	# stage. chown comes first, because chown clears the setuid bit.
+	_h=/usr/local/libexec/dbus-daemon-launch-helper
+	if [ -f "$1$_h" ]; then
+		chroot "$1" /usr/sbin/chown root:messagebus "$_h" || die "chown root:messagebus $_h in the stage failed"
+		chroot "$1" /bin/chmod 4750 "$_h" || die "chmod 4750 $_h in the stage failed"
+	fi
+	return 0
+}
+
+in_stage() { # in_stage <stage> <path> — refuse a path that leaves the stage
+	# a symlink on the way (a staged var -> /var) would make rm -rf
+	# delete outside the stage: the real path of the parent of <path>
+	# and of <path> itself (a directory, a file, or a symlink to either)
+	# must be the stage or lie under it; a symlink that cannot be
+	# resolved (it dangles) is refused too
+	_sr=$(realpath "$1") || die "realpath $1 failed"
+	for _p in "$(dirname -- "$2")" "$2"; do
+		[ -e "$_p" ] || [ -L "$_p" ] || continue
+		_pr=$(realpath "$_p") || die "refusing $2: $_p does not resolve (a dangling symlink in the stage)"
+		case $_pr in
+		"$_sr" | "$_sr"/*) ;;
+		*) die "refusing $2: it resolves to $_pr, outside the stage $_sr (a symlink in the stage)" ;;
+		esac
+	done
+}
+
+prune_stage() { # prune_stage <stage> — drop the package cache and the debug files
+	in_stage "$1" "$1/var/cache/pkg"
+	in_stage "$1" "$1/usr/lib/debug"
+	in_stage "$1" "$1/boot"
+	# the packages pkg -r downloaded are cached in the stage: they are
+	# removed, the empty cache directory stays
+	rmrf "$1/var/cache/pkg" "$OUT"
+	mkdir -p "$1/var/cache/pkg" || die "cannot create $1/var/cache/pkg"
+	# the standalone debug files of world and kernel (/usr/lib/debug,
+	# kernel.debug and *.ko.debug among them) are removed unless
+	# KEEP_DEBUG=yes
+	if [ "$KEEP_DEBUG" != yes ]; then
+		rmrf "$1/usr/lib/debug" "$OUT"
+		if [ -d "$1/boot" ]; then
+			find "$1/boot" -type f -name '*.debug' -exec rm -f -- {} + \
+				|| die "cannot remove the debug files under $1/boot"
+		fi
+	fi
+	return 0
+}
+
+src_version() { # src_version <src> — the __FreeBSD_version of a src tree
+	sed -n 's/^#define[[:space:]][[:space:]]*__FreeBSD_version[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+		"$1/sys/sys/param.h" 2> /dev/null | head -1
+}
+
+pkg_note() { # pkg_note <stage> <package> <annotation> — its value, or nothing
+	pkg -r "$1" query '%At %Av' "$2" | awk -v k="$3" '$1 == k { print $2; exit }'
+}
+
+KMOD_MM=''
+kmod_mismatches() { # kmod_mismatches <stage> <version> — sets KMOD_MM
+	# KMOD_MM gets one "name built-for" line per installed package that
+	# owns a *.ko file and whose FreeBSD_version annotation is not
+	# <version> ("none" when it has none). A package is a kmod by what it
+	# ships, not by its name: the meta packages (drm-kmod,
+	# gpu-firmware-kmod, nvidia-drm-kmod) own no .ko and carry no
+	# FreeBSD_version annotation, so they are not looked at.
+	_q=$(pkg -r "$1" query -a '%n %Fp') || die "pkg -r $1 query -a '%n %Fp' failed"
+	KMOD_MM=''
+	for _n in $(printf '%s\n' "$_q" | awk '$2 ~ /\.ko$/ { print $1 }' | sort -u); do
+		_pv=$(pkg_note "$1" "$_n" FreeBSD_version)
+		[ "$_pv" = "$2" ] || KMOD_MM="$KMOD_MM$_n ${_pv:-none}
+"
+	done
+}
+
+need_ports() { # need_ports — the ports tree the kmods are rebuilt from
+	[ -f "$PORTS/Mk/bsd.port.mk" ] || die "KMOD_REBUILD=yes needs a ports tree at $PORTS (PORTS=<dir>); get one with: git clone --depth 1 https://git.FreeBSD.org/ports.git $PORTS
+or build with KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes to keep the repository's kmods"
+}
+
+rebuild_kmods() { # rebuild_kmods <stage> <src>
+	# every package that owns a .ko and was built for another
+	# __FreeBSD_version than <src> is rebuilt from the ports tree against
+	# <src> and installed into the stage over the repository's copy, then
+	# locked so that a pkg upgrade does not bring the repository's copy
+	# back. pkg create writes the FreeBSD_version annotation from the ABI
+	# and OSVERSION of its environment, so both are set for make.
+	[ "$KMOD_REBUILD" = yes ] || return 0
+	_rst=$1 _rsrc=$2
+	_kv=$(src_version "$_rsrc")
+	[ -n "$_kv" ] || die "cannot read __FreeBSD_version from $_rsrc/sys/sys/param.h: check that SRC is a complete FreeBSD src tree (sys/sys/param.h)"
+	kmod_mismatches "$_rst" "$_kv"
+	[ -n "$KMOD_MM" ] || return 0
+	if [ -n "${PKG_ABI:-}" ]; then
+		die "kmod packages need a rebuild for $_kv, which a cross build cannot do:
+$KMOD_MM
+build on a host of the target arch, or set KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes"
+	fi
+	need_ports
+	# __FreeBSD_version is major * 100000 + minor * 1000 + patch level
+	# (sys/sys/param.h), so the major version is the quotient by 100000
+	_abi="FreeBSD:$((_kv / 100000)):$MARC"
+	# the ports framework writes PKGFILE only into an existing PACKAGES
+	# directory (a fresh clone of the ports tree has none): the rebuilt
+	# packages go to a directory of this build, emptied first, so no
+	# package of an earlier build or of the ports tree is picked up
+	_kp="$OUT/kmod-packages"
+	rmrf "$_kp" "$OUT"
+	mkdir -p "$_kp" || die "cannot create $_kp"
+	for _n in $(printf '%s' "$KMOD_MM" | awk '{ print $1 }'); do
+		_pv=$(printf '%s' "$KMOD_MM" | awk -v n="$_n" '$1 == n { print $2; exit }')
+		_o=$(pkg -r "$_rst" query %o "$_n") || die "pkg -r $_rst query %o $_n failed"
+		# the origin and the flavor reach make(1) as values: only the
+		# characters of a port directory and of a flavor name pass
+		printf '%s\n' "$_o" | grep -Eqx '[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+' \
+			|| die "$_n: refusing the origin '$_o' (not category/port)"
+		[ -f "$PORTS/$_o/Makefile" ] || die "$_n: no port $PORTS/$_o to rebuild it from"
+		_fl=$(pkg_note "$_rst" "$_n" flavor)
+		if [ -n "$_fl" ]; then
+			printf '%s\n' "$_fl" | grep -Eqx '[A-Za-z0-9_]+' \
+				|| die "$_n: refusing the flavor '$_fl' (not [A-Za-z0-9_]+)"
+		fi
+		log "    rebuild $_n ($_o${_fl:+@$_fl}): built for $_pv, kernel is $_kv"
+		set -- "SRC_BASE=$_rsrc" "OSVERSION=$_kv" BATCH=yes DISABLE_VULNERABILITIES=yes "PACKAGES=$_kp"
+		[ -z "$_fl" ] || set -- "$@" "FLAVOR=$_fl"
+		env "ABI=$_abi" "OSVERSION=$_kv" make -C "$PORTS/$_o" "$@" clean package \
+			|| die "make package of $_o failed"
+		_pf=$(env "ABI=$_abi" "OSVERSION=$_kv" make -C "$PORTS/$_o" "$@" -V PKGFILE) \
+			|| die "make -V PKGFILE of $_o failed"
+		[ -f "$_pf" ] || die "make package of $_o left no $_pf"
+		pkg -r "$_rst" add -f "$_pf" || die "pkg -r $_rst add -f $_pf failed"
+		pkg -r "$_rst" lock -y "$_n" || die "pkg -r $_rst lock -y $_n failed"
+	done
+}
+
+check_kmods() { # check_kmods <stage> <src>
+	# a kernel module only works on the kernel it was built for: every
+	# package that owns a .ko must carry the __FreeBSD_version of <src>
+	# (from which the kernel of the image is built) in its
+	# FreeBSD_version annotation. A mismatch fails the build unless
+	# ALLOW_KMOD_MISMATCH=yes, which turns it into a warning.
+	_kv=$(src_version "$2")
+	[ -n "$_kv" ] || die "cannot read __FreeBSD_version from $2/sys/sys/param.h: check that SRC is a complete FreeBSD src tree (sys/sys/param.h)"
+	kmod_mismatches "$1" "$_kv"
+	_bad=$(printf '%s' "$KMOD_MM" | awk -v k="$_kv" '{ printf "\n  %s: built for %s, kernel is %s", $1, $2, k }')
+	[ -n "$_bad" ] || return 0
+	if [ "$ALLOW_KMOD_MISMATCH" = yes ]; then
+		printf '%s\n' "WARNING: kmod packages do not match the kernel (__FreeBSD_version $_kv of $2); ALLOW_KMOD_MISMATCH=yes, building anyway:$_bad" >&2
+		return 0
+	fi
+	die "kmod packages do not match the kernel (__FreeBSD_version $_kv of $2):$_bad
+KMOD_REBUILD=yes rebuilds them from the ports tree; ALLOW_KMOD_MISMATCH=yes builds anyway"
+}
+
 abspath() { # abspath <path> — the absolute form of a path, without creating it
 	case $1 in
 	/*) printf '%s\n' "$1" ;;
@@ -410,6 +673,24 @@ else
 	mkdir -p -- "$OUT" || die "cannot create the output directory: $OUT"
 	OUT=$(CDPATH='' cd -- "$OUT" && pwd) || die "cannot enter the output directory: $OUT"
 fi
+
+# a desktop image installs kmods: with KMOD_REBUILD=yes the ports tree has
+# to be there before hours of buildworld, not after them
+case $PROF in
+desktop | both)
+	if [ "$KMOD_REBUILD" = yes ]; then
+		# a cross build (PKG_ABI) cannot rebuild kmods at all: it
+		# refuses later, and only when a kmod does not match
+		if [ -n "${PKG_ABI:-}" ]; then
+			:
+		elif [ "$DRY" -eq 1 ]; then
+			[ -f "$PORTS/Mk/bsd.port.mk" ] || log "note: no ports tree at $PORTS; the real build refuses to start (KMOD_REBUILD=yes)"
+		else
+			need_ports
+		fi
+	fi
+	;;
+esac
 
 # --------------------------------------------------------------------------
 # plan header
@@ -478,13 +759,7 @@ for p in $profiles; do
 		# usr/local/sbin/@SLUG@-install) belong to the product: rename
 		# them to the slug (content placeholders were substituted above,
 		# which is why the rename comes after subst_overlay)
-		_slugs=$(find "$STAGE" -depth -name '*@SLUG@*')
-		for _sf in $_slugs; do
-			_sf_new=$(printf %s "$_sf" | sed -e "s%@SLUG@%$DISTRO_SLUG%g")
-			if [ "$_sf" != "$_sf_new" ]; then
-				mv "$_sf" "$_sf_new"
-			fi
-		done
+		rename_slug "$STAGE" || die 'the @SLUG@ rename of the stage failed'
 		# the overlay was copied with cp -Rp: the owner and the modes of
 		# the checkout are in the image, so every path that came from the
 		# overlay is given to root:wheel and loses its group-write bit
@@ -566,6 +841,33 @@ for p in $profiles; do
 		else
 			step pkg -r "$STAGE" install -y $pkgs
 		fi
+	fi
+
+	# 4a. the kmods are rebuilt for the kernel of the image and checked
+	# against it; then the work pkg -r leaves undone in the stage: the
+	# deferred triggers, the caches and the group of the dbus launch
+	# helper; then the Xspice configuration of xf86-video-qxl, the
+	# package cache and the debug files come out of the stage
+	log '  [4a] kmod rebuild + kmod/kernel match, package triggers in the stage, Xspice config, package cache, debug files'
+	if [ "$DRY" -eq 1 ]; then
+		printf '    + every package owning a .ko whose FreeBSD_version is not __FreeBSD_version of %s/sys/sys/param.h: make -C %s/<origin> SRC_BASE=%s OSVERSION=<it> BATCH=yes DISABLE_VULNERABILITIES=yes PACKAGES=%s/kmod-packages clean package; pkg -r %s add -f; pkg lock (KMOD_REBUILD=%s)\n' "$SRC" "$PORTS" "$SRC" "$OUT" "$STAGE" "$KMOD_REBUILD"
+		printf '    + check those packages against __FreeBSD_version of %s/sys/sys/param.h (ALLOW_KMOD_MISMATCH=%s)\n' "$SRC" "$ALLOW_KMOD_MISMATCH"
+		printf '    + pkg -c %s triggers (when %s/var/db/pkg/triggers holds deferred triggers)\n' "$STAGE" "$STAGE"
+		printf '    + chroot %s: gdk-pixbuf-query-loaders --update-cache, glib-compile-schemas, update-mime-database (each when its tool is there and its cache is not)\n' "$STAGE"
+		printf '    + chroot %s: chown root:messagebus + chmod 4750 /usr/local/libexec/dbus-daemon-launch-helper\n' "$STAGE"
+		printf '    + rm %s/usr/local/etc/X11/xorg.conf.d/spiceqxl.xorg.conf\n' "$STAGE"
+		printf '    + rm -rf %s/var/cache/pkg/*\n' "$STAGE"
+		if [ "$KEEP_DEBUG" = yes ]; then
+			printf '    + KEEP_DEBUG=yes: %s/usr/lib/debug is kept\n' "$STAGE"
+		else
+			printf "    + rm -rf %s/usr/lib/debug; find %s/boot -type f -name '*.debug' -exec rm -f -- {} + (KEEP_DEBUG=yes keeps them)\n" "$STAGE" "$STAGE"
+		fi
+	else
+		rebuild_kmods "$STAGE" "$SRC"
+		check_kmods "$STAGE" "$SRC"
+		pkg_triggers "$STAGE"
+		strip_xspice_conf "$STAGE"
+		prune_stage "$STAGE"
 	fi
 	rimg=${img#"$OUT"/}
 	riso=${iso#"$OUT"/}

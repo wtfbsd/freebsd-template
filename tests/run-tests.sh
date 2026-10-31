@@ -2288,5 +2288,852 @@ for _p in drm-kmod mesa-dri nvidia-driver nvidia-drm-kmod \
 	fi
 done
 
+# ------------------------------------------------------------------
+# (m) the defects the first end-to-end run of an installed desktop
+#     found: no greeter on a UEFI bhyve guest. Each helper is taken out
+#     of build.sh (or the rc.d script out of the overlay) and run
+#     against a fake stage.
+# ------------------------------------------------------------------
+
+# _bline <ere> — the line of build.sh where the first call matching the
+# extended regular expression stands (comments do not count)
+_bline() { grep -nE "^[[:space:]]*$1" "$repo/build.sh" | head -1 | cut -d: -f1; }
+# _bfunc <name> — the definition of a build.sh function
+_bfunc() { awk "/^$1\\(\\) \\{/,/^\\}/" "$repo/build.sh"; }
+# the build calls a step after the package install and before the raw
+# image, so the image and the ISO both carry its result
+_l_pkg=$(_bline 'step pkg -r "\$STAGE" install -y \$pkgs')
+_l_img=$(_bline "log '  \\[6\\] raw image")
+_after_pkg() { # _after_pkg <name> <ere>
+	_l=$(_bline "$2")
+	if [ -n "$_l" ] && [ -n "$_l_pkg" ] && [ -n "$_l_img" ] &&
+		[ "$_l" -gt "$_l_pkg" ] && [ "$_l" -lt "$_l_img" ]; then
+		ok "build.sh: $1 runs after the package install and before the raw image"
+	else
+		no "build.sh: $1 runs after the package install and before the raw image (line ${_l:-none})"
+	fi
+}
+
+# (m1) xf86-video-qxl installs xorg.conf.d/spiceqxl.xorg.conf, which
+#      makes Xspice the only screen: Xorg dies with signal 11. The build
+#      removes that file and nothing else; the qxl driver stays.
+_after_pkg 'the removal of the Xspice config' 'strip_xspice_conf "\$STAGE"'
+_m1="$work/m1"
+mkdir -p "$_m1/stage/usr/local/etc/X11/xorg.conf.d"
+_xd="$_m1/stage/usr/local/etc/X11/xorg.conf.d"
+printf 'Section "Device"\n\tDriver "spiceqxl"\nEndSection\n' > "$_xd/spiceqxl.xorg.conf"
+cp "$_xd/spiceqxl.xorg.conf" "$_xd/spiceqxl.xorg.conf.example"
+printf '# wacom\n' > "$_xd/wacom.conf.sample"
+printf '# admin\n' > "$_xd/30-admin.conf"
+_bfunc strip_xspice_conf > "$_m1/f.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	. "$_m1/f.sh"
+	strip_xspice_conf "$_m1/stage"
+) > "$_m1/out" 2>&1
+_m1rc=$?
+if [ "$_m1rc" -eq 0 ] && [ -s "$_m1/f.sh" ] && [ ! -e "$_xd/spiceqxl.xorg.conf" ]; then
+	ok "build.sh: xorg.conf.d/spiceqxl.xorg.conf is removed from the stage"
+else
+	no "build.sh: xorg.conf.d/spiceqxl.xorg.conf is removed from the stage (rc=$_m1rc)"
+fi
+if [ -f "$_xd/spiceqxl.xorg.conf.example" ] && [ -f "$_xd/wacom.conf.sample" ] && [ -f "$_xd/30-admin.conf" ]; then
+	ok "build.sh: the other files of xorg.conf.d stay"
+else
+	no "build.sh: the other files of xorg.conf.d stay"
+fi
+# a stage without the file (no qxl package) is not an error
+rm -rf "$_m1/stage2" && mkdir -p "$_m1/stage2"
+( die() { echo "die: $*" >&2; exit 1; }; . "$_m1/f.sh"; strip_xspice_conf "$_m1/stage2" ) > /dev/null 2>&1 \
+	&& [ -s "$_m1/f.sh" ] && ok "build.sh: a stage without the Xspice config is not an error" \
+	|| no "build.sh: a stage without the Xspice config is not an error"
+
+# (m2) the X fallback: without /dev/dri/card0 the autoconfiguration
+#      matches modesetting, scfb and vesa and exits "Cannot run in
+#      framebuffer mode". rc.d/xorg_fallback copies the shipped scfb
+#      Device section into xorg.conf.d only without a DRM device, keeps
+#      a file of the administrator, and removes its own copy once a DRM
+#      device appears.
+_xfb="$repo/overlay/profiles/desktop/rootfs/etc/rc.d/xorg_fallback"
+_xsrc="$repo/overlay/profiles/desktop/rootfs/usr/local/share/@SLUG@/xorg/20-scfb.conf"
+if [ -f "$_xsrc" ] && sed 's/#.*//' "$_xsrc" | grep -q '^[[:space:]]*Driver[[:space:]]*"scfb"'; then
+	ok "the desktop profile ships the scfb Device section under /usr/local/share/@SLUG@/xorg"
+else
+	no "the desktop profile ships the scfb Device section under /usr/local/share/@SLUG@/xorg"
+fi
+if [ -x "$_xfb" ] && sh -n "$_xfb" 2> /dev/null; then
+	ok "rc.d/xorg_fallback is an executable sh script"
+else
+	no "rc.d/xorg_fallback is an executable sh script"
+fi
+if grep -q '^[[:space:]]*xorg_fallback_enable="YES"' "$repo/overlay/profiles/desktop/rootfs/etc/rc.conf.d/xorg_fallback" 2> /dev/null; then
+	ok "rc.conf.d/xorg_fallback enables the X fallback"
+else
+	no "rc.conf.d/xorg_fallback enables the X fallback"
+fi
+# it runs at every boot (not only on the first one) and before LightDM
+if [ -f "$_xfb" ] && ! grep -q '^# KEYWORD:.*firstboot' "$_xfb" && grep -q '^# BEFORE:.*LOGIN' "$_xfb"; then
+	ok "rc.d/xorg_fallback runs at every boot, before LOGIN (LightDM)"
+else
+	no "rc.d/xorg_fallback runs at every boot, before LOGIN (LightDM)"
+fi
+_m2="$work/m2"
+mkdir -p "$_m2/share" "$_m2/xorg.conf.d"
+[ -f "$_xsrc" ] && cp "$_xsrc" "$_m2/share/20-scfb.conf"
+cat > "$_m2/rc.subr" <<'RCSUBR'
+load_rc_config() { :; }
+run_rc_command() {
+	case ${1:-} in
+	start) "$start_cmd" ;;
+	*) : ;;
+	esac
+}
+logger() { :; }
+RCSUBR
+[ -f "$_xfb" ] && sed -e "s#^\\. /etc/rc\\.subr#. $_m2/rc.subr#" "$_xfb" > "$_m2/xorg_fallback"
+_xdst="$_m2/xorg.conf.d/20-scfb.conf"
+_xrun() { # _xrun yes|no — run the script with or without a DRM device
+	if [ "$1" = yes ]; then : > "$_m2/card0"; else rm -f "$_m2/card0"; fi
+	xorg_fallback_src="$_m2/share/20-scfb.conf" xorg_fallback_dir="$_m2/xorg.conf.d" \
+		xorg_fallback_drm="$_m2/card0" sh "$_m2/xorg_fallback" start > "$_m2/log" 2>&1
+	_xrc=$?
+}
+rm -f "$_xdst"
+_xrun no
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/share/20-scfb.conf" ] && cmp -s "$_xdst" "$_m2/share/20-scfb.conf"; then
+	ok "rc.d/xorg_fallback: without a DRM device the scfb fallback is installed"
+else
+	no "rc.d/xorg_fallback: without a DRM device the scfb fallback is installed (rc=$_xrc)"
+	sed 's/^/      | /' "$_m2/log" 2> /dev/null
+fi
+rm -f "$_xdst"
+_xrun yes
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && [ ! -e "$_xdst" ]; then
+	ok "rc.d/xorg_fallback: with a DRM device nothing is installed"
+else
+	no "rc.d/xorg_fallback: with a DRM device nothing is installed (rc=$_xrc)"
+fi
+printf '# the file of the administrator\n' > "$_xdst"
+_xrun no
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && grep -q '^# the file of the administrator$' "$_xdst"; then
+	ok "rc.d/xorg_fallback: a file of the administrator is never overwritten"
+else
+	no "rc.d/xorg_fallback: a file of the administrator is never overwritten (rc=$_xrc)"
+fi
+_xrun yes
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && grep -q '^# the file of the administrator$' "$_xdst"; then
+	ok "rc.d/xorg_fallback: with a DRM device a file of the administrator is kept"
+else
+	no "rc.d/xorg_fallback: with a DRM device a file of the administrator is kept (rc=$_xrc)"
+fi
+rm -f "$_xdst"
+_xrun no
+_xrun yes
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && [ ! -e "$_xdst" ]; then
+	ok "rc.d/xorg_fallback: the installed fallback is removed once a DRM device appears"
+else
+	no "rc.d/xorg_fallback: the installed fallback is removed once a DRM device appears (rc=$_xrc)"
+fi
+if [ "$(id -u)" -ne 0 ]; then
+	rm -f "$_xdst"
+	chmod 555 "$_m2/xorg.conf.d"
+	_xrun no
+	if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && [ ! -e "$_xdst" ] && ! grep -q 'could not' "$_m2/log"; then
+		ok "rc.d/xorg_fallback: a read-only xorg.conf.d is left alone, without an error"
+	else
+		no "rc.d/xorg_fallback: a read-only xorg.conf.d is left alone, without an error (rc=$_xrc)"
+	fi
+	chmod 755 "$_m2/xorg.conf.d"
+fi
+
+# (m3) pkg -r defers the package triggers and looks the groups up on
+#      the build host: the stage had no gdk-pixbuf loader cache, no
+#      compiled GSettings schemas, no MIME database, and a dbus launch
+#      helper of root:wheel. pkg -c <stage> triggers runs the deferred
+#      triggers inside the stage; a cache that is still missing is built
+#      with chroot; the helper becomes root:messagebus 4750 through
+#      chroot. The stubs record the calls.
+_after_pkg 'the package triggers' 'pkg_triggers "\$STAGE"'
+_m3="$work/m3"
+mkdir -p "$_m3/bin"
+cat > "$_m3/bin/pkg" <<'STUBPKG'
+#!/bin/sh
+# pkg stub: logs its arguments; "pkg -c <root> triggers" deletes the
+# deferred triggers of <root> unless STUB_PKG=fail
+printf 'pkg %s\n' "$*" >> "$STUB_LOG"
+if [ "$1" = -c ] && [ "$3" = triggers ] && [ "${STUB_PKG:-ok}" = ok ]; then
+	rm -f "$2"/var/db/pkg/triggers/*
+fi
+exit 0
+STUBPKG
+cat > "$_m3/bin/chroot" <<'STUBCHROOT'
+#!/bin/sh
+# chroot stub: logs its arguments; the cache tools write their cache in
+# the root (unless STUB_CHROOT=fail)
+printf 'chroot %s\n' "$*" >> "$STUB_LOG"
+[ "${STUB_CHROOT:-ok}" = ok ] || exit 1
+_r=$1
+case $2 in
+*/gdk-pixbuf-query-loaders) : > "$_r/usr/local/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ;;
+*/glib-compile-schemas) : > "$_r$3/gschemas.compiled" ;;
+*/update-mime-database) : > "$_r$3/mime.cache" ;;
+esac
+exit 0
+STUBCHROOT
+chmod 755 "$_m3/bin/pkg" "$_m3/bin/chroot"
+{ _bfunc has_entries; _bfunc stage_cache; _bfunc pkg_triggers; } > "$_m3/f.sh"
+_m3stage() { # _m3stage <dir> tools|notools — a fake stage after pkg -r
+	rm -rf "$1"
+	mkdir -p "$1/var/db/pkg/triggers" "$1/usr/local/bin" "$1/usr/local/libexec" \
+		"$1/usr/local/lib/gdk-pixbuf-2.0/2.10.0" "$1/usr/local/share/glib-2.0/schemas" \
+		"$1/usr/local/share/mime"
+	printf -- '--begin args\n--end args\n--\nprint(1)\n' > "$1/var/db/pkg/triggers/AbCdEfGhIj"
+	if [ "$2" = tools ]; then
+		for _t in gdk-pixbuf-query-loaders glib-compile-schemas update-mime-database; do
+			printf '#!/bin/sh\n' > "$1/usr/local/bin/$_t"
+			chmod 755 "$1/usr/local/bin/$_t"
+		done
+		: > "$1/usr/local/libexec/dbus-daemon-launch-helper"
+	fi
+}
+_m3run() { # _m3run <stage>
+	: > "$_m3/log"
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		PATH="$_m3/bin:$PATH"
+		STUB_LOG="$_m3/log"
+		export PATH STUB_LOG
+		. "$_m3/f.sh"
+		pkg_triggers "$1"
+	) > "$_m3/out" 2>&1
+	_m3rc=$?
+}
+_s="$_m3/s1"
+_m3stage "$_s" tools
+_m3run "$_s"
+if [ "$_m3rc" -eq 0 ] && grep -qx "pkg -c $_s triggers" "$_m3/log" && [ -z "$(ls "$_s/var/db/pkg/triggers")" ]; then
+	ok "build.sh: the deferred package triggers run inside the stage (pkg -c <stage> triggers)"
+else
+	no "build.sh: the deferred package triggers run inside the stage (pkg -c <stage> triggers) (rc=$_m3rc)"
+	sed 's/^/      | /' "$_m3/log" "$_m3/out" 2> /dev/null
+fi
+for _c in "/usr/local/bin/gdk-pixbuf-query-loaders --update-cache" \
+	"/usr/local/bin/glib-compile-schemas /usr/local/share/glib-2.0/schemas" \
+	"/usr/local/bin/update-mime-database /usr/local/share/mime"; do
+	if grep -qxF "chroot $_s $_c" "$_m3/log"; then
+		ok "build.sh: a missing cache is built inside the stage: chroot <stage> $_c"
+	else
+		no "build.sh: a missing cache is built inside the stage: chroot <stage> $_c"
+	fi
+done
+_own=$(grep -nxF "chroot $_s /usr/sbin/chown root:messagebus /usr/local/libexec/dbus-daemon-launch-helper" "$_m3/log" | cut -d: -f1)
+_mod=$(grep -nxF "chroot $_s /bin/chmod 4750 /usr/local/libexec/dbus-daemon-launch-helper" "$_m3/log" | cut -d: -f1)
+if [ -n "$_own" ] && [ -n "$_mod" ] && [ "$_own" -lt "$_mod" ]; then
+	ok "build.sh: the dbus launch helper becomes root:messagebus 4750 in the stage (chown before chmod)"
+else
+	no "build.sh: the dbus launch helper becomes root:messagebus 4750 in the stage (chown before chmod)"
+fi
+# the caches a trigger already built are not built again
+_s="$_m3/s2"
+_m3stage "$_s" tools
+: > "$_s/usr/local/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+: > "$_s/usr/local/share/glib-2.0/schemas/gschemas.compiled"
+: > "$_s/usr/local/share/mime/mime.cache"
+_m3run "$_s"
+if [ "$_m3rc" -eq 0 ] && [ -f "$_m3/f.sh" ] && [ -s "$_m3/f.sh" ] && ! grep -Eq 'gdk-pixbuf|glib-compile|update-mime' "$_m3/log"; then
+	ok "build.sh: a cache that is already in the stage is not built again"
+else
+	no "build.sh: a cache that is already in the stage is not built again (rc=$_m3rc)"
+fi
+# a stage without the tools and the helper: no chroot at all
+_s="$_m3/s3"
+_m3stage "$_s" notools
+_m3run "$_s"
+if [ "$_m3rc" -eq 0 ] && [ -s "$_m3/f.sh" ] && ! grep -q '^chroot ' "$_m3/log"; then
+	ok "build.sh: a tool that is not in the stage is not run"
+else
+	no "build.sh: a tool that is not in the stage is not run (rc=$_m3rc)"
+fi
+# a trigger that fails (it is left in the triggers directory) fails the build
+_s="$_m3/s4"
+_m3stage "$_s" tools
+STUB_PKG=fail
+export STUB_PKG
+_m3run "$_s"
+unset STUB_PKG
+if [ "$_m3rc" -ne 0 ] && grep -q 'deferred package triggers failed' "$_m3/out"; then
+	ok "build.sh: a deferred trigger that fails in the stage fails the build"
+else
+	no "build.sh: a deferred trigger that fails in the stage fails the build (rc=$_m3rc)"
+fi
+# a tool that is in the stage and fails, fails the build
+_s="$_m3/s5"
+_m3stage "$_s" tools
+STUB_CHROOT=fail
+export STUB_CHROOT
+_m3run "$_s"
+unset STUB_CHROOT
+if [ "$_m3rc" -ne 0 ] && grep -q 'die: chroot' "$_m3/out"; then
+	ok "build.sh: a cache tool that fails in the stage fails the build"
+else
+	no "build.sh: a cache tool that fails in the stage fails the build (rc=$_m3rc)"
+fi
+sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m3.log" 2>&1
+if grep -q 'pkg -c .*/desktop/stage triggers' "$work/m3.log" && grep -q 'root:messagebus' "$work/m3.log"; then
+	ok "build.sh: the dry run prints the triggers and the dbus helper step"
+else
+	no "build.sh: the dry run prints the triggers and the dbus helper step"
+fi
+
+# (m4) LightDM reads its configuration as a GLib key file: a ';' line is
+#      "not a key-value pair, group, or comment" and the whole file is
+#      dropped. The seat configuration carries the slug in its name, so
+#      that the image of a fork does not carry the name of the template.
+#      The build's own substitution and rename are run with another slug.
+_m4="$work/m4"
+mkdir -p "$_m4/stage"
+cp -Rp "$repo/overlay/base/rootfs/." "$_m4/stage/"
+cp -Rp "$repo/overlay/profiles/desktop/rootfs/." "$_m4/stage/"
+{ _bfunc sed_esc; _bfunc mk_subst; _bfunc subst_overlay; _bfunc rename_slug; } > "$_m4/f.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	DISTRO_NAME=OtherBSD MOTD=motd DISTRO_SLUG=otherbsd BRAND_URL=https://example.org OUT="$_m4"
+	. "$_m4/f.sh"
+	mk_subst
+	subst_overlay "$_m4/stage" "$repo/overlay/base/rootfs"
+	subst_overlay "$_m4/stage" "$repo/overlay/profiles/desktop/rootfs"
+	rename_slug "$_m4/stage"
+) > "$_m4/out" 2>&1
+_m4rc=$?
+_ld="$_m4/stage/usr/local/etc/lightdm"
+if [ "$_m4rc" -eq 0 ] && [ -f "$_ld/lightdm.conf.d/50-otherbsd.conf" ]; then
+	ok "the LightDM seat configuration is named after the slug (50-<slug>.conf)"
+else
+	no "the LightDM seat configuration is named after the slug (50-<slug>.conf) (rc=$_m4rc)"
+	ls "$_ld/lightdm.conf.d" 2> /dev/null | sed 's/^/      | /'
+fi
+_ldbad=$(find "$_ld" -type f \( -name '*.conf' -o -name '*examplebsd*' -o -name '*@SLUG@*' \) 2> /dev/null |
+	while IFS= read -r _f; do
+		case $_f in *examplebsd* | *@SLUG@*) printf ' %s' "${_f#"$_ld"/}"; continue ;; esac
+		grep -qi 'examplebsd\|@SLUG@' "$_f" && printf ' %s' "${_f#"$_ld"/}"
+	done)
+if [ "$_m4rc" -eq 0 ] && [ -d "$_ld/lightdm.conf.d" ] && [ -z "$_ldbad" ]; then
+	ok "the staged LightDM configuration carries no examplebsd and no @SLUG@ (slug otherbsd)"
+else
+	no "the staged LightDM configuration carries no examplebsd and no @SLUG@ (slug otherbsd):$_ldbad"
+fi
+_ldsemi=''
+for _f in "$_ld"/lightdm.conf.d/* "$_ld/lightdm-gtk-greeter.conf"; do
+	[ -f "$_f" ] || continue
+	grep -q '^[[:space:]]*;' "$_f" && _ldsemi="$_ldsemi ${_f#"$_ld"/}"
+done
+if [ "$_m4rc" -eq 0 ] && [ -z "$_ldsemi" ] && [ -n "$(ls "$_ld/lightdm.conf.d" 2> /dev/null)" ]; then
+	ok "no LightDM configuration has a ';' comment line (GLib key files take '#')"
+else
+	no "no LightDM configuration has a ';' comment line (GLib key files take '#'):$_ldsemi"
+fi
+# the X fallback is staged under the slug and the rc.d script points at it
+if [ -f "$_m4/stage/usr/local/share/otherbsd/xorg/20-scfb.conf" ] &&
+	grep -q '/usr/local/share/otherbsd/xorg/20-scfb.conf' "$_m4/stage/etc/rc.d/xorg_fallback" 2> /dev/null; then
+	ok "the X fallback is staged under /usr/local/share/<slug> and rc.d/xorg_fallback points at it"
+else
+	no "the X fallback is staged under /usr/local/share/<slug> and rc.d/xorg_fallback points at it"
+fi
+
+# (m5) the size of the media: the stage carried the package cache of
+#      pkg -r and the debug files of world and kernel (kernel.debug).
+#      Both are removed; KEEP_DEBUG=yes keeps the debug files.
+_after_pkg 'the removal of the package cache and the debug files' 'prune_stage "\$STAGE"'
+_m5="$work/m5"
+_m5stage() {
+	rm -rf "$_m5/out/stage"
+	mkdir -p "$_m5/out/stage/var/cache/pkg/All" "$_m5/out/stage/usr/lib/debug/boot/kernel" \
+		"$_m5/out/stage/boot/kernel" "$_m5/out/stage/usr/lib"
+	: > "$_m5/out/stage/var/cache/pkg/All/xorg-7.7_3.pkg"
+	: > "$_m5/out/stage/var/cache/pkg/xorg-7.7_3~0123456789.pkg"
+	: > "$_m5/out/stage/usr/lib/debug/boot/kernel/kernel.debug"
+	: > "$_m5/out/stage/boot/kernel/kernel"
+	: > "$_m5/out/stage/boot/kernel/zfs.ko"
+	: > "$_m5/out/stage/boot/kernel/kernel.debug"
+	: > "$_m5/out/stage/boot/kernel/zfs.ko.debug"
+	: > "$_m5/out/stage/usr/lib/libc.so.7"
+}
+{ _bfunc rmrf; _bfunc in_stage; _bfunc prune_stage; } > "$_m5.f.sh"
+_m5run() { # _m5run yes|no
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		OUT="$_m5/out" KEEP_DEBUG=$1
+		. "$_m5.f.sh"
+		prune_stage "$_m5/out/stage"
+	) > "$_m5/log" 2>&1
+	_m5rc=$?
+}
+mkdir -p "$_m5"
+_m5stage
+_m5run no
+_st="$_m5/out/stage"
+if [ "$_m5rc" -eq 0 ] && [ -d "$_st/var/cache/pkg" ] && [ -z "$(ls -A "$_st/var/cache/pkg")" ]; then
+	ok "build.sh: the package cache is removed from the stage (the directory stays)"
+else
+	no "build.sh: the package cache is removed from the stage (the directory stays) (rc=$_m5rc)"
+fi
+if [ "$_m5rc" -eq 0 ] && [ ! -e "$_st/usr/lib/debug" ] && [ ! -e "$_st/boot/kernel/kernel.debug" ] &&
+	[ ! -e "$_st/boot/kernel/zfs.ko.debug" ]; then
+	ok "build.sh: /usr/lib/debug and the *.debug files under /boot are removed by default"
+else
+	no "build.sh: /usr/lib/debug and the *.debug files under /boot are removed by default (rc=$_m5rc)"
+fi
+if [ -f "$_st/boot/kernel/kernel" ] && [ -f "$_st/boot/kernel/zfs.ko" ] && [ -f "$_st/usr/lib/libc.so.7" ]; then
+	ok "build.sh: the kernel, the modules and the libraries stay"
+else
+	no "build.sh: the kernel, the modules and the libraries stay"
+fi
+_m5stage
+_m5run yes
+if [ "$_m5rc" -eq 0 ] && [ -f "$_st/usr/lib/debug/boot/kernel/kernel.debug" ] && [ -f "$_st/boot/kernel/zfs.ko.debug" ] &&
+	[ -z "$(ls -A "$_st/var/cache/pkg" 2> /dev/null)" ]; then
+	ok "build.sh: KEEP_DEBUG=yes keeps the debug files (the package cache still goes)"
+else
+	no "build.sh: KEEP_DEBUG=yes keeps the debug files (the package cache still goes) (rc=$_m5rc)"
+fi
+KEEP_DEBUG=maybe sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > /dev/null 2>&1 \
+	&& no "build.sh: KEEP_DEBUG other than yes or no is refused" \
+	|| ok "build.sh: KEEP_DEBUG other than yes or no is refused"
+sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m5.log" 2>&1
+if grep -q 'var/cache/pkg' "$work/m5.log" && grep -q 'usr/lib/debug' "$work/m5.log" &&
+	grep -q 'spiceqxl.xorg.conf' "$work/m5.log"; then
+	ok "build.sh: the dry run prints the removal of the package cache, the debug files and the Xspice config"
+else
+	no "build.sh: the dry run prints the removal of the package cache, the debug files and the Xspice config"
+fi
+
+# (m6) a pkg upgrade of xf86-video-qxl creates spiceqxl.xorg.conf again
+#      from its sample: rc.d/xorg_fallback removes it at every boot while
+#      it is byte-identical to the sample, and keeps an edited one.
+_xq="$_m2/xorg.conf.d/spiceqxl.xorg.conf"
+for _sx in sample example; do
+	rm -f "$_m2/xorg.conf.d/"spiceqxl*
+	printf 'Section "Device"\n\tDriver "spiceqxl"\nEndSection\n' > "$_xq.$_sx"
+	cp "$_xq.$_sx" "$_xq"
+	_xrun no
+	if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && [ ! -e "$_xq" ] && [ -f "$_xq.$_sx" ]; then
+		ok "rc.d/xorg_fallback: spiceqxl.xorg.conf identical to its .$_sx is removed at boot (the .$_sx stays)"
+	else
+		no "rc.d/xorg_fallback: spiceqxl.xorg.conf identical to its .$_sx is removed at boot (the .$_sx stays) (rc=$_xrc)"
+	fi
+done
+printf '# edited by the administrator\n' >> "$_xq.example"
+cp "$_xq.example" "$_xq"
+printf 'Section "Device"\n\tDriver "spiceqxl"\nEndSection\n' > "$_xq.example"
+_xrun yes
+if [ "$_xrc" -eq 0 ] && [ -f "$_m2/xorg_fallback" ] && grep -q 'edited by the administrator' "$_xq" 2> /dev/null; then
+	ok "rc.d/xorg_fallback: an edited spiceqxl.xorg.conf is kept"
+else
+	no "rc.d/xorg_fallback: an edited spiceqxl.xorg.conf is kept (rc=$_xrc)"
+fi
+rm -f "$_m2/xorg.conf.d/"spiceqxl*
+printf 'x\n' > "$_xq"
+_xrun no
+if [ "$_xrc" -eq 0 ] && [ -f "$_xq" ]; then
+	ok "rc.d/xorg_fallback: a spiceqxl.xorg.conf without a sample is kept"
+else
+	no "rc.d/xorg_fallback: a spiceqxl.xorg.conf without a sample is kept (rc=$_xrc)"
+fi
+rm -f "$_m2/xorg.conf.d/"spiceqxl*
+
+# (m7) a kmod only works on the kernel it was built for. A package is a
+#      kmod when it owns a .ko file (the meta packages own none and have
+#      no FreeBSD_version annotation); one built for another
+#      __FreeBSD_version than the src tree is rebuilt from the ports tree
+#      against that src (KMOD_REBUILD=yes, the default), installed over
+#      the repository's copy and locked; the check then passes. The
+#      annotations are the rows of the FreeBSD:16:amd64 repositories in
+#      tests/fixtures/kmod-annotations.txt (kmods built for 1600029, meta
+#      packages without FreeBSD_version); the src tree is 1600028.
+_after_pkg 'the kmod rebuild' 'rebuild_kmods "\$STAGE" "\$SRC"'
+_after_pkg 'the kmod/kernel version check' 'check_kmods "\$STAGE" "\$SRC"'
+_l_rb=$(_bline 'rebuild_kmods "\$STAGE" "\$SRC"')
+_l_ck=$(_bline 'check_kmods "\$STAGE" "\$SRC"')
+_l_tr=$(_bline 'pkg_triggers "\$STAGE"')
+if [ -n "$_l_rb" ] && [ -n "$_l_ck" ] && [ -n "$_l_tr" ] && [ "$_l_rb" -lt "$_l_ck" ] && [ "$_l_ck" -lt "$_l_tr" ]; then
+	ok "build.sh: the kmods are rebuilt, then checked, then the triggers run"
+else
+	no "build.sh: the kmods are rebuilt, then checked, then the triggers run"
+fi
+_m7="$work/m7"
+rm -rf "$_m7"
+mkdir -p "$_m7/bin" "$_m7/src/sys/sys" "$_m7/stage" "$_m7/fx" "$_m7/ports/Mk" "$_m7/o"
+: > "$_m7/ports/Mk/bsd.port.mk"
+for _o in graphics/drm-latest-kmod graphics/drm-kmod graphics/gpu-firmware-kmod \
+	x11/nvidia-kmod graphics/nvidia-drm-latest-kmod graphics/gpu-firmware-amd-kmod; do
+	mkdir -p "$_m7/ports/$_o"
+	: > "$_m7/ports/$_o/Makefile"
+done
+# "pkg query -a '%n %Fp'": the meta packages own no .ko
+cat > "$_m7/fx/files" <<'FILES'
+drm-kmod /usr/local/share/licenses/drm-kmod-20250428/catalog.mk
+drm-latest-kmod /boot/modules/amdgpu.ko
+drm-latest-kmod /boot/modules/drm.ko
+drm-latest-kmod /boot/modules/i915kms.ko
+drm-latest-kmod /usr/local/share/doc/drm-latest-kmod/README
+gpu-firmware-kmod /usr/local/share/licenses/gpu-firmware-kmod-20250604,1/catalog.mk
+gpu-firmware-amd-kmod-fiji /boot/modules/amdgpu_fiji_ce_bin.ko
+gpu-firmware-amd-kmod-fiji /boot/modules/amdgpu_fiji_mc_bin.ko
+nvidia-kmod /boot/modules/nvidia.ko
+nvidia-drm-latest-kmod /boot/modules/nvidia-drm.ko
+nvidia-drm-kmod /usr/local/share/licenses/nvidia-drm-kmod-580.82.07/catalog.mk
+xorg /usr/local/share/licenses/xorg-7.7_3/catalog.mk
+FILES
+printf 'graphics/drm-latest-kmod\n' > "$_m7/fx/origin.drm-latest-kmod"
+printf 'graphics/gpu-firmware-amd-kmod\n' > "$_m7/fx/origin.gpu-firmware-amd-kmod-fiji"
+printf 'x11/nvidia-kmod\n' > "$_m7/fx/origin.nvidia-kmod"
+printf 'graphics/nvidia-drm-latest-kmod\n' > "$_m7/fx/origin.nvidia-drm-latest-kmod"
+_m7fix="$repo/tests/fixtures/kmod-annotations.txt"
+_m7names='drm-kmod gpu-firmware-kmod nvidia-drm-kmod drm-latest-kmod nvidia-kmod nvidia-drm-latest-kmod gpu-firmware-amd-kmod-fiji xorg'
+_m7fx() { # _m7fx — the stage after pkg -r install: the annotations of the repository
+	for _k in $_m7names; do
+		awk -v n="$_k" '$1 == n { print $2, $3 }' "$_m7fix" > "$_m7/fx/ann.$_k"
+	done
+}
+_m7src() { # _m7src <version> — the __FreeBSD_version of the src tree
+	printf '#define __FreeBSD_version %s\t/* Master, propagated to newvers */\n' "$1" > "$_m7/src/sys/sys/param.h"
+}
+cat > "$_m7/bin/pkg" <<'STUBPKG'
+#!/bin/sh
+# pkg stub over the fixtures in $STUB_FX: query -a '%n %Fp', query
+# '%At %Av' <name>, query %o <name>; "add -f <file>" installs the
+# annotations of the rebuilt package ($STUB_FX/rebuilt.<name>, named by
+# the file <name>.pkg) unless STUB_ADD=stale; lock is logged
+printf 'pkg %s\n' "$*" >> "$STUB_LOG"
+[ "$1" = -r ] || exit 1
+shift 2
+case $1 in
+query)
+	case $2 in
+	-a) cat "$STUB_FX/files" ;;
+	'%At %Av') cat "$STUB_FX/ann.$3" 2> /dev/null ;;
+	%o) cat "$STUB_FX/origin.$3" ;;
+	*) exit 1 ;;
+	esac
+	;;
+add)
+	_n=$(basename "$3" .pkg)
+	[ "${STUB_ADD:-ok}" = stale ] || cp "$STUB_FX/rebuilt.$_n" "$STUB_FX/ann.$_n"
+	;;
+lock) ;;
+*) exit 1 ;;
+esac
+exit 0
+STUBPKG
+cat > "$_m7/bin/make" <<'STUBMAKE'
+#!/bin/sh
+# make stub: logs ABI, OSVERSION of its environment and its arguments.
+# Like bsd.port.mk, PKGFILE is ${PACKAGES}/All/<pkg>.pkg only when the
+# PACKAGES directory exists (else the port directory), and "package"
+# writes the package only into an existing PACKAGES directory; with
+# STUB_MAKE=nopkg it writes nothing
+printf 'make ABI=%s ENV_OSVERSION=%s %s\n' "${ABI:-}" "${OSVERSION:-}" "$*" >> "$STUB_LOG"
+_d=$2
+case $_d in
+*/drm-latest-kmod) _n=drm-latest-kmod ;;
+*/gpu-firmware-amd-kmod) _n=gpu-firmware-amd-kmod-fiji ;;
+*/nvidia-drm-latest-kmod) _n=nvidia-drm-latest-kmod ;;
+*/nvidia-kmod) _n=nvidia-kmod ;;
+*) exit 1 ;;
+esac
+_pk=''
+for _a in "$@"; do
+	case $_a in PACKAGES=*) _pk=${_a#PACKAGES=} ;; esac
+done
+if [ -n "$_pk" ] && [ -d "$_pk" ]; then _pf="$_pk/All/$_n.pkg"; else _pf="$_d/$_n.pkg"; fi
+for _a in "$@"; do
+	case $_a in
+	PKGFILE) printf '%s\n' "$_pf"; exit 0 ;;
+	package)
+		if [ "${STUB_MAKE:-ok}" = ok ] && [ -n "$_pk" ] && [ -d "$_pk" ]; then
+			mkdir -p "$_pk/All" && : > "$_pf"
+		fi
+		;;
+	esac
+done
+exit 0
+STUBMAKE
+chmod 755 "$_m7/bin/pkg" "$_m7/bin/make"
+{ _bfunc rmrf; _bfunc src_version; _bfunc pkg_note; _bfunc kmod_mismatches; _bfunc need_ports; _bfunc rebuild_kmods; _bfunc check_kmods; } > "$_m7/f.sh"
+# a package rebuilt against the src tree: the annotations of the
+# repository's build, with the FreeBSD_version of the src tree
+for _k in drm-latest-kmod nvidia-kmod nvidia-drm-latest-kmod gpu-firmware-amd-kmod-fiji; do
+	awk -v n="$_k" '$1 == n { if ($2 == "FreeBSD_version") $3 = 1600028; print $2, $3 }' "$_m7fix" > "$_m7/fx/rebuilt.$_k"
+done
+if [ "$(grep -c '^[^#]* FreeBSD_version ' "$_m7fix" 2> /dev/null)" -eq 4 ] &&
+	! grep -Eq '^(drm-kmod|gpu-firmware-kmod|nvidia-drm-kmod) FreeBSD_version ' "$_m7fix"; then
+	ok "the kmod fixture: the four kmods carry FreeBSD_version, the meta packages do not"
+else
+	no "the kmod fixture: the four kmods carry FreeBSD_version, the meta packages do not"
+fi
+_m7run() { # _m7run <KMOD_REBUILD> <ALLOW_KMOD_MISMATCH> [PORTS] — rebuild, then check
+	: > "$_m7/log"
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		log() { printf '%s\n' "$*"; }
+		PATH="$_m7/bin:$PATH" STUB_LOG="$_m7/log" STUB_FX="$_m7/fx"
+		KMOD_REBUILD=$1 ALLOW_KMOD_MISMATCH=$2 PORTS=${3:-$_m7/ports} MARC=amd64 OUT="$_m7/o"
+		export PATH STUB_LOG STUB_FX
+		KMOD_MM=''
+		. "$_m7/f.sh"
+		rebuild_kmods "$_m7/stage" "$_m7/src"
+		check_kmods "$_m7/stage" "$_m7/src"
+	) > "$_m7/out" 2>&1
+	_m7rc=$?
+}
+# the kmods match the src tree: nothing is rebuilt, the meta packages pass
+_m7fx
+_m7src 1600029
+_m7run yes no
+if [ "$_m7rc" -eq 0 ] && [ -s "$_m7/f.sh" ] && grep -q "query %At %Av drm-latest-kmod" "$_m7/log" &&
+	! grep -q '^make ' "$_m7/log" && ! grep -Eq 'query %At %Av (drm-kmod|gpu-firmware-kmod|nvidia-drm-kmod|xorg)$' "$_m7/log"; then
+	ok "build.sh: kmods built for the src tree pass; only packages owning a .ko are checked (meta packages are not)"
+else
+	no "build.sh: kmods built for the src tree pass; only packages owning a .ko are checked (meta packages are not) (rc=$_m7rc)"
+	sed 's/^/      | /' "$_m7/out" 2> /dev/null
+fi
+# the repository's kmods are 1600029, the src tree is 1600028:
+# KMOD_REBUILD=no fails, naming them
+_m7fx
+_m7src 1600028
+_m7run no no
+if [ "$_m7rc" -ne 0 ] && grep -q 'drm-latest-kmod: built for 1600029, kernel is 1600028' "$_m7/out" &&
+	grep -q 'gpu-firmware-amd-kmod-fiji: built for 1600029, kernel is 1600028' "$_m7/out" &&
+	! grep -Eq '  (drm-kmod|gpu-firmware-kmod|nvidia-drm-kmod):' "$_m7/out"; then
+	ok "build.sh: a kmod built for another __FreeBSD_version fails the build (KMOD_REBUILD=no), naming it and both versions"
+else
+	no "build.sh: a kmod built for another __FreeBSD_version fails the build (KMOD_REBUILD=no), naming it and both versions (rc=$_m7rc)"
+	sed 's/^/      | /' "$_m7/out" 2> /dev/null
+fi
+_m7run no yes
+if [ "$_m7rc" -eq 0 ] && grep -q 'WARNING: kmod packages do not match' "$_m7/out" &&
+	grep -q 'drm-latest-kmod: built for 1600029, kernel is 1600028' "$_m7/out"; then
+	ok "build.sh: ALLOW_KMOD_MISMATCH=yes turns the mismatch into a warning"
+else
+	no "build.sh: ALLOW_KMOD_MISMATCH=yes turns the mismatch into a warning (rc=$_m7rc)"
+fi
+# KMOD_REBUILD=yes: each mismatched kmod is rebuilt against the src tree
+_m7fx
+_m7run yes no
+_m7mk="make ABI=FreeBSD:16:amd64 ENV_OSVERSION=1600028 -C $_m7/ports/graphics/drm-latest-kmod SRC_BASE=$_m7/src OSVERSION=1600028 BATCH=yes DISABLE_VULNERABILITIES=yes PACKAGES=$_m7/o/kmod-packages clean package"
+if grep -qxF "$_m7mk" "$_m7/log"; then
+	ok "build.sh: a mismatched kmod is rebuilt from its port with SRC_BASE, OSVERSION and the ABI of the src tree"
+else
+	no "build.sh: a mismatched kmod is rebuilt from its port with SRC_BASE, OSVERSION and the ABI of the src tree"
+	sed 's/^/      | /' "$_m7/log" "$_m7/out" 2> /dev/null
+fi
+if grep -q "^make .*-C $_m7/ports/graphics/gpu-firmware-amd-kmod .*FLAVOR=fiji clean package" "$_m7/log"; then
+	ok "build.sh: a flavoured kmod is rebuilt with its FLAVOR"
+else
+	no "build.sh: a flavoured kmod is rebuilt with its FLAVOR"
+fi
+if grep -qxF "pkg -r $_m7/stage add -f $_m7/o/kmod-packages/All/drm-latest-kmod.pkg" "$_m7/log" &&
+	grep -qxF "pkg -r $_m7/stage lock -y drm-latest-kmod" "$_m7/log"; then
+	ok "build.sh: the rebuilt kmod is installed into the stage over the repository's copy and locked"
+else
+	no "build.sh: the rebuilt kmod is installed into the stage over the repository's copy and locked"
+fi
+if ! grep -Eq '^make .*/(drm-kmod|gpu-firmware-kmod|nvidia-drm-kmod) ' "$_m7/log" && [ -s "$_m7/log" ]; then
+	ok "build.sh: the meta packages are never rebuilt"
+else
+	no "build.sh: the meta packages are never rebuilt"
+fi
+if [ "$_m7rc" -eq 0 ] && ! grep -q 'do not match' "$_m7/out" && grep -q '^make ' "$_m7/log"; then
+	ok "build.sh: after the rebuild the kmod check passes"
+else
+	no "build.sh: after the rebuild the kmod check passes (rc=$_m7rc)"
+	sed 's/^/      | /' "$_m7/out" 2> /dev/null
+fi
+# a rebuild that still carries the wrong version fails the check
+_m7fx
+STUB_ADD=stale
+export STUB_ADD
+_m7run yes no
+unset STUB_ADD
+if [ "$_m7rc" -ne 0 ] && grep -q 'drm-latest-kmod: built for 1600029, kernel is 1600028' "$_m7/out"; then
+	ok "build.sh: a rebuilt kmod that still does not match fails the build"
+else
+	no "build.sh: a rebuilt kmod that still does not match fails the build (rc=$_m7rc)"
+fi
+# the ports tree has no packages/ directory (a fresh clone): the
+# rebuilt packages go to an emptied directory of the build, so a stale
+# package left there by an earlier build is never installed
+_m7fx
+mkdir -p "$_m7/o/kmod-packages/All"
+: > "$_m7/o/kmod-packages/All/stale-kmod.pkg"
+_m7run yes no
+if [ "$_m7rc" -eq 0 ] && [ ! -e "$_m7/o/kmod-packages/All/stale-kmod.pkg" ] &&
+	[ -f "$_m7/o/kmod-packages/All/drm-latest-kmod.pkg" ] && [ ! -d "$_m7/ports/packages" ] &&
+	grep -q "PACKAGES=$_m7/o/kmod-packages -V PKGFILE" "$_m7/log"; then
+	ok "build.sh: the rebuilt kmods go to an emptied PACKAGES of the build (a fresh ports tree has none)"
+else
+	no "build.sh: the rebuilt kmods go to an emptied PACKAGES of the build (a fresh ports tree has none) (rc=$_m7rc)"
+	sed 's/^/      | /' "$_m7/out" 2> /dev/null
+fi
+# make succeeded but wrote no package: the build fails, nothing is added
+_m7fx
+STUB_MAKE=nopkg
+export STUB_MAKE
+_m7run yes no
+unset STUB_MAKE
+if [ "$_m7rc" -ne 0 ] && grep -q 'left no' "$_m7/out" && ! grep -q ' add -f ' "$_m7/log"; then
+	ok "build.sh: a make package that leaves no package fails the build"
+else
+	no "build.sh: a make package that leaves no package fails the build (rc=$_m7rc)"
+fi
+# the origin and the flavor reach make(1): only port directory and
+# flavor characters pass
+_m7fx
+printf 'graphics/drm-latest-kmod:Q\n' > "$_m7/fx/origin.drm-latest-kmod"
+_m7run yes no
+printf 'graphics/drm-latest-kmod\n' > "$_m7/fx/origin.drm-latest-kmod"
+if [ "$_m7rc" -ne 0 ] && grep -q "refusing the origin 'graphics/drm-latest-kmod:Q'" "$_m7/out" && ! grep -q '^make ' "$_m7/log"; then
+	ok "build.sh: an origin that is not category/port is refused before make"
+else
+	no "build.sh: an origin that is not category/port is refused before make (rc=$_m7rc)"
+fi
+_m7fx
+sed 's/^flavor fiji$/flavor fiji:S,x,y,/' "$_m7/fx/ann.gpu-firmware-amd-kmod-fiji" > "$_m7/fx/ann.tmp"
+mv "$_m7/fx/ann.tmp" "$_m7/fx/ann.gpu-firmware-amd-kmod-fiji"
+_m7run yes no
+if [ "$_m7rc" -ne 0 ] && grep -q "refusing the flavor 'fiji:S,x,y,'" "$_m7/out" &&
+	! grep -q 'gpu-firmware-amd-kmod .*clean package' "$_m7/log"; then
+	ok "build.sh: a flavor that is not [A-Za-z0-9_]+ is refused before make"
+else
+	no "build.sh: a flavor that is not [A-Za-z0-9_]+ is refused before make (rc=$_m7rc)"
+fi
+# no ports tree: a clear refusal, nothing is built
+_m7fx
+_m7run yes no "$_m7/noports"
+if [ "$_m7rc" -ne 0 ] && grep -q 'git clone --depth 1 https://git.FreeBSD.org/ports.git' "$_m7/out" &&
+	grep -q 'KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes' "$_m7/out" && ! grep -q '^make ' "$_m7/log"; then
+	ok "build.sh: KMOD_REBUILD=yes without a ports tree refuses clearly (clone it, or KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes)"
+else
+	no "build.sh: KMOD_REBUILD=yes without a ports tree refuses clearly (clone it, or KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes) (rc=$_m7rc)"
+fi
+# a cross build cannot rebuild: a clear refusal
+_m7fx
+PKG_ABI=FreeBSD:16:aarch64
+export PKG_ABI
+_m7run yes no
+unset PKG_ABI
+if [ "$_m7rc" -ne 0 ] && grep -q 'cross build cannot' "$_m7/out" && ! grep -q '^make ' "$_m7/log"; then
+	ok "build.sh: a cross build (PKG_ABI) refuses the kmod rebuild clearly"
+else
+	no "build.sh: a cross build (PKG_ABI) refuses the kmod rebuild clearly (rc=$_m7rc)"
+fi
+: > "$_m7/src/sys/sys/param.h"
+_m7run no no
+if [ "$_m7rc" -ne 0 ] && grep -q 'cannot read __FreeBSD_version' "$_m7/out"; then
+	ok "build.sh: a src tree without __FreeBSD_version fails the kmod check"
+else
+	no "build.sh: a src tree without __FreeBSD_version fails the kmod check (rc=$_m7rc)"
+fi
+for _kn in ALLOW_KMOD_MISMATCH KMOD_REBUILD; do
+	env "$_kn=maybe" sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > /dev/null 2>&1 \
+		&& no "build.sh: $_kn other than yes or no is refused" \
+		|| ok "build.sh: $_kn other than yes or no is refused"
+done
+PORTS="$_m7/noports" sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m7.log" 2>&1
+if grep -q "note: no ports tree at $_m7/noports" "$work/m7.log" && grep -q 'clean package' "$work/m7.log"; then
+	ok "build.sh: the dry run notes a missing ports tree and prints the kmod rebuild"
+else
+	no "build.sh: the dry run notes a missing ports tree and prints the kmod rebuild"
+fi
+
+PKG_ABI=FreeBSD:16:aarch64 PORTS="$_m7/noports" sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m7x.log" 2>&1
+if [ -s "$work/m7x.log" ] && ! grep -q 'note: no ports tree' "$work/m7x.log" && grep -q 'clean package' "$work/m7x.log"; then
+	ok "build.sh: a cross build (PKG_ABI) does not ask for the ports tree up front"
+else
+	no "build.sh: a cross build (PKG_ABI) does not ask for the ports tree up front"
+fi
+
+# (m8) a cross-arch stage (PKG_ABI) holds binaries the build host cannot
+#      run: the triggers and the chroot steps are skipped with a warning
+_s="$_m3/s6"
+_m3stage "$_s" tools
+PKG_ABI=FreeBSD:16:aarch64
+export PKG_ABI
+_m3run "$_s"
+unset PKG_ABI
+if [ "$_m3rc" -eq 0 ] && [ -s "$_m3/f.sh" ] && grep -q 'WARNING: PKG_ABI' "$_m3/out" && [ ! -s "$_m3/log" ]; then
+	ok "build.sh: with PKG_ABI the triggers and the chroot steps are skipped with a warning"
+else
+	no "build.sh: with PKG_ABI the triggers and the chroot steps are skipped with a warning (rc=$_m3rc)"
+fi
+
+# (m9b) the last component counts too: a staged path that is a symlink
+#       to a FILE outside the stage is refused, and the file survives
+for _lk in var/cache/pkg usr/lib/debug; do
+	_m5stage
+	rm -rf "$_m5/host"
+	mkdir -p "$_m5/host"
+	printf 'keep\n' > "$_m5/host/outside.file"
+	rm -rf "${_st:?}/$_lk"
+	ln -s "$_m5/host/outside.file" "$_st/$_lk"
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		OUT="$_m5/out" KEEP_DEBUG=no
+		. "$_m5.f.sh"
+		prune_stage "$_m5/out/stage"
+	) > "$_m5/log" 2>&1
+	_m5rc=$?
+	if [ "$_m5rc" -ne 0 ] && grep -q 'outside the stage' "$_m5/log" && grep -qx keep "$_m5/host/outside.file" 2> /dev/null; then
+		ok "build.sh: prune_stage refuses a stage whose $_lk is a symlink to a file out of the stage"
+	else
+		no "build.sh: prune_stage refuses a stage whose $_lk is a symlink to a file out of the stage (rc=$_m5rc)"
+		sed 's/^/      | /' "$_m5/log" 2> /dev/null
+	fi
+done
+sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m9.log" 2>&1
+if grep -qF "find $work/out/desktop/stage/boot -type f -name '*.debug' -exec rm -f -- {} +" "$work/m9.log"; then
+	ok "build.sh: the dry run prints the find command that removes the debug files under /boot"
+else
+	no "build.sh: the dry run prints the find command that removes the debug files under /boot"
+fi
+_m7src 1600028
+: > "$_m7/src/sys/sys/param.h"
+_m7run yes no
+if [ "$_m7rc" -ne 0 ] && grep -q 'check that SRC is a complete FreeBSD src tree' "$_m7/out"; then
+	ok "build.sh: a src tree without __FreeBSD_version is refused with the remedy"
+else
+	no "build.sh: a src tree without __FreeBSD_version is refused with the remedy (rc=$_m7rc)"
+fi
+
+# (m9) prune_stage refuses a path that a symlink in the stage leads out
+#      of the stage (a staged var -> /var would rm the host's cache)
+for _lk in var usr/lib boot; do
+	_m5stage
+	rm -rf "$_m5/host"
+	mkdir -p "$_m5/host/cache/pkg" "$_m5/host/debug" "$_m5/host/kernel"
+	: > "$_m5/host/cache/pkg/keep.pkg"
+	: > "$_m5/host/debug/keep.debug"
+	: > "$_m5/host/kernel/keep.debug"
+	case $_lk in
+	var) rm -rf "$_st/var" && ln -s "$_m5/host" "$_st/var" ;;
+	usr/lib) rm -rf "$_st/usr/lib" && ln -s "$_m5/host" "$_st/usr/lib" ;;
+	boot) rm -rf "$_st/boot" && ln -s "$_m5/host" "$_st/boot" ;;
+	esac
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		OUT="$_m5/out" KEEP_DEBUG=no
+		. "$_m5.f.sh"
+		prune_stage "$_m5/out/stage"
+	) > "$_m5/log" 2>&1
+	_m5rc=$?
+	if [ "$_m5rc" -ne 0 ] && grep -q 'outside the stage' "$_m5/log" && [ -f "$_m5/host/cache/pkg/keep.pkg" ] &&
+		[ -f "$_m5/host/debug/keep.debug" ] && [ -f "$_m5/host/kernel/keep.debug" ]; then
+		ok "build.sh: prune_stage refuses a stage whose $_lk is a symlink out of the stage"
+	else
+		no "build.sh: prune_stage refuses a stage whose $_lk is a symlink out of the stage (rc=$_m5rc)"
+		sed 's/^/      | /' "$_m5/log" 2> /dev/null
+	fi
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
