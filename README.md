@@ -35,8 +35,9 @@ are built with stock release(7)-style tooling:
     └── profiles/
         ├── appliance/       headless: packages.list (empty-ish), loader.conf.d,
         │                    rc.conf.d/sshd, sshd_config.d
-        └── desktop/         X11 only: packages.list, branding.conf, rc.conf.d/{dbus,lightdm},
-                           lightdm configs under rootfs/usr/local/etc
+        └── desktop/         X11 only: packages.list, branding.conf, rc.conf.d/{dbus,lightdm,xorg_fallback},
+                           rc.d/xorg_fallback, usr/local/share/@SLUG@/xorg/20-scfb.conf,
+                           lightdm configs under rootfs/usr/local/etc (lightdm.conf.d/50-@SLUG@.conf)
 ```
 
 ## Overlay rules
@@ -158,6 +159,79 @@ VM of the matching arch). `ROOTSIZE` is a number with an optional `k`, `m`, `g`
 or `t` suffix; the suffix is lowercased, because `makefs(8)` reads a size only
 with a lowercase suffix (`12G` is an illegal number to it). `JOBS` is the
 `make(1)` job count, defaulting to `hw.ncpu` and overridable to any positive integer.
+`KEEP_DEBUG=yes` keeps the standalone debug files of world and kernel
+(`/usr/lib/debug`, `kernel.debug`, `*.ko.debug`) in the image; by default they
+are removed, together with the package cache `pkg -r` leaves in
+`var/cache/pkg`. `KMOD_REBUILD`, `PORTS` and `ALLOW_KMOD_MISMATCH` drive the
+kmod rebuild and check below. With `PKG_ABI` (a cross-arch stage) the package
+triggers and the `chroot` steps are skipped with a warning, because the build
+host cannot run the binaries of the stage.
+
+After the package install the build finishes in the stage what `pkg -r`
+leaves undone: `pkg -r` defers the package triggers (the gdk-pixbuf loader
+cache, the compiled GSettings schemas, the MIME database, the font and icon
+caches) to `var/db/pkg/triggers`, so `pkg -c <stage> triggers` runs them
+chrooted into the stage, with its binaries and files, and a trigger left over
+fails the build; a cache still missing is built with `chroot <stage>`. `pkg -r`
+also looks group names up on the build host, so the dbus launch helper is set
+to `root:messagebus 4750` with `chroot <stage>`. The installation itself stays
+`pkg -r`: `pkg -c` would read the repository configuration of the stage, not
+the one of the build host. `xorg.conf.d/spiceqxl.xorg.conf` (created by
+`xf86-video-qxl`, it makes Xspice the only screen and Xorg crash) is removed;
+on the installed system `rc.d/xorg_fallback` removes it again at every boot
+while it is identical to its sample, because a `pkg upgrade` recreates it.
+The same script installs a `scfb` Device section when the display has no
+`/dev/dri/card0` (a UEFI bhyve guest), and removes it once there is one.
+
+### Kernel modules must match the kernel
+
+The kernel is built from the src tree, but the kmods (`drm-*-kmod`, the
+NVIDIA kmods, `gpu-firmware-*-kmod`) come from the package repository, built
+for the `__FreeBSD_version` that repository targets. On main the two almost
+never agree (the FreeBSD:16 repository builds its kmods for one
+`__FreeBSD_version`, a fresh src tree is usually another), and a kmod built
+for another version can panic the kernel. So after the package install:
+
+1. Every installed package that owns a `.ko` file
+   (`pkg -r <stage> query -a '%n %Fp'`) is compared with
+   `<src>/sys/sys/param.h`: its `FreeBSD_version` annotation
+   (`pkg -r <stage> query '%At %Av' <pkg>`) must be the `__FreeBSD_version`
+   of the src tree. The meta packages (`drm-kmod`, `gpu-firmware-kmod`,
+   `nvidia-drm-kmod`) own no `.ko` and carry no such annotation; they are
+   not looked at.
+2. With `KMOD_REBUILD=yes` (the default) each mismatched kmod is rebuilt from
+   the ports tree (`PORTS`, default `/usr/ports`) against the same src tree:
+   `make -C $PORTS/<origin> SRC_BASE=<src> OSVERSION=<version> BATCH=yes
+   DISABLE_VULNERABILITIES=yes PACKAGES=<out>/kmod-packages [FLAVOR=<flavor>]
+   clean package`, with
+   `ABI=FreeBSD:<major>:<arch>` and `OSVERSION=<version>` in the environment,
+   because `pkg create` writes the `FreeBSD_version` annotation from those
+   two variables. `PACKAGES` points at a directory of this build, emptied
+   first: the ports framework writes the package only into an existing
+   `PACKAGES` directory, and a fresh clone of the ports tree has none. The
+   package lands at `make -V PKGFILE`; it is installed with
+   `pkg -r <stage> add -f` over the repository's copy and locked
+   (`pkg lock`) so that a `pkg upgrade` on the installed system does not bring
+   the repository's copy back (`pkg unlock <name>` before upgrading it by
+   hand).
+3. The check runs again and fails the build naming each kmod and both
+   versions. `ALLOW_KMOD_MISMATCH=yes` makes it a warning instead (the
+   explicit escape); `KMOD_REBUILD=no` keeps the repository's kmods.
+
+A desktop build with `KMOD_REBUILD=yes` refuses to start without a ports
+tree: `git clone --depth 1 https://git.FreeBSD.org/ports.git /usr/ports`, or
+build with `KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=yes`. A cross build
+(`PKG_ABI`) does not need the ports tree to start; it cannot rebuild the
+kmods and refuses when they do not match.
+
+The cost: a shallow ports tree is about a gigabyte on disk. The rebuild runs
+on the build host, as part of the image build. The build dependencies of
+those ports are built from the ports tree too (`BATCH=yes`, no
+`USE_PACKAGE_DEPENDS`) and installed on the build host itself, not in the
+image: the build host ends up with them. A DRM kmod
+is a sizeable kernel build (tens of minutes on a small machine); the NVIDIA
+kmods and the firmware kmods are short. Only the kmods that do not match are
+rebuilt.
 
 The output directory (`-o`, default `./out`) is made absolute before the
 build starts: the build runs `make(1)` inside the source tree, where a

@@ -1,0 +1,45 @@
+# kmod-annotations.txt — "pkg rquery '%n %At %Av'" rows of the FreeBSD:16:amd64
+# package repositories FreeBSD-ports and FreeBSD-ports-kmods (October 2026).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Rows captured from the FreeBSD repositories, with built_by and the git
+# hashes replaced by placeholders. The kmods (they own .ko files) carry
+# FreeBSD_version; the meta packages (drm-kmod, gpu-firmware-kmod,
+# nvidia-drm-kmod) do not. The capture holds only the FreeBSD_version row
+# of nvidia-kmod and nvidia-drm-latest-kmod.
+drm-kmod build_timestamp 2026-10-23T04:23:28+0000
+drm-kmod built_by poudriere-builder
+drm-kmod port_checkout_unclean no
+drm-kmod port_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+drm-kmod ports_top_checkout_unclean no
+drm-kmod ports_top_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+gpu-firmware-kmod build_timestamp 2026-10-22T12:43:28+0000
+gpu-firmware-kmod built_by poudriere-builder
+gpu-firmware-kmod port_checkout_unclean no
+gpu-firmware-kmod port_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+gpu-firmware-kmod ports_top_checkout_unclean no
+gpu-firmware-kmod ports_top_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+nvidia-drm-kmod build_timestamp 2026-10-25T01:12:08+0000
+nvidia-drm-kmod built_by poudriere-builder
+nvidia-drm-kmod port_checkout_unclean no
+nvidia-drm-kmod port_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+nvidia-drm-kmod ports_top_checkout_unclean no
+nvidia-drm-kmod ports_top_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+drm-latest-kmod FreeBSD_version 1600029
+drm-latest-kmod build_timestamp 2026-10-22T05:26:10+0000
+drm-latest-kmod built_by poudriere-builder
+drm-latest-kmod port_checkout_unclean no
+drm-latest-kmod port_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+drm-latest-kmod ports_top_checkout_unclean no
+drm-latest-kmod ports_top_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+nvidia-drm-latest-kmod FreeBSD_version 1600029
+nvidia-kmod FreeBSD_version 1600029
+gpu-firmware-amd-kmod-fiji FreeBSD_version 1600029
+gpu-firmware-amd-kmod-fiji build_timestamp 2026-10-22T01:14:07+0000
+gpu-firmware-amd-kmod-fiji built_by poudriere-builder
+gpu-firmware-amd-kmod-fiji flavor fiji
+gpu-firmware-amd-kmod-fiji port_checkout_unclean no
+gpu-firmware-amd-kmod-fiji port_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
+gpu-firmware-amd-kmod-fiji ports_top_checkout_unclean no
+gpu-firmware-amd-kmod-fiji ports_top_git_hash 0123abcd0123abcd0123abcd0123abcd0123abcd
