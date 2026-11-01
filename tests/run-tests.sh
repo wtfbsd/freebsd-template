@@ -102,7 +102,7 @@ esac
 # (j0b) the placeholder substitution keeps the mode of a file: an overlay
 #       script (usr/local/sbin/@SLUG@-install) that loses its exec bit is
 #       refused by the start script of the live ISO ("Permission denied")
-_sx=$(mktemp -d)
+_sx=$(mktemp -d "${TMPDIR:-/tmp}/wtfbsd-fbsd-sx.XXXXXXXX")
 mkdir -p "$_sx/stage/usr/local/sbin"
 printf '#!/bin/sh\necho @SLUG@\n' > "$_sx/stage/usr/local/sbin/x"
 chmod 755 "$_sx/stage/usr/local/sbin/x"
@@ -268,8 +268,8 @@ jn_code() {
 # jn_block — the block of the Jenkinsfile that starts at a header, with
 # the braces counted. The header is a plain text, not a pattern.
 jn_block() { # jn_block <header-text>
-	jn_code | awk -v hdr="$1" '
-		!inside && index($0, hdr) { inside = 1 }
+	jn_code | hdr="$1" awk '
+		!inside && index($0, ENVIRON["hdr"]) { inside = 1 }
 		inside {
 			rest = $0
 			o = gsub(/\{/, "{", rest)
@@ -294,7 +294,7 @@ jn_sh_code() {
 # jn_sh_files — write every shell block of the pipeline into its own file
 jn_sh_files() { # jn_sh_files <dir>
 	mkdir -p "$1"
-	awk -v dir="$1" "/'''/{ n++; file = sprintf(\"%s/block-%03d.sh\", dir, n); inb = !inb; next } inb { print > file }" \
+	dir="$1" awk "/'''/{ n++; file = sprintf(\"%s/block-%03d.sh\", ENVIRON[\"dir\"], n); inb = !inb; next } inb { print > file }" \
 		"$repo/Jenkinsfile"
 }
 
@@ -1536,7 +1536,7 @@ fi
 
 # (h) opencode.json is valid JSON and names no provider, model, key or MCP server
 if command -v python3 >/dev/null 2>&1; then
-	if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$repo/opencode.json" >/dev/null 2>&1; then
+	if python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$repo/opencode.json" >/dev/null 2>&1; then
 		ok "opencode.json parses as JSON"
 	else
 		no "opencode.json parses as JSON"
@@ -1637,7 +1637,7 @@ tree_names() {
 # (i6) a tree that is not a git checkout has no ignore rules: the files that
 #      .gitignore keeps out of git (the site's own product.conf, the CI run's
 #      files, round reports) are left out of the scan there too.
-_ng=$(mktemp -d)
+_ng=$(mktemp -d "${TMPDIR:-/tmp}/wtfbsd-fbsd-ng.XXXXXXXX")
 mkdir -p "$_ng/console-logs"
 for _f in a.txt product.conf PRODUCT_CONF console-logs/x.addr .wtfbsd-vms ROUND-REPORT-2.md; do
 	printf 'x\n' > "$_ng/$_f"
@@ -2259,6 +2259,92 @@ else
 	ok "firstboot_user: no pw call on a read-only root"
 fi
 
+# (k7) the first-boot script installs the SSH keys into a home that may
+#      already exist. Whoever owns that home can plant symbolic links in
+#      it; root must not write, chmod or chown through them. A .ssh that
+#      is a link to a directory of root, and an authorized_keys that is a
+#      link to a password file, are refused and said, and the targets are
+#      left as they were. A configuration path with a space in it works.
+_k7=$work/k7
+mkdir -p "$_k7/bin" "$_k7/rootdir" "$_k7/etc"
+cp "$STUBS/pw" "$STUBS/logger" "$_k7/bin/"
+cat > "$_k7/bin/chown" <<'K7CHOWN'
+#!/bin/sh
+printf 'chown %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0
+K7CHOWN
+chmod +x "$_k7/bin/pw" "$_k7/bin/logger" "$_k7/bin/chown"
+printf 'root:*:0:0:the master password file stand-in\n' > "$_k7/etc/master.passwd"
+cp "$_k7/etc/master.passwd" "$_k7/master.passwd.orig"
+# every function of the script, with the password file of the test tree
+awk '/^[a-z_]+\(\) \{/,/^\}/' "$_fbrc" | sed "s#/etc/passwd#$_k7/passwd#g" > "$_k7/functions.sh"
+_k7run() { # _k7run <name> <home> <conf> — run the start command once
+	printf 'fbuser:*:1001:1001:Fb User:%s:/bin/sh\n' "$2" > "$_k7/passwd"
+	printf 'USERNAME=fbuser\nWHEEL=no\nSSH_KEY=ssh-ed25519 %s k7\n' 'k7data' > "$3"
+	{
+		cat "$_k7/functions.sh"
+		echo 'root_writable() { return 0; }'
+		printf 'firstboot_user_conf=%s\n' "'$3'"
+		echo 'firstboot_user_start'
+	} > "$_k7/$1.sh"
+	PATH="$_k7/bin:$PATH" STUB_LOG="$_k7/$1.stub" sh "$_k7/$1.sh" > "$_k7/$1.out" 2>&1
+	_k7rc=$?
+}
+# .ssh is a link to a directory of root
+mkdir -p "$_k7/home-a"
+ln -s "$_k7/rootdir" "$_k7/home-a/.ssh"
+_k7run a "$_k7/home-a" "$_k7/a.conf"
+if [ "$_k7rc" -ne 0 ] && grep -q 'refused.*home-a/.ssh is a symbolic link' "$_k7/a.out" &&
+	[ -z "$(ls -A "$_k7/rootdir")" ] && ! grep -q '^chown' "$_k7/a.stub" 2> /dev/null; then
+	ok "firstboot_user: a .ssh that is a symbolic link is refused, and its target is untouched"
+else
+	no "firstboot_user: a .ssh that is a symbolic link is refused, and its target is untouched (rc=$_k7rc)"
+	sed 's/^/      | /' "$_k7/a.out"
+fi
+# authorized_keys is a link to the password file
+mkdir -p "$_k7/home-b/.ssh"
+ln -s "$_k7/etc/master.passwd" "$_k7/home-b/.ssh/authorized_keys"
+_k7run b "$_k7/home-b" "$_k7/b.conf"
+if [ "$_k7rc" -ne 0 ] && grep -q 'refused.*authorized_keys is a symbolic link' "$_k7/b.out" &&
+	cmp -s "$_k7/etc/master.passwd" "$_k7/master.passwd.orig" && ! grep -q '^chown' "$_k7/b.stub" 2> /dev/null; then
+	ok "firstboot_user: an authorized_keys that is a symbolic link is refused, and the file it names is untouched"
+else
+	no "firstboot_user: an authorized_keys that is a symbolic link is refused, and the file it names is untouched (rc=$_k7rc)"
+	sed 's/^/      | /' "$_k7/b.out"
+fi
+# the home sits below a symbolic link nobody but its maker trusts: the
+# link sends the whole home somewhere else
+mkdir -p "$_k7/elsewhere/fbuser"
+ln -s "$_k7/elsewhere" "$_k7/plink"
+_k7run p "$_k7/plink/fbuser" "$_k7/p.conf"
+if [ "$_k7rc" -ne 0 ] && grep -q 'refused.*plink is a symbolic link that root does not own' "$_k7/p.out" &&
+	[ ! -e "$_k7/elsewhere/fbuser/.ssh" ] && ! grep -q '^chown' "$_k7/p.stub" 2> /dev/null; then
+	ok "firstboot_user: a home below a symbolic link root does not own is refused, and nothing is written through it"
+else
+	no "firstboot_user: a home below a symbolic link root does not own is refused, and nothing is written through it (rc=$_k7rc)"
+	sed 's/^/      | /' "$_k7/p.out"
+fi
+# the ordinary case, with a space in the path of the configuration
+mkdir -p "$_k7/home-c" "$_k7/conf dir"
+_k7run c "$_k7/home-c" "$_k7/conf dir/firstboot-user.conf"
+_k7mode=$(ls -ld "$_k7/home-c/.ssh/authorized_keys" 2> /dev/null | cut -c1-10)
+if [ "$_k7rc" -eq 0 ] && grep -qx 'ssh-ed25519 k7data k7' "$_k7/home-c/.ssh/authorized_keys" 2> /dev/null &&
+	[ "$_k7mode" = '-rw-------' ] && [ ! -L "$_k7/home-c/.ssh/authorized_keys" ] &&
+	[ -f "$_k7/conf dir/firstboot-user.conf.done" ] &&
+	grep -qx 'chown -h fbuser authorized_keys .' "$_k7/c.stub"; then
+	ok "firstboot_user: the keys are installed 0600 and given to the user (a configuration path with a space)"
+else
+	no "firstboot_user: the keys are installed 0600 and given to the user (a configuration path with a space) (rc=$_k7rc mode=$_k7mode)"
+	sed 's/^/      | /' "$_k7/c.out"
+fi
+# the path of the configuration is quoted where it is read: some sh split
+# the unquoted word of local
+if grep -q '^	local _conf="\$firstboot_user_conf"$' "$_fbrc"; then
+	ok "firstboot_user: the configuration path is quoted in local"
+else
+	no "firstboot_user: the configuration path is quoted in local"
+fi
+
 # (k6) a ZFS root gets an /etc/fstab: the header line the stock
 #      installer writes and nothing else
 sh "$repo/build.sh" -n -c "$work/good.conf" -o "$work/out" > "$work/k6.log" 2>&1
@@ -2281,7 +2367,7 @@ for _p in drm-kmod mesa-dri nvidia-driver nvidia-drm-kmod \
 	xf86-input-mouse xf86-input-synaptics xf86-input-vmmouse \
 	xf86-input-wacom xf86-input-elographics xf86-input-egalax \
 	xf86-input-joystick xf86-input-void; do
-	if sed 's/#.*//' "$_dl" | grep -qx "[[:space:]]*$_p[[:space:]]*"; then
+	if sed 's/#.*//' "$_dl" | grep -qx "[[:space:]]*${_p}[[:space:]]*"; then
 		ok "desktop profile ships $_p"
 	else
 		no "desktop profile ships $_p"
@@ -2737,6 +2823,7 @@ _m5run() { # _m5run yes|no
 	(
 		die() { echo "die: $*" >&2; exit 1; }
 		OUT="$_m5/out" KEEP_DEBUG=$1
+		# shellcheck source=/dev/null
 		. "$_m5.f.sh"
 		prune_stage "$_m5/out/stage"
 	) > "$_m5/log" 2>&1
@@ -2866,7 +2953,7 @@ _m7fix="$repo/tests/fixtures/kmod-annotations.txt"
 _m7names='drm-kmod gpu-firmware-kmod nvidia-drm-kmod drm-latest-kmod nvidia-kmod nvidia-drm-latest-kmod gpu-firmware-amd-kmod-fiji xorg'
 _m7fx() { # _m7fx — the stage after pkg -r install: the annotations of the repository
 	for _k in $_m7names; do
-		awk -v n="$_k" '$1 == n { print $2, $3 }' "$_m7fix" > "$_m7/fx/ann.$_k"
+		n="$_k" awk '$1 == ENVIRON["n"] { print $2, $3 }' "$_m7fix" > "$_m7/fx/ann.$_k"
 	done
 }
 _m7src() { # _m7src <version> — the __FreeBSD_version of the src tree
@@ -2937,7 +3024,7 @@ chmod 755 "$_m7/bin/pkg" "$_m7/bin/make"
 # a package rebuilt against the src tree: the annotations of the
 # repository's build, with the FreeBSD_version of the src tree
 for _k in drm-latest-kmod nvidia-kmod nvidia-drm-latest-kmod gpu-firmware-amd-kmod-fiji; do
-	awk -v n="$_k" '$1 == n { if ($2 == "FreeBSD_version") $3 = 1600028; print $2, $3 }' "$_m7fix" > "$_m7/fx/rebuilt.$_k"
+	n="$_k" awk '$1 == ENVIRON["n"] { if ($2 == "FreeBSD_version") $3 = 1600028; print $2, $3 }' "$_m7fix" > "$_m7/fx/rebuilt.$_k"
 done
 if [ "$(grep -c '^[^#]* FreeBSD_version ' "$_m7fix" 2> /dev/null)" -eq 4 ] &&
 	! grep -Eq '^(drm-kmod|gpu-firmware-kmod|nvidia-drm-kmod) FreeBSD_version ' "$_m7fix"; then
@@ -3153,6 +3240,7 @@ for _lk in var/cache/pkg usr/lib/debug; do
 	(
 		die() { echo "die: $*" >&2; exit 1; }
 		OUT="$_m5/out" KEEP_DEBUG=no
+		# shellcheck source=/dev/null
 		. "$_m5.f.sh"
 		prune_stage "$_m5/out/stage"
 	) > "$_m5/log" 2>&1
@@ -3189,13 +3277,14 @@ for _lk in var usr/lib boot; do
 	: > "$_m5/host/debug/keep.debug"
 	: > "$_m5/host/kernel/keep.debug"
 	case $_lk in
-	var) rm -rf "$_st/var" && ln -s "$_m5/host" "$_st/var" ;;
+	var) rm -rf "${_st:?}/var" && ln -s "$_m5/host" "$_st/var" ;;
 	usr/lib) rm -rf "$_st/usr/lib" && ln -s "$_m5/host" "$_st/usr/lib" ;;
-	boot) rm -rf "$_st/boot" && ln -s "$_m5/host" "$_st/boot" ;;
+	boot) rm -rf "${_st:?}/boot" && ln -s "$_m5/host" "$_st/boot" ;;
 	esac
 	(
 		die() { echo "die: $*" >&2; exit 1; }
 		OUT="$_m5/out" KEEP_DEBUG=no
+		# shellcheck source=/dev/null
 		. "$_m5.f.sh"
 		prune_stage "$_m5/out/stage"
 	) > "$_m5/log" 2>&1
