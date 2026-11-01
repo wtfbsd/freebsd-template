@@ -2361,6 +2361,17 @@ if [ -f "$_xsrc" ] && sed 's/#.*//' "$_xsrc" | grep -q '^[[:space:]]*Driver[[:sp
 else
 	no "the desktop profile ships the scfb Device section under /usr/local/share/@SLUG@/xorg"
 fi
+# on scfb (no DRI2) AIGLX makes Xorg die with a bus error (signal 10):
+# the fallback turns the GLX extension off, in an Extensions section
+if [ -f "$_xsrc" ] && sed 's/#.*//' "$_xsrc" | awk '
+	/^[[:space:]]*Section[[:space:]]+"Extensions"/ { inx = 1; next }
+	inx && /^[[:space:]]*EndSection/ { inx = 0; next }
+	inx && /^[[:space:]]*Option[[:space:]]+"GLX"[[:space:]]+"Disable"[[:space:]]*$/ { found = 1 }
+	END { exit !found }'; then
+	ok "the scfb fallback disables GLX in an Extensions section"
+else
+	no "the scfb fallback disables GLX in an Extensions section"
+fi
 if [ -x "$_xfb" ] && sh -n "$_xfb" 2> /dev/null; then
 	ok "rc.d/xorg_fallback is an executable sh script"
 else
@@ -2468,11 +2479,18 @@ exit 0
 STUBPKG
 cat > "$_m3/bin/chroot" <<'STUBCHROOT'
 #!/bin/sh
-# chroot stub: logs its arguments; the cache tools write their cache in
-# the root (unless STUB_CHROOT=fail)
+# chroot stub: logs its arguments; ldconfig also writes its arguments
+# one per line to $STUB_LOG.ldconfig and fails when STUB_LDCONFIG=fail;
+# the cache tools write their cache in the root (unless STUB_CHROOT=fail)
 printf 'chroot %s\n' "$*" >> "$STUB_LOG"
-[ "${STUB_CHROOT:-ok}" = ok ] || exit 1
 _r=$1
+if [ "$2" = /sbin/ldconfig ]; then
+	shift 2
+	printf '%s\n' "$@" > "$STUB_LOG.ldconfig"
+	[ "${STUB_LDCONFIG:-ok}" = ok ] || exit 1
+	exit 0
+fi
+[ "${STUB_CHROOT:-ok}" = ok ] || exit 1
 case $2 in
 */gdk-pixbuf-query-loaders) : > "$_r/usr/local/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ;;
 */glib-compile-schemas) : > "$_r$3/gschemas.compiled" ;;
@@ -2481,7 +2499,7 @@ esac
 exit 0
 STUBCHROOT
 chmod 755 "$_m3/bin/pkg" "$_m3/bin/chroot"
-{ _bfunc has_entries; _bfunc stage_cache; _bfunc pkg_triggers; } > "$_m3/f.sh"
+{ _bfunc has_entries; _bfunc stage_cache; _bfunc stage_ldconfig; _bfunc pkg_triggers; } > "$_m3/f.sh"
 _m3stage() { # _m3stage <dir> tools|notools — a fake stage after pkg -r
 	rm -rf "$1"
 	mkdir -p "$1/var/db/pkg/triggers" "$1/usr/local/bin" "$1/usr/local/libexec" \
@@ -2498,6 +2516,7 @@ _m3stage() { # _m3stage <dir> tools|notools — a fake stage after pkg -r
 }
 _m3run() { # _m3run <stage>
 	: > "$_m3/log"
+	rm -f "$_m3/log.ldconfig"
 	(
 		die() { echo "die: $*" >&2; exit 1; }
 		PATH="$_m3/bin:$PATH"
@@ -2511,6 +2530,22 @@ _m3run() { # _m3run <stage>
 _s="$_m3/s1"
 _m3stage "$_s" tools
 _m3run "$_s"
+# the stage has no ld-elf hints: ldconfig runs in the stage first, before
+# the triggers and the cache tools, or they do not find their libraries
+_m3ld="chroot $_s /sbin/ldconfig -elf /lib /usr/lib /usr/local/lib"
+if [ "$_m3rc" -eq 0 ] && [ "$(sed -n 1p "$_m3/log")" = "$_m3ld" ]; then
+	ok "build.sh: ldconfig -elf builds the hints of the stage before anything runs in it"
+else
+	no "build.sh: ldconfig -elf builds the hints of the stage before anything runs in it (rc=$_m3rc)"
+	sed 's/^/      | /' "$_m3/log" "$_m3/out" 2> /dev/null
+fi
+_ldl=$(grep -nxF "$_m3ld" "$_m3/log" | cut -d: -f1)
+_trl=$(grep -nxF "pkg -c $_s triggers" "$_m3/log" | cut -d: -f1)
+if [ -n "$_ldl" ] && [ -n "$_trl" ] && [ "$_ldl" -lt "$_trl" ]; then
+	ok "build.sh: ldconfig runs in the stage before pkg -c <stage> triggers"
+else
+	no "build.sh: ldconfig runs in the stage before pkg -c <stage> triggers"
+fi
 if [ "$_m3rc" -eq 0 ] && grep -qx "pkg -c $_s triggers" "$_m3/log" && [ -z "$(ls "$_s/var/db/pkg/triggers")" ]; then
 	ok "build.sh: the deferred package triggers run inside the stage (pkg -c <stage> triggers)"
 else
@@ -2549,7 +2584,7 @@ fi
 _s="$_m3/s3"
 _m3stage "$_s" notools
 _m3run "$_s"
-if [ "$_m3rc" -eq 0 ] && [ -s "$_m3/f.sh" ] && ! grep -q '^chroot ' "$_m3/log"; then
+if [ "$_m3rc" -eq 0 ] && [ -s "$_m3/f.sh" ] && ! grep -v '^chroot [^ ]* /sbin/ldconfig ' "$_m3/log" | grep -q '^chroot '; then
 	ok "build.sh: a tool that is not in the stage is not run"
 else
 	no "build.sh: a tool that is not in the stage is not run (rc=$_m3rc)"
@@ -2578,11 +2613,50 @@ if [ "$_m3rc" -ne 0 ] && grep -q 'die: chroot' "$_m3/out"; then
 else
 	no "build.sh: a cache tool that fails in the stage fails the build (rc=$_m3rc)"
 fi
+# the directories the packages list in the stage's libdata/ldconfig are
+# passed to ldconfig, one argument each, in file order; a missing
+# directory, a relative line and an empty line are skipped, and a line
+# with a space or a "$(...)" is one directory, never run as a command
+_s="$_m3/s7"
+_m3stage "$_s" tools
+mkdir -p "$_s/usr/local/libdata/ldconfig" "$_s/usr/local/lib/qt6" "$_s/usr/local/lib/a b" \
+	"$_s/usr/local/lib/\$(touch m3pwned)"
+printf '/usr/local/lib/qt6\n/usr/local/lib/missing\n\nrelative/lib\n/usr/local/lib/a b\n' > "$_s/usr/local/libdata/ldconfig/qt6"
+printf '/usr/local/lib/$(touch m3pwned)' > "$_s/usr/local/libdata/ldconfig/zz-nonl"
+_m3cwd=$(pwd)
+cd "$_m3" || exit 1
+_m3run "$_s"
+cd "$_m3cwd" || exit 1
+printf '%s\n' -elf /lib /usr/lib /usr/local/lib /usr/local/lib/qt6 "/usr/local/lib/a b" \
+	'/usr/local/lib/$(touch m3pwned)' > "$_m3/ld.want"
+if [ "$_m3rc" -eq 0 ] && cmp -s "$_m3/ld.want" "$_m3/log.ldconfig" && [ ! -e "$_m3/m3pwned" ]; then
+	ok "build.sh: ldconfig gets the directories of the stage's libdata/ldconfig, one argument each"
+else
+	no "build.sh: ldconfig gets the directories of the stage's libdata/ldconfig, one argument each (rc=$_m3rc)"
+	sed 's/^/      | /' "$_m3/log.ldconfig" "$_m3/out" 2> /dev/null
+fi
+# ldconfig failing in the stage fails the build, before the triggers run
+_s="$_m3/s8"
+_m3stage "$_s" tools
+STUB_LDCONFIG=fail
+export STUB_LDCONFIG
+_m3run "$_s"
+unset STUB_LDCONFIG
+if [ "$_m3rc" -ne 0 ] && grep -q 'die: chroot .*/sbin/ldconfig' "$_m3/out" && ! grep -q '^pkg ' "$_m3/log"; then
+	ok "build.sh: ldconfig that fails in the stage fails the build"
+else
+	no "build.sh: ldconfig that fails in the stage fails the build (rc=$_m3rc)"
+fi
 sh "$repo/build.sh" -n -c "$work/good.conf" -p desktop -o "$work/out" > "$work/m3.log" 2>&1
 if grep -q 'pkg -c .*/desktop/stage triggers' "$work/m3.log" && grep -q 'root:messagebus' "$work/m3.log"; then
 	ok "build.sh: the dry run prints the triggers and the dbus helper step"
 else
 	no "build.sh: the dry run prints the triggers and the dbus helper step"
+fi
+if grep -q 'chroot .*/desktop/stage /sbin/ldconfig -elf' "$work/m3.log"; then
+	ok "build.sh: the dry run prints the ldconfig step of the stage"
+else
+	no "build.sh: the dry run prints the ldconfig step of the stage"
 fi
 
 # (m4) LightDM reads its configuration as a GLib key file: a ';' line is

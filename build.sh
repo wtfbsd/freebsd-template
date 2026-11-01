@@ -459,6 +459,29 @@ stage_cache() { # stage_cache <stage> <output> <tool> <args...>
 	[ -e "$_st$_o" ] || die "chroot $_st $_t $* left no $_o"
 }
 
+stage_ldconfig() { # stage_ldconfig <stage> — build the ld-elf hints of the stage
+	# a fresh stage has no /var/run/ld-elf.so.hints until rc.d/ldconfig
+	# runs at boot, so a tool run in it with chroot does not find the
+	# libraries of /usr/local/lib ("Shared object libglib-2.0.so.0 not
+	# found"). This runs ldconfig -elf in the stage over /lib, /usr/lib,
+	# /usr/local/lib and the directories that the packages list in the
+	# stage's /usr/local/libdata/ldconfig/* (one per line; a line that is
+	# not an absolute path or names a directory missing from the stage is
+	# skipped), as rc.d/ldconfig does. Each directory is one argument of
+	# the chroot command; nothing read from the stage goes through a shell.
+	_lst=$1
+	set -- /lib /usr/lib /usr/local/lib
+	for _lf in "$_lst"/usr/local/libdata/ldconfig/*; do
+		[ -f "$_lf" ] || continue
+		while IFS= read -r _ld || [ -n "$_ld" ]; do
+			case $_ld in
+			/*) if [ -d "$_lst$_ld" ]; then set -- "$@" "$_ld"; fi ;;
+			esac
+		done < "$_lf"
+	done
+	chroot "$_lst" /sbin/ldconfig -elf "$@" || die "chroot $_lst /sbin/ldconfig -elf $* failed"
+}
+
 pkg_triggers() { # pkg_triggers <stage>
 	# pkg -r installs into the stage but defers every trigger that is
 	# not sandboxed: it writes it to <stage>/var/db/pkg/triggers instead
@@ -474,6 +497,8 @@ pkg_triggers() { # pkg_triggers <stage>
 		printf '%s\n' "WARNING: PKG_ABI=$PKG_ABI: the stage binaries cannot run here; the package triggers, the caches and the dbus helper group are left undone" >&2
 		return 0
 	fi
+	# the trigger and cache tools need the hints of the stage first
+	stage_ldconfig "$1"
 	_td="$1/var/db/pkg/triggers"
 	if has_entries "$_td"; then
 		pkg -c "$1" triggers || die "pkg -c $1 triggers failed"
@@ -852,6 +877,7 @@ for p in $profiles; do
 	if [ "$DRY" -eq 1 ]; then
 		printf '    + every package owning a .ko whose FreeBSD_version is not __FreeBSD_version of %s/sys/sys/param.h: make -C %s/<origin> SRC_BASE=%s OSVERSION=<it> BATCH=yes DISABLE_VULNERABILITIES=yes PACKAGES=%s/kmod-packages clean package; pkg -r %s add -f; pkg lock (KMOD_REBUILD=%s)\n' "$SRC" "$PORTS" "$SRC" "$OUT" "$STAGE" "$KMOD_REBUILD"
 		printf '    + check those packages against __FreeBSD_version of %s/sys/sys/param.h (ALLOW_KMOD_MISMATCH=%s)\n' "$SRC" "$ALLOW_KMOD_MISMATCH"
+		printf '    + chroot %s /sbin/ldconfig -elf /lib /usr/lib /usr/local/lib <the directories of %s/usr/local/libdata/ldconfig/*>\n' "$STAGE" "$STAGE"
 		printf '    + pkg -c %s triggers (when %s/var/db/pkg/triggers holds deferred triggers)\n' "$STAGE" "$STAGE"
 		printf '    + chroot %s: gdk-pixbuf-query-loaders --update-cache, glib-compile-schemas, update-mime-database (each when its tool is there and its cache is not)\n' "$STAGE"
 		printf '    + chroot %s: chown root:messagebus + chmod 4750 /usr/local/libexec/dbus-daemon-launch-helper\n' "$STAGE"
