@@ -571,7 +571,7 @@ src_version() { # src_version <src> — the __FreeBSD_version of a src tree
 }
 
 pkg_note() { # pkg_note <stage> <package> <annotation> — its value, or nothing
-	pkg -r "$1" query '%At %Av' "$2" | awk -v k="$3" '$1 == k { print $2; exit }'
+	pkg -r "$1" query '%At %Av' "$2" | k="$3" awk '$1 == ENVIRON["k"] { print $2; exit }'
 }
 
 KMOD_MM=''
@@ -626,7 +626,7 @@ build on a host of the target arch, or set KMOD_REBUILD=no ALLOW_KMOD_MISMATCH=y
 	rmrf "$_kp" "$OUT"
 	mkdir -p "$_kp" || die "cannot create $_kp"
 	for _n in $(printf '%s' "$KMOD_MM" | awk '{ print $1 }'); do
-		_pv=$(printf '%s' "$KMOD_MM" | awk -v n="$_n" '$1 == n { print $2; exit }')
+		_pv=$(printf '%s' "$KMOD_MM" | n="$_n" awk '$1 == ENVIRON["n"] { print $2; exit }')
 		_o=$(pkg -r "$_rst" query %o "$_n") || die "pkg -r $_rst query %o $_n failed"
 		# the origin and the flavor reach make(1) as values: only the
 		# characters of a port directory and of a flavor name pass
@@ -660,7 +660,7 @@ check_kmods() { # check_kmods <stage> <src>
 	_kv=$(src_version "$2")
 	[ -n "$_kv" ] || die "cannot read __FreeBSD_version from $2/sys/sys/param.h: check that SRC is a complete FreeBSD src tree (sys/sys/param.h)"
 	kmod_mismatches "$1" "$_kv"
-	_bad=$(printf '%s' "$KMOD_MM" | awk -v k="$_kv" '{ printf "\n  %s: built for %s, kernel is %s", $1, $2, k }')
+	_bad=$(printf '%s' "$KMOD_MM" | k="$_kv" awk '{ printf "\n  %s: built for %s, kernel is %s", $1, $2, ENVIRON["k"] }')
 	[ -n "$_bad" ] || return 0
 	if [ "$ALLOW_KMOD_MISMATCH" = yes ]; then
 		printf '%s\n' "WARNING: kmod packages do not match the kernel (__FreeBSD_version $_kv of $2); ALLOW_KMOD_MISMATCH=yes, building anyway:$_bad" >&2

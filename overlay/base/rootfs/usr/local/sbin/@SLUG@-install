@@ -285,7 +285,7 @@ lastidx=$(gpart show /dev/"$disk" \
 [ -n "$lastidx" ] || die 'could not determine the last partition index (gpart show)'
 gpart resize -i "$lastidx" /dev/"$disk" || die "gpart resize -i $lastidx failed"
 ptype=$(gpart show /dev/"$disk" \
-	| awk -v idx="$lastidx" '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 == idx { print $4 }')
+	| idx="$lastidx" awk '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 == ENVIRON["idx"] { print $4 }')
 [ -n "$ptype" ] || die "could not read the type of partition $lastidx (gpart show)"
 
 mkdir -p "$mnt"

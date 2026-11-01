@@ -55,8 +55,168 @@ root_writable() { # root_writable — is the root filesystem writable?
 	[ -w /etc ]
 }
 
+# fbu_owned_by <path> <uid>... — is <path> itself (a symbolic link is not
+# followed) owned by one of the uids? An empty uid matches nothing.
+fbu_owned_by() {
+	_ob_p=$1
+	shift
+	_ob_u=$(ls -ldn "$_ob_p" 2> /dev/null | awk '{ print $3 }')
+	[ -n "$_ob_u" ] || return 1
+	for _ob_w in "$@"; do
+		if [ -n "$_ob_w" ] && [ "$_ob_u" = "$_ob_w" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# safe_ancestors <path> — can nobody but root (or the user that runs
+# this) redirect <path> through a directory above it? A check of the last
+# component alone is not enough: a symbolic link, or a directory another
+# user can write to, anywhere above it sends mkdir -p and every write
+# somewhere else. Two walks, from /:
+#   - the path as written: a component that is a symbolic link must
+#     belong to root (FreeBSD ships /home as a link of root to usr/home,
+#     which is fine; a link anyone else made is refused). The walk stops
+#     at the first component that does not exist yet.
+#   - the physical path of the deepest component that exists (cd -P):
+#     every directory must belong to root or to the user that runs this,
+#     and must not be writable by others unless it is sticky (/tmp).
+# Owner and mode are read with find(1) -user and -perm, which never
+# follow a link and need no parsing of ls(1). On a refusal _sa_why says
+# which component and why.
+safe_ancestors() { # safe_ancestors <path>
+	_sa_why=''
+	_sa_left=${1#/}
+	_sa_p=''
+	_sa_last=/
+	while :; do
+		case $_sa_left in
+		*/*)
+			_sa_c=${_sa_left%%/*}
+			_sa_left=${_sa_left#*/}
+			;;
+		*) break ;;
+		esac
+		[ -n "$_sa_c" ] || continue
+		_sa_p="$_sa_p/$_sa_c"
+		if [ -L "$_sa_p" ]; then
+			if [ -z "$(find "$_sa_p" -prune -user 0 -print 2> /dev/null)" ]; then
+				_sa_why="$_sa_p is a symbolic link that root does not own"
+				return 1
+			fi
+		elif [ ! -e "$_sa_p" ]; then
+			break
+		fi
+		_sa_last=$_sa_p
+	done
+	if ! _sa_phys=$(cd -P "$_sa_last" 2> /dev/null && pwd -P); then
+		_sa_why="$_sa_last cannot be entered"
+		return 1
+	fi
+	_sa_d=/
+	_sa_left=${_sa_phys#/}
+	while :; do
+		if ! [ -O "$_sa_d" ] && [ -z "$(find "$_sa_d" -prune -user 0 -print 2> /dev/null)" ]; then
+			_sa_why="$_sa_d belongs to neither root nor the user that runs this"
+			return 1
+		fi
+		if [ -n "$(find "$_sa_d" -prune -perm -0002 ! -perm -1000 -print 2> /dev/null)" ]; then
+			_sa_why="others can write to $_sa_d"
+			return 1
+		fi
+		[ -n "$_sa_left" ] || break
+		_sa_c=${_sa_left%%/*}
+		case $_sa_left in
+		*/*) _sa_left=${_sa_left#*/} ;;
+		*) _sa_left='' ;;
+		esac
+		_sa_d="${_sa_d%/}/$_sa_c"
+	done
+	return 0
+}
+
+# fbu_install_keys <user> <home> <keys> — write <keys> to
+# <home>/.ssh/authorized_keys for <user> without following a symbolic
+# link. The home directory may already exist (an account that was made
+# before, a home left on the disk), and whoever owns it can plant a link
+# there: root would then write, chmod and chown the file the link names.
+# So: no directory above the home may be redirected (safe_ancestors);
+# the home, .ssh and authorized_keys must not be symbolic links and
+# must belong to root (the uid that runs this script) or to the user;
+# .ssh is entered once, its physical path is checked, it belongs to root
+# while the keys go in, and every later name is relative to it. The keys
+# go to a file mktemp creates in .ssh, which is renamed over
+# authorized_keys (a rename replaces a link, it never follows it), and
+# chown -h never follows a link either. Anything else is refused and
+# said.
+fbu_install_keys() {
+	_ik_user=$1
+	_ik_home=$2
+	_ik_keys=$3
+	_ik_ssh="$_ik_home/.ssh"
+	_ik_me=$(id -u)
+	_ik_uid=$(id -u "$_ik_user" 2> /dev/null) || _ik_uid=''
+	if ! safe_ancestors "$_ik_home"; then
+		note "refused to install the SSH keys of $_ik_user: $_sa_why"
+		return 1
+	fi
+	for _ik_p in "$_ik_home" "$_ik_ssh" "$_ik_ssh/authorized_keys"; do
+		if [ -L "$_ik_p" ]; then
+			note "refused to install the SSH keys of $_ik_user: $_ik_p is a symbolic link"
+			return 1
+		fi
+		if [ -e "$_ik_p" ] && ! fbu_owned_by "$_ik_p" 0 "$_ik_me" "$_ik_uid"; then
+			note "refused to install the SSH keys of $_ik_user: $_ik_p belongs to neither root nor $_ik_user"
+			return 1
+		fi
+	done
+	if [ ! -d "$_ik_home" ] && ! mkdir -p "$_ik_home"; then
+		note "cannot create $_ik_home"
+		return 1
+	fi
+	if [ ! -e "$_ik_ssh" ] && ! (umask 077 && mkdir "$_ik_ssh"); then
+		note "cannot create $_ik_ssh"
+		return 1
+	fi
+	(
+		umask 077
+		if [ -L "$_ik_ssh" ] || ! cd -P "$_ik_ssh" 2> /dev/null; then
+			note "refused to install the SSH keys of $_ik_user: $_ik_ssh is a symbolic link or not a directory"
+			exit 1
+		fi
+		_ik_want=$(cd -P "$_ik_home" && pwd -P) || exit 1
+		if [ "$(pwd -P)" != "$_ik_want/.ssh" ]; then
+			note "refused to install the SSH keys of $_ik_user: $_ik_ssh moved while it was checked"
+			exit 1
+		fi
+		if ! chown -h 0 . || ! chmod 700 .; then
+			note "cannot take $_ik_ssh over for the write"
+			exit 1
+		fi
+		if [ -L authorized_keys ]; then
+			note "refused to install the SSH keys of $_ik_user: $_ik_ssh/authorized_keys is a symbolic link"
+			exit 1
+		fi
+		if ! _ik_tmp=$(mktemp authorized_keys.XXXXXXXX); then
+			note "cannot create a temporary file in $_ik_ssh"
+			exit 1
+		fi
+		if ! printf '%s\n' "$_ik_keys" > "$_ik_tmp" || ! chmod 600 "$_ik_tmp" ||
+			! mv -f "$_ik_tmp" authorized_keys; then
+			rm -f "$_ik_tmp"
+			note "failed to write $_ik_ssh/authorized_keys"
+			exit 1
+		fi
+		if ! chown -h "$_ik_user" authorized_keys .; then
+			note "cannot give $_ik_ssh to $_ik_user"
+			exit 1
+		fi
+	)
+}
+
 firstboot_user_start() {
-	local _conf=$firstboot_user_conf
+	local _conf="$firstboot_user_conf"
 	local _k _l _v _user _full _keys _nkeys _hash _wheel _home _n
 	if ! root_writable; then
 		echo 'firstboot_user: read-only root (live media), skipped'
@@ -190,24 +350,15 @@ $_v"
 
 	# /etc/passwd is 7 fields: the home directory is field 6
 	# (the FULLNAME value is validated to never contain ':', so -F: is safe)
-	_home=$(awk -F: -v u="$_user" '$1 == u { print $6 }' /etc/passwd)
+	_home=$(u="$_user" awk -F: '$1 == ENVIRON["u"] { print $6 }' /etc/passwd)
 	case $_home in
 	/*) ;;
 	*) _home="/home/$_user" ;;
 	esac
-	if ! mkdir -p "$_home/.ssh"; then
-		note "cannot create $_home/.ssh"
+	if ! fbu_install_keys "$_user" "$_home" "${_keys#?}"; then
 		return 1
 	fi
-	if chmod 700 "$_home/.ssh" \
-		&& printf '%s\n' "${_keys#?}" > "$_home/.ssh/authorized_keys" \
-		&& chmod 600 "$_home/.ssh/authorized_keys" \
-		&& chown "$_user" "$_home/.ssh" "$_home/.ssh/authorized_keys"; then
-		note "installed $_nkeys SSH key(s) for $_user at $_home/.ssh/authorized_keys"
-	else
-		note "failed to write $_home/.ssh/authorized_keys"
-		return 1
-	fi
+	note "installed $_nkeys SSH key(s) for $_user at $_home/.ssh/authorized_keys"
 
 	# key-only wheel user (no password to type): let doas accept the
 	# SSH-authenticated session, otherwise the account could never get root

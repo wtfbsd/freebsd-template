@@ -1,0 +1,31 @@
+# class-checks allow-list (agents/tools/class-checks): CLASS PATH:LINE REASON
+eval-nonliteral tests/run-tests.sh:111 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+eval-nonliteral tests/run-tests.sh:1657 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+eval-nonliteral tests/run-tests.sh:1664 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+eval-nonliteral tests/run-tests.sh:1679 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+eval-nonliteral tests/run-tests.sh:1680 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+eval-nonliteral tests/run-tests.sh:1681 evaluates code cut from this repository's own build.sh or Jenkinsfile, never outside data
+shellcheck overlay/base/rootfs/etc/rc.d/firstboot_user:120 the script runs as root under the BSD /bin/sh, whose test has -O
+shellcheck overlay/base/rootfs/etc/rc.d/firstboot_user:219 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck overlay/base/rootfs/etc/rc.d/firstboot_user:220 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck overlay/base/rootfs/usr/local/sbin/@SLUG@-install:77 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck overlay/base/rootfs/usr/local/sbin/@SLUG@-install:81 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck overlay/profiles/desktop/rootfs/etc/rc.d/xorg_fallback:61 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck overlay/profiles/desktop/rootfs/etc/rc.d/xorg_fallback:78 local is a builtin of the BSD /bin/sh this script runs under
+shellcheck tests/run-tests.sh:1681 set in a subshell for the code that subshell then evaluates or sources
+shellcheck tests/run-tests.sh:2760 set in a subshell for the code that subshell then evaluates or sources
+shellcheck tests/run-tests.sh:3041 set in a subshell for the code that subshell then evaluates or sources
+shellcheck tests/run-tests.sh:3043 set in a subshell for the code that subshell then evaluates or sources
+shellcheck tests/run-tests.sh:3286 set in a subshell for the code that subshell then evaluates or sources
+unquoted-expansion build.sh:743 MAKETGT is TARGET= and TARGET_ARCH= of a fixed arch name, split on purpose
+unquoted-expansion build.sh:744 MAKETGT is TARGET= and TARGET_ARCH= of a fixed arch name, split on purpose
+unquoted-expansion build.sh:764 MAKETGT is TARGET= and TARGET_ARCH= of a fixed arch name, split on purpose
+unquoted-expansion build.sh:765 MAKETGT is TARGET= and TARGET_ARCH= of a fixed arch name, split on purpose
+unquoted-expansion build.sh:766 MAKETGT is TARGET= and TARGET_ARCH= of a fixed arch name, split on purpose
+unquoted-expansion build.sh:865 pkgs is the package names of the packages.list files, one word each, split on purpose
+unquoted-expansion build.sh:867 pkgs is the package names of the packages.list files, one word each, split on purpose
+unquoted-expansion build.sh:1038 RELS is artifact paths made from the slug, which is [a-z0-9-], split on purpose
+unquoted-expansion overlay/base/rootfs/usr/local/sbin/@SLUG@-install:220 disks is the kern.disks list of disk names, split on purpose
+unquoted-expansion overlay/base/rootfs/usr/local/sbin/@SLUG@-install:232 the menu is disk names and a fixed word, split into dialog items on purpose
+unquoted-expansion overlay/base/rootfs/usr/local/sbin/@SLUG@-install:235 disks is the kern.disks list of disk names, split on purpose
+unquoted-expansion overlay/base/rootfs/usr/local/sbin/@SLUG@-install:250 disks is the kern.disks list of disk names, split on purpose
