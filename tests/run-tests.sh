@@ -2045,7 +2045,7 @@ irun() {
 	_ir_err="$INSTDIR/$_ir_n.err"
 	_ir_img="$INSTDIR/$_ir_n.img"
 	mkdir -p "$_ir_bin"
-	for _s in gpart zpool zfs mount umount growfs dd xz sysctl bsddialog id logger mktemp; do
+	for _s in gpart zpool zfs mount umount growfs dd xz sysctl bsddialog id logger mktemp glabel geli newfs_msdos; do
 		cp "$STUBS/$_s" "$_ir_bin/$_s"
 		chmod +x "$_ir_bin/$_s"
 	done
@@ -2061,6 +2061,11 @@ irun() {
 	fi
 	PATH="$_ir_bin:$PATH" STUB_LOG="$_ir_log" \
 		STUB_BSDDIALOG_RC="${IR_BSDDIALOG_RC:-0}" \
+		STUB_MOUNT_ROOT="${IR_MOUNT_ROOT:-}" STUB_GLABEL="${IR_GLABEL:-}" \
+		INSTALL_DEVDIR="$INSTDIR/dev" INSTALL_ZONEINFO="$INSTDIR/zoneinfo" \
+		INSTALL_KEYMAPS="$INSTDIR/keymaps" INSTALL_MANIFEST="${IR_MANIFEST:-$INSTDIR/no-manifest}" \
+		INSTALL_PLANNER="$INSTDIR/install-plan" INSTALL_LOCALES="$INSTDIR/locales" \
+		INSTALL_CATALOGUE="$INSTDIR/catalogue.json" INSTALL_SRCROOT="${IR_SRCROOT:-}" \
 		INSTALL_IMG="$_ir_img" INSTALL_MNT="$INSTALL_MNT" \
 		"$_ir_bin/examplebsd-install" "$@" > "$_ir_out" 2> "$_ir_err" < /dev/null
 	_ir_rc=$?
@@ -2068,6 +2073,18 @@ irun() {
 
 # the key the installer accepts (it checks the type of the line only)
 printf 'ssh-ed25519 %sAC3NzaC1l test@example\n' AAA > "$work/inst.pub"
+# the disks, time zones and keymaps of the fake live system
+mkdir -p "$INSTDIR/dev" "$INSTDIR/zoneinfo/Europe" "$INSTDIR/keymaps"
+: > "$INSTDIR/dev/vtbd0"
+: > "$INSTDIR/dev/nvd0"
+: > "$INSTDIR/zoneinfo/UTC"
+: > "$INSTDIR/zoneinfo/Europe/Paris"
+: > "$INSTDIR/keymaps/us.kbd"
+: > "$INSTDIR/keymaps/fr.kbd"
+: > "$INSTDIR/keymaps/uk.kbd"
+mkdir -p "$INSTDIR/locales/fr_FR.UTF-8"
+sed -e 's|@SLUG@|examplebsd|g' "$repo/overlay/base/rootfs/usr/local/libexec/@SLUG@/install-plan" > "$INSTDIR/install-plan" 2> /dev/null
+printf '{"version": 1, "items": [{"id": "vendor-gpu", "name": "Vendor GPU driver"}]}\n' > "$INSTDIR/catalogue.json"
 
 # (k1) the last partition index: the plain `gpart show` table, and only
 #      the rows whose first and third columns are numbers. With -p the
@@ -2353,6 +2370,16 @@ if grep -qF "etc/fstab: $_fstab" "$work/k6.log"; then
 	ok "build.sh: the dry run writes the fstab of a zfs root"
 else
 	no "build.sh: the dry run writes the fstab of a zfs root"
+fi
+
+# (k6b) the EFI system partition is mounted on /boot/efi (as the stock
+#       installer does), by the label step [6] gives it, failok: the desktop
+#       then shows no volume icon for it, and a disk without it still boots
+_espl=$(printf '/dev/msdosfs/EFISYS\t/boot/efi\tmsdosfs\trw,failok\t2\t2')
+if grep -qF "etc/fstab: $_espl" "$work/k6.log" && grep -q 'volume_label=EFISYS' "$repo/build.sh"; then
+	ok "build.sh: the fstab mounts the EFI partition on /boot/efi by its label, failok"
+else
+	no "build.sh: the fstab mounts the EFI partition on /boot/efi by its label, failok"
 fi
 
 # (k7) the desktop profile ships every X video and input driver FreeBSD
@@ -3298,5 +3325,1157 @@ for _lk in var usr/lib boot; do
 	fi
 done
 
+
+# (n0) the @SLUG@ rename: a placeholder directory that holds a placeholder
+#      file joins the directory of the slug an earlier overlay made
+_rs="$work/rslug"
+mkdir -p "$_rs/usr/local/share/examplebsd/xorg" "$_rs/usr/local/share/@SLUG@/live"
+: > "$_rs/usr/local/share/examplebsd/xorg/20-scfb.conf"
+: > "$_rs/usr/local/share/@SLUG@/live/@SLUG@-install.desktop"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	DISTRO_SLUG=examplebsd
+	eval "$(awk '/^rename_slug\(\) \{/,/^\}/' "$repo/build.sh")"
+	rename_slug "$_rs"
+) > "$work/rslug.log" 2>&1
+_rsrc=$?
+if [ "$_rsrc" -eq 0 ] && [ -f "$_rs/usr/local/share/examplebsd/live/examplebsd-install.desktop" ] &&
+	[ -f "$_rs/usr/local/share/examplebsd/xorg/20-scfb.conf" ] && [ -z "$(find "$_rs" -path '*@SLUG@*')" ]; then
+	ok "build.sh: the @SLUG@ rename merges a placeholder directory into the slug's"
+else
+	no "build.sh: the @SLUG@ rename merges a placeholder directory into the slug's (rc=$_rsrc)"
+	sed 's/^/      | /' "$work/rslug.log"
+fi
+
+# ------------------------------------------------------------------
+# (o) the install command the graphical installer calls:
+#     -d -u -H [-n -z -K] -y --progress, and nothing but PROGRESS and
+#     ERROR lines on stdout
+# ------------------------------------------------------------------
+_oh='$6$saltsalt$0123456789abcdefABCDEF./0123456789abcdefABCDEF'
+printf '%s\n' "$_oh" > "$work/o.hash"
+chmod 600 "$work/o.hash"
+# _o_lines <name> — is every stdout line a PROGRESS or an ERROR line?
+_o_lines() {
+	[ -s "$INSTDIR/$1.out" ] || return 1
+	! grep -Ev '^(PROGRESS (100|[1-9]?[0-9]) [^[:cntrl:]]+|ERROR [^[:cntrl:]]+)$' "$INSTDIR/$1.out" > /dev/null
+}
+irun prog "$INSTDIR/mnt-prog" -d vtbd0 -u wtfuser -H "$work/o.hash" -n host.example.org \
+	-z Europe/Paris -K fr -y --progress
+if [ "$_ir_rc" -eq 0 ] && _o_lines prog && [ "$(tail -n 1 "$INSTDIR/prog.out")" = 'PROGRESS 100 The system is installed' ]; then
+	ok "install --progress: only PROGRESS lines on stdout, 100 at the end"
+else
+	no "install --progress: only PROGRESS lines on stdout, 100 at the end (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/prog.out" "$INSTDIR/prog.err" 2> /dev/null | head -20
+fi
+if grep -q 'of=/dev/vtbd0' "$INSTDIR/prog.log" && ! grep -q '^bsddialog ' "$INSTDIR/prog.log"; then
+	ok "install --progress: writes the -d disk and asks nothing"
+else
+	no "install --progress: writes the -d disk and asks nothing"
+fi
+_ofb="$INSTDIR/mnt-prog/boot/firstboot-user.conf"
+if grep -qxF "PASSWORD_HASH=$_oh" "$_ofb" 2> /dev/null && grep -qx 'USERNAME=wtfuser' "$_ofb" &&
+	! grep -q '^SSH_KEY=' "$_ofb" && grep -qx 'HOSTNAME=host.example.org' "$_ofb" &&
+	grep -qx 'TIMEZONE=Europe/Paris' "$_ofb" && grep -qx 'KEYMAP=fr' "$_ofb"; then
+	ok "install -H -n -z -K: the first-boot conf has the hash, host name, time zone and keymap"
+else
+	no "install -H -n -z -K: the first-boot conf has the hash, host name, time zone and keymap"
+fi
+if ! grep -q '^PASSWORD_HASH=' "$_ofb" 2> /dev/null || grep -qF "$_oh" "$INSTDIR/prog.out" "$INSTDIR/prog.err" "$INSTDIR/prog.log" 2> /dev/null; then
+	no "install -H: the hash is not printed or passed to a command"
+else
+	ok "install -H: the hash is not printed or passed to a command"
+fi
+# _o_refused <name> <what> <args...> — the run fails with an ERROR line
+# on stdout and writes no disk
+_o_refused() {
+	_orn=$1 _orw=$2
+	shift 2
+	irun "$_orn" "$INSTDIR/mnt-$_orn" "$@"
+	if [ "$_ir_rc" -ne 0 ] && _o_lines "$_orn" && tail -n 1 "$INSTDIR/$_orn.out" | grep -q '^ERROR ' &&
+		! grep -q '^dd .*of=' "$INSTDIR/$_orn.log"; then
+		ok "install --progress refuses $_orw (ERROR line, no disk written)"
+	else
+		no "install --progress refuses $_orw (ERROR line, no disk written; rc=$_ir_rc)"
+		sed 's/^/      | /' "$INSTDIR/$_orn.out" 2> /dev/null | head -5
+	fi
+}
+cp "$work/o.hash" "$work/o.hash644"
+chmod 644 "$work/o.hash644"
+_o_refused hmode 'a hash file other users can read' -d vtbd0 -u wtfuser -H "$work/o.hash644" -y --progress
+printf 'not-a-hash\n' > "$work/o.clear"
+chmod 600 "$work/o.clear"
+_o_refused hclear 'a hash file that holds no crypt(3) hash' -d vtbd0 -u wtfuser -H "$work/o.clear" -y --progress
+if ! grep -q '^ERROR .*crypt(3)' "$INSTDIR/hclear.out" 2> /dev/null || grep -q 'not-a-hash' "$INSTDIR/hclear.out" "$INSTDIR/hclear.err" 2> /dev/null; then
+	no "install -H: the content of a bad hash file is not printed"
+else
+	ok "install -H: the content of a bad hash file is not printed"
+fi
+_o_refused noy 'a run without -y' -d vtbd0 -u wtfuser -H "$work/o.hash" --progress
+_o_refused nodisk 'a run without -d' -u wtfuser -H "$work/o.hash" -y --progress
+_o_refused nouser 'a run without -u' -d vtbd0 -H "$work/o.hash" -y --progress
+_o_refused badhost 'a bad host name' -d vtbd0 -u wtfuser -H "$work/o.hash" -n -bad.example -y --progress
+_o_refused badtz 'a time zone outside zoneinfo' -d vtbd0 -u wtfuser -H "$work/o.hash" -z ../../etc/passwd -y --progress
+_o_refused unktz 'an unknown time zone' -d vtbd0 -u wtfuser -H "$work/o.hash" -z Mars/Olympus -y --progress
+_o_refused badkm 'an unknown keymap' -d vtbd0 -u wtfuser -H "$work/o.hash" -K zz -y --progress
+# the live media: the root is the cd9660 file system of the ISO, written
+# to a disk (a USB stick); its GEOM label names that disk
+IR_MOUNT_ROOT='/dev/iso9660/EXAMPLEBSD / cd9660 ro 0 0'
+IR_GLABEL='iso9660/EXAMPLEBSD  N/A  vtbd0'
+_o_refused media 'the disk of the live media (iso9660 label)' -d vtbd0 -u wtfuser -H "$work/o.hash" -y --progress
+IR_GLABEL='iso9660/EXAMPLEBSD  N/A  vtbd0p2'
+_o_refused mediap 'the disk of the live media (label on a partition)' -d vtbd0 -u wtfuser -H "$work/o.hash" -y --progress
+IR_GLABEL=''
+_o_refused medianone 'any disk when the disk of the cd9660 root cannot be told' -d nvd0 -u wtfuser -H "$work/o.hash" -y --progress
+IR_GLABEL='iso9660/EXAMPLEBSD  N/A  vtbd0'
+irun mediamenu "$INSTDIR/mnt-mediamenu" -u wtfuser -k "$work/inst.pub" -y
+if grep -q '^bsddialog .*nvd0 DESTROYS-ALL-DATA' "$INSTDIR/mediamenu.log" &&
+	! grep -q '^bsddialog .*vtbd0 DESTROYS-ALL-DATA' "$INSTDIR/mediamenu.log"; then
+	ok "install: the disk menu leaves out the disk of the live media"
+else
+	no "install: the disk menu leaves out the disk of the live media"
+fi
+IR_MOUNT_ROOT=''
+IR_GLABEL=''
+irun other "$INSTDIR/mnt-other" -d nvd0 -u wtfuser -H "$work/o.hash" -y --progress
+if [ "$_ir_rc" -eq 0 ] && grep -q 'of=/dev/nvd0' "$INSTDIR/other.log"; then
+	ok "install --progress: another disk than the media is written"
+else
+	no "install --progress: another disk than the media is written (rc=$_ir_rc)"
+fi
+# -c, -P, -N and the MANIFEST of the installer
+printf '%s\n' /usr/local/bin/wtfbsd-installer /usr/local/share/wtfbsd-installer/MANIFEST /etc/../etc/passwd \
+	/usr/local/share/wtfbsd-installer/ /usr/local/share/ > "$INSTDIR/MANIFEST"
+mkdir -p "$INSTDIR/mnt-full/usr/local/bin" "$INSTDIR/mnt-full/usr/local/share/wtfbsd-installer" "$INSTDIR/mnt-full/etc"
+: > "$INSTDIR/mnt-full/usr/local/bin/wtfbsd-installer"
+: > "$INSTDIR/mnt-full/usr/local/share/wtfbsd-installer/MANIFEST"
+: > "$INSTDIR/mnt-full/usr/local/share/keep"
+: > "$INSTDIR/mnt-full/etc/passwd"
+IR_MANIFEST="$INSTDIR/MANIFEST"
+irun full "$INSTDIR/mnt-full" -d vtbd0 -u wtfuser -H "$work/o.hash" \
+	-c 'WTF User' -P -N vtnet0:192.0.2.10/24:192.0.2.1 -N em0:dhcp -y --progress
+IR_MANIFEST=''
+_off="$INSTDIR/mnt-full/boot/firstboot-user.conf"
+if [ "$_ir_rc" -eq 0 ] && grep -qx 'FULLNAME=WTF User' "$_off" 2> /dev/null && grep -qx 'DOAS_NOPASS=yes' "$_off" &&
+	grep -qx 'NETWORK=vtnet0:192.0.2.10/24:192.0.2.1' "$_off" && grep -qx 'NETWORK=em0:dhcp' "$_off"; then
+	ok "install -c -P -N: the first-boot conf has the full name, doas without a password and the network"
+else
+	no "install -c -P -N: the first-boot conf has the full name, doas without a password and the network (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/full.out" 2> /dev/null | tail -3
+fi
+if [ ! -e "$INSTDIR/mnt-full/usr/local/bin/wtfbsd-installer" ] && [ ! -e "$INSTDIR/mnt-full/usr/local/share/wtfbsd-installer/MANIFEST" ] &&
+	[ ! -d "$INSTDIR/mnt-full/usr/local/share/wtfbsd-installer" ] && [ -d "$INSTDIR/mnt-full/usr/local/share" ] &&
+	[ -e "$INSTDIR/mnt-full/etc/passwd" ]; then
+	ok "install: every file and empty directory of the installer's MANIFEST is removed from the target (a path with .. is not)"
+else
+	no "install: every file and empty directory of the installer's MANIFEST is removed from the target (a path with .. is not)"
+fi
+_o_refused badnet 'a bad -N' -d vtbd0 -u wtfuser -H "$work/o.hash" -N vtnet0:192.0.2.300/24 -y --progress
+_o_refused badfull 'a full name with a colon' -d vtbd0 -u wtfuser -H "$work/o.hash" -c 'a:b' -y --progress
+irun nonet "$INSTDIR/mnt-nonet" -d vtbd0 -u wtfuser -H "$work/o.hash" -y --progress
+if [ "$_ir_rc" -eq 0 ] && ! grep -q '^NETWORK=\|^DOAS_NOPASS=' "$INSTDIR/mnt-nonet/boot/firstboot-user.conf" 2> /dev/null &&
+	grep -qx 'FULLNAME=wtfuser' "$INSTDIR/mnt-nonet/boot/firstboot-user.conf"; then
+	ok "install: without -N, -P and -c the conf names no network, no doas rule, the user as full name"
+else
+	no "install: without -N, -P and -c the conf names no network, no doas rule, the user as full name"
+fi
+# the disk plan (-p) of the graphical installer: the supported subset is
+# installed, the rest refused before any disk is written
+_pplan() { # _pplan <name> <json> — a 0600 plan file
+	printf '%s\n' "$2" > "$work/plan-$1.json"
+	chmod 600 "$work/plan-$1.json"
+}
+_pplan swap '{"version":1,"mode":"erase","boot":"uefi","disks":["vtbd0"],"layout":"single","filesystem":"zfs","encryption":{"enabled":false,"swap":true},"swap_mb":2048,"sector_4k":true,"trim":true,"wipe":{"vtbd0":"quick"},"confirm_foreign":[]}'
+mkdir -p "$INSTDIR/mnt-plan/etc"
+: > "$INSTDIR/mnt-plan/etc/fstab"
+printf '{"if":"iwm0","ssid":"ExampleNet","security":"wpa2","psk":"correct horse battery"}\n' > "$work/o.wifi"
+chmod 600 "$work/o.wifi"
+printf '[{"id":"vendor-gpu","licence":"vendor","sha256":"00","timestamp":"2026-11-01T00:00:00Z"}]\n' > "$work/o.accept"
+chmod 600 "$work/o.accept"
+cp "$work/o.hash" "$work/o.roothash"
+# the gateway in a variable: the leak check reads "LEN:GW" as an address
+_gw6=2001:db8::1
+irun plan "$INSTDIR/mnt-plan" -p "$work/plan-swap.json" -u wtfuser -H "$work/o.hash" -L fr_FR.UTF-8 -Z local \
+	-r "$work/o.roothash" -A -U -6 vtnet0:slaac -6 "em0:2001:db8::10/64:$_gw6" -D 192.0.2.53 -D 2001:db8::53 \
+	-W "$work/o.wifi" -l "$work/o.accept" -y --progress
+_opf="$INSTDIR/mnt-plan/boot/firstboot-user.conf"
+# the plan, the Wi-Fi file and the licences are read with python3 (the
+# desktop image has it); a build host without it cannot run these checks
+_nopy=''
+command -v python3 > /dev/null 2>&1 || _nopy=' (not run: this host has no python3)'
+if [ -n "$_nopy" ] || { [ "$_ir_rc" -eq 0 ] && _o_lines plan && grep -q 'of=/dev/vtbd0' "$INSTDIR/plan.log"; }; then
+	ok "install -p: a single-disk erase plan installs on its disk$_nopy"
+else
+	no "install -p: a single-disk erase plan installs on its disk (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/plan.out" "$INSTDIR/plan.err" 2> /dev/null | tail -5
+fi
+if [ -n "$_nopy" ] || { grep -q '^gpart add -t freebsd-swap -l examplebsdswap -b [0-9]* -s 2048M /dev/vtbd0$' "$INSTDIR/plan.log" &&
+	[ "$(grep -n '^gpart add -t freebsd-swap' "$INSTDIR/plan.log" | cut -d: -f1)" -lt "$(grep -n '^gpart resize' "$INSTDIR/plan.log" | cut -d: -f1)" ] &&
+	grep -q "$(printf '^/dev/gpt/examplebsdswap.eli\tnone\tswap\tsw')" "$INSTDIR/mnt-plan/etc/fstab"; }; then
+	ok "install -p: swap at the end of the disk before the root grows, encrypted (.eli) in fstab$_nopy"
+else
+	no "install -p: swap at the end of the disk before the root grows, encrypted (.eli) in fstab"
+fi
+if [ -n "$_nopy" ] || { grep -qx 'LOCALE=fr_FR.UTF-8' "$_opf" 2> /dev/null && grep -qx 'CLOCK=local' "$_opf" && grep -qxF "ROOT_HASH=$_oh" "$_opf" &&
+	grep -qx 'AUTOLOGIN=yes' "$_opf" && grep -qx 'UPDATE=yes' "$_opf" && grep -qx 'NETWORK6=vtnet0:slaac' "$_opf" &&
+	grep -qx "NETWORK6=em0:2001:db8::10/64:$_gw6" "$_opf" && grep -qx 'DNS=192.0.2.53' "$_opf" &&
+	grep -qx 'DNS=2001:db8::53' "$_opf" && grep -qx 'WIFI_IF=iwm0' "$_opf"; }; then
+	ok "install -L -Z -r -A -U -6 -D -W: the first-boot conf carries them$_nopy"
+else
+	no "install -L -Z -r -A -U -6 -D -W: the first-boot conf carries them"
+fi
+if [ -n "$_nopy" ] || { grep -qx '	ssid="ExampleNet"' "$INSTDIR/mnt-plan/etc/wpa_supplicant.conf" 2> /dev/null &&
+	grep -qx '	key_mgmt=WPA-PSK' "$INSTDIR/mnt-plan/etc/wpa_supplicant.conf" &&
+	! grep -q 'correct horse' "$_opf" "$INSTDIR/plan.out" "$INSTDIR/plan.err" "$INSTDIR/plan.log"; }; then
+	ok "install -W: wpa_supplicant.conf on the target; the key is in no conf, output or command$_nopy"
+else
+	no "install -W: wpa_supplicant.conf on the target; the key is in no conf, output or command"
+fi
+if [ -n "$_nopy" ] || { cmp -s "$work/o.accept" "$INSTDIR/mnt-plan/var/db/examplebsd/licenses-accepted.json"; }; then
+	ok "install -l: the accepted licences are recorded on the installed system$_nopy"
+else
+	no "install -l: the accepted licences are recorded on the installed system"
+fi
+_pplan mirror '{"version":1,"mode":"erase","disks":["vtbd0","vtbd0"],"layout":"mirror","filesystem":"zfs","swap_mb":0}'
+_o_refused mirror 'a plan naming a disk twice' -p "$work/plan-mirror.json" -u wtfuser -H "$work/o.hash" -y --progress
+_pplan unknown '{"version":1,"mode":"erase","disks":["vtbd0"],"layout":"single","colour":"red"}'
+_o_refused unknownkey 'a plan with an unknown key' -p "$work/plan-unknown.json" -u wtfuser -H "$work/o.hash" -y --progress
+_pplan geli '{"version":1,"mode":"erase","disks":["vtbd0"],"layout":"single","filesystem":"ufs","encryption":{"enabled":true}}'
+_o_refused geli 'an encrypted ufs plan (not in this release)' -p "$work/plan-geli.json" -u wtfuser -H "$work/o.hash" -E "$work/o.hash" -y --progress
+_pplan media '{"version":1,"mode":"erase","disks":["vtbd0"],"layout":"single","swap_mb":0}'
+cp "$work/plan-media.json" "$work/plan-open.json"
+chmod 644 "$work/plan-open.json"
+_o_refused planmode 'a plan file other users can read' -p "$work/plan-open.json" -u wtfuser -H "$work/o.hash" -y --progress
+_o_refused planandd 'both -p and -d' -p "$work/plan-media.json" -d vtbd0 -u wtfuser -H "$work/o.hash" -y --progress
+IR_MOUNT_ROOT='/dev/iso9660/EXAMPLEBSD / cd9660 ro 0 0'
+IR_GLABEL='iso9660/EXAMPLEBSD  N/A  vtbd0'
+_o_refused planmedia 'a plan naming the disk of the live media' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -y --progress
+IR_MOUNT_ROOT=''
+IR_GLABEL=''
+printf '[{"id":"something-else"}]\n' > "$work/o.accept2"
+chmod 600 "$work/o.accept2"
+_o_refused acceptunknown 'an accepted licence that is not in the catalogue' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -l "$work/o.accept2" -y --progress
+_o_refused passphrase 'a passphrase without an encryption plan' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -E "$work/o.hash" -y --progress
+_o_refused badlocale 'an unknown locale' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -L xx_YY.UTF-8 -y --progress
+_o_refused badnet6 'a bad -6' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -6 vtnet0:2001:db8:::1/64 -y --progress
+# the copy install: ZFS layouts across disks, GELI, data pools. The system
+# is copied from the root of the live media without the live layer that
+# build.sh lists next to the image (live-paths, orig/, system.pool)
+_cs="$work/copysrc"
+mkdir -p "$_cs/boot" "$_cs/etc" "$_cs/conf/base" "$_cs/usr/local/etc" "$_cs/usr/local/share/examplebsd/install"
+: > "$_cs/boot/loader.efi"
+: > "$_cs/boot/pmbr"
+: > "$_cs/boot/gptzfsboot"
+printf '# Device\tMountpoint\n/dev/iso9660/EXAMPLEBSD\t/\tcd9660\tro\t0\t0\n' > "$_cs/etc/fstab"
+: > "$_cs/etc/diskless"
+: > "$_cs/conf/base/etc.cpio.gz"
+printf 'permit nopass live as root cmd /x\n' > "$_cs/usr/local/etc/doas.conf"
+: > "$_cs/usr/local/share/examplebsd/install/system.img.xz"
+printf '%s\n' ./conf ./conf/base ./conf/base/etc.cpio.gz ./etc/diskless ./usr/local/share/examplebsd/install \
+	./usr/local/share/examplebsd/install/system.img.xz > "$INSTDIR/live-paths"
+mkdir -p "$INSTDIR/orig/usr/local/etc" "$INSTDIR/orig/etc"
+printf 'permit persist :wheel\n' > "$INSTDIR/orig/usr/local/etc/doas.conf"
+# the image's fstab, as build.sh writes it (the ESP by its volume label)
+printf '# Device\tMountpoint\n/dev/msdosfs/EFISYS\t/boot/efi\tmsdosfs\trw,failok\t2\t2\n' > "$INSTDIR/orig/etc/fstab"
+printf 'examplebsd_root\n' > "$INSTDIR/system.pool"
+printf '1000\n' > "$INSTDIR/system.kb"
+printf 'a long enough passphrase\n' > "$work/o.pass"
+chmod 600 "$work/o.pass"
+_pplan gmirror '{"version":1,"mode":"erase","boot":"uefi","disks":["vtbd0","nvd0"],"layout":"mirror","filesystem":"zfs","encryption":{"enabled":true,"swap":true},"swap_mb":1024,"sector_4k":true,"trim":true,"wipe":{"vtbd0":"quick","nvd0":"quick"}}'
+IR_SRCROOT=$_cs
+irun gmirror "$INSTDIR/mnt-gmirror" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+_gm="$INSTDIR/mnt-gmirror"
+if [ -n "$_nopy" ] || { [ "$_ir_rc" -eq 0 ] && _o_lines gmirror &&
+	grep -q '^geli init -b -g -e AES-XTS -l 256 -s 4096 -J .* /dev/gpt/zfs0$' "$INSTDIR/gmirror.log" &&
+	grep -q '^geli init -b -g -e AES-XTS -l 256 -s 4096 -J .* /dev/gpt/zfs1$' "$INSTDIR/gmirror.log" &&
+	grep -q "^zpool create -f -o altroot=$_gm -O mountpoint=/ -O compression=lz4 -O atime=off -o ashift=12 examplebsd_root mirror gpt/zfs0.eli gpt/zfs1.eli" "$INSTDIR/gmirror.log" &&
+	grep -q '^zpool set bootfs=examplebsd_root examplebsd_root$' "$INSTDIR/gmirror.log"; }; then
+	ok "install -p (copy): an encrypted 2-disk mirror gets GELI (boot prompt) on both disks and a mirror pool$_nopy"
+else
+	no "install -p (copy): an encrypted 2-disk mirror gets GELI (boot prompt) on both disks and a mirror pool (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/gmirror.out" "$INSTDIR/gmirror.err" 2> /dev/null | tail -6
+fi
+if [ -n "$_nopy" ] || { [ "$(grep -c '^gpart bootcode -b .*/boot/pmbr -p .*/boot/gptzfsboot -i 1 ' "$INSTDIR/gmirror.log")" -eq 2 ] &&
+	[ "$(grep -c '^newfs_msdos -F 32 -c 1 -L EFISYS ' "$INSTDIR/gmirror.log")" -eq 2 ] &&
+	[ "$(grep -c '^gpart add -t freebsd-swap -a 1m -s 1024m ' "$INSTDIR/gmirror.log")" -eq 2 ]; }; then
+	ok "install -p (copy): every system disk gets boot code, an EFI partition and swap$_nopy"
+else
+	no "install -p (copy): every system disk gets boot code, an EFI partition and swap"
+fi
+if [ -n "$_nopy" ] || { [ -f "$_gm/etc/fstab" ] && [ -f "$_gm/boot/loader.efi" ] && [ ! -e "$_gm/etc/diskless" ] &&
+	[ ! -e "$_gm/conf" ] && [ ! -e "$_gm/usr/local/share/examplebsd/install" ] &&
+	grep -qx 'permit persist :wheel' "$_gm/usr/local/etc/doas.conf" && ! grep -q live "$_gm/usr/local/etc/doas.conf" &&
+	! grep -q cd9660 "$_gm/etc/fstab"; }; then
+	ok "install -p (copy): the system is copied without the live layer or the live fstab line, the replaced files restored$_nopy"
+else
+	no "install -p (copy): the system is copied without the live layer, the replaced files restored"
+fi
+# every system disk has an ESP labelled EFISYS: the label is ambiguous, and
+# an ESP left unmounted shows as a volume icon on the desktop. Each ESP is
+# mounted by its GPT label, the first on /boot/efi
+if [ -n "$_nopy" ] || { grep -q "$(printf '^/dev/gpt/efiboot0\t/boot/efi\tmsdosfs\trw,failok\t2\t2$')" "$_gm/etc/fstab" &&
+	grep -q "$(printf '^/dev/gpt/efiboot1\t/boot/efi1\tmsdosfs\trw,failok\t2\t2$')" "$_gm/etc/fstab" &&
+	! grep -q '^/dev/msdosfs/EFISYS' "$_gm/etc/fstab" && [ -d "$_gm/boot/efi1" ]; }; then
+	ok "install -p (copy): each disk's EFI partition is mounted by its GPT label (/boot/efi, /boot/efi1), none left for the desktop$_nopy"
+else
+	no "install -p (copy): each disk's EFI partition is mounted by its GPT label (/boot/efi, /boot/efi1), none left for the desktop"
+	sed 's/^/      | /' "$_gm/etc/fstab" 2> /dev/null | head
+fi
+if [ -n "$_nopy" ] || { grep -qx 'geom_eli_load="YES"' "$_gm/boot/loader.conf.d/geli.conf" 2> /dev/null &&
+	grep -q "$(printf '^/dev/gpt/swap0.eli\tnone\tswap')" "$_gm/etc/fstab" && grep -q "$(printf '^/dev/gpt/swap1.eli\tnone\tswap')" "$_gm/etc/fstab" &&
+	grep -qx 'USERNAME=wtfuser' "$_gm/boot/firstboot-user.conf"; }; then
+	ok "install -p (copy): GELI in the loader, both swaps encrypted in fstab, the first-boot conf written$_nopy"
+else
+	no "install -p (copy): GELI in the loader, both swaps encrypted in fstab, the first-boot conf written"
+fi
+if { [ -z "$_nopy" ] && ! grep -q '^geli init .* -J ' "$INSTDIR/gmirror.log" 2> /dev/null; } ||
+	grep -q 'a long enough passphrase' "$INSTDIR/gmirror.log" "$INSTDIR/gmirror.out" "$INSTDIR/gmirror.err" 2> /dev/null; then
+	no "install -E: the passphrase is in no command line or output"
+else
+	ok "install -E: the passphrase is in no command line or output"
+fi
+_pplan sep '{"version":1,"mode":"erase","usage":"separate","disks":["vtbd0"],"layout":"single","filesystem":"zfs","swap_mb":0,"data":[{"name":"data","disks":["nvd0"],"layout":"single","filesystem":"zfs","mount":"/data"}]}'
+irun sep "$INSTDIR/mnt-sep" -p "$work/plan-sep.json" -u wtfuser -H "$work/o.hash" -y --progress
+if [ -n "$_nopy" ] || { [ "$_ir_rc" -eq 0 ] &&
+	grep -q "^zpool create .* examplebsd_root gpt/zfs0 *$" "$INSTDIR/sep.log" &&
+	grep -q "^zpool create -f -o altroot=$INSTDIR/mnt-sep -O mountpoint=/data .* data gpt/data-nvd0 *$" "$INSTDIR/sep.log" &&
+	! grep -q '^geli' "$INSTDIR/sep.log" && ! grep -q '^dd ' "$INSTDIR/sep.log"; }; then
+	ok "install -p (copy): \"use the disks separately\" makes the system pool and a data pool on /data$_nopy"
+else
+	no "install -p (copy): \"use the disks separately\" makes the system pool and a data pool on /data (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/sep.out" 2> /dev/null | tail -3
+fi
+IR_SRCROOT=''
+# on the live media the source is the cd9660 root itself: FreeBSD refuses
+# a second mount of the device in use ("Device busy"), so the installer
+# looks at it through a read-only nullfs view of / (which does not show
+# the memory disks mounted over /etc, /var, /root and /home)
+IR_MOUNT_ROOT='/dev/iso9660/EXAMPLEBSD / cd9660 ro 0 0'
+IR_GLABEL='iso9660/EXAMPLEBSD  N/A  cd0'
+irun nullsrc "$INSTDIR/mnt-nullsrc" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+if [ -n "$_nopy" ] || { grep -q '^mount -t nullfs -o ro / ' "$INSTDIR/nullsrc.log" &&
+	! grep -q '^mount -t cd9660' "$INSTDIR/nullsrc.log"; }; then
+	ok "install -p (copy): the source is a read-only nullfs view of the cd9660 root, not a second mount of the device$_nopy"
+else
+	no "install -p (copy): the source is a read-only nullfs view of the cd9660 root, not a second mount of the device"
+	grep '^mount' "$INSTDIR/nullsrc.log" 2> /dev/null | sed 's/^/      | /' | head -4
+fi
+IR_MOUNT_ROOT=''
+IR_GLABEL=''
+_o_refused nopass 'an encrypted plan without -E' -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -y --progress
+cp "$work/o.pass" "$work/o.pass644"
+chmod 644 "$work/o.pass644"
+_o_refused passmode 'a passphrase file other users can read' -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass644" -y --progress
+_pplan alongside '{"version":1,"mode":"alongside","disks":["vtbd0"],"layout":"single"}'
+_o_refused alongside 'mode alongside (not in this release)' -p "$work/plan-alongside.json" -u wtfuser -H "$work/o.hash" -y --progress
+_pplan along2 '{"version":1,"mode":"alongside","disks":[],"alongside":{"disk":"vtbd0","region":{"start_mb":1,"size_mb":102400}}}'
+_o_refused along2 'an alongside plan as the installer writes it (no disks)' -p "$work/plan-along2.json" -u wtfuser -H "$work/o.hash" -y --progress
+if [ -n "$_nopy" ] || grep -q '^ERROR disk plan: mode alongside is not supported by this release' "$INSTDIR/along2.out"; then
+	ok "install -p: an alongside plan is refused with a message that names the mode$_nopy"
+else
+	no "install -p: an alongside plan is refused with a message that names the mode"
+fi
+_pplan manual '{"version":1,"mode":"manual","disks":[],"partitions":[{"disk":"vtbd0","type":"root","size_mb":0,"mount":"/"}]}'
+_o_refused manual 'a manual plan (not in this release)' -p "$work/plan-manual.json" -u wtfuser -H "$work/o.hash" -y --progress
+irun dnszone "$INSTDIR/mnt-dnszone" -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -D '2001:db8::1%vtnet0' \
+	-6 'vtnet0:2001:db8::10/64:' -y --progress
+if [ -n "$_nopy" ] || { [ "$_ir_rc" -eq 0 ] && grep -qx 'DNS=2001:db8::1%vtnet0' "$INSTDIR/mnt-dnszone/boot/firstboot-user.conf" &&
+	grep -qx 'NETWORK6=vtnet0:2001:db8::10/64:' "$INSTDIR/mnt-dnszone/boot/firstboot-user.conf"; }; then
+	ok "install: a resolver with an adapter zone and a static IPv6 address without a gateway are taken$_nopy"
+else
+	no "install: a resolver with an adapter zone and a static IPv6 address without a gateway are taken (rc=$_ir_rc)"
+fi
+_o_refused badzone 'a resolver zone that is not an adapter name' -p "$work/plan-media.json" -u wtfuser -H "$work/o.hash" -D '2001:db8::1%../x' -y --progress
+# --capabilities: what the command takes, accepted by the installer's own
+# lib/diskplan.py --check-capabilities (tests/fixtures/installer, pinned at
+# the INSTALLER_REF of build.sh); every layout it announces, at its least
+# number of disks, encrypted and not, is a plan install-plan takes
+_capbin="$INSTDIR/caps"
+mkdir -p "$_capbin"
+sed -e 's|@SLUG@|examplebsd|g' "$INSTALLER" > "$_capbin/examplebsd-install"
+INSTALL_IMG="$INSTDIR/caps/none.img" sh "$_capbin/examplebsd-install" --capabilities > "$_capbin/out" 2> "$_capbin/err"
+_caprc=$?
+if [ -n "$_nopy" ] || { [ "$_caprc" -eq 0 ] &&
+	python3 -I "$repo/tests/fixtures/installer/diskplan.py" --check-capabilities < "$_capbin/out" > "$_capbin/checked" &&
+	python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["modes"]==["erase"]; assert c["boot"]==["uefi","bios"]; assert c["data_pools"] is True; assert {l["ident"] for l in c["layouts"]}=={"single","stripe","mirror","raid10","raidz1","raidz2","raidz3"}' "$_capbin/checked"; }; then
+	ok "install --capabilities: erase only, the ZFS layouts, GELI, data pools, uefi and bios; the installer's checker takes it$_nopy"
+else
+	no "install --capabilities: erase only, the ZFS layouts, GELI, data pools, uefi and bios; the installer's checker takes it (rc=$_caprc)"
+fi
+printf 'ufs\n' > "$INSTDIR/caps/system.fs"
+INSTALL_IMG="$INSTDIR/caps/none.img" sh "$_capbin/examplebsd-install" --capabilities > "$_capbin/out-ufs" 2>&1
+if [ -n "$_nopy" ] || { python3 -I "$repo/tests/fixtures/installer/diskplan.py" --check-capabilities < "$_capbin/out-ufs" > /dev/null &&
+	python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); assert [l["ident"] for l in c["layouts"]]==["single"]; assert c["filesystems"]==[["ufs","UFS"]]' "$_capbin/out-ufs"; }; then
+	ok "install --capabilities: a UFS image offers one disk, UFS, and nothing else$_nopy"
+else
+	no "install --capabilities: a UFS image offers one disk, UFS, and nothing else"
+fi
+_capbad=''
+if [ -z "$_nopy" ]; then
+	for _cl in $(python3 -I -c 'import json,sys
+for l in json.load(open(sys.argv[1]))["layouts"]: print("%s:%d" % (l["ident"], l.get("min_disks", 1)))' "$_capbin/out"); do
+		for _ce in false true; do
+			python3 -I -c 'import json,sys
+ident, n = sys.argv[1].split(":"); n = int(n)
+print(json.dumps({"version": 1, "mode": "erase", "disks": ["vtbd%d" % i for i in range(n)], "layout": ident,
+	"filesystem": "zfs", "encryption": {"enabled": sys.argv[2] == "true", "swap": False}, "swap_mb": 0}))' "$_cl" "$_ce" > "$_capbin/plan.json"
+			chmod 600 "$_capbin/plan.json"
+			python3 -I "$repo/overlay/base/rootfs/usr/local/libexec/@SLUG@/install-plan" "$_capbin/plan.json" zfs > /dev/null 2>&1 \
+				|| _capbad="$_capbad $_cl/enc=$_ce"
+		done
+	done
+fi
+if [ -z "$_capbad" ]; then
+	ok "install --capabilities: every layout it announces is a plan install-plan takes, encrypted or not$_nopy"
+else
+	no "install --capabilities: every layout it announces is a plan install-plan takes, encrypted or not; refused:$_capbad"
+fi
+# the vdev words of each layout
+_zs=$(awk '/^zpool_spec\(\) \{/,/^\}/' "$INSTALLER")
+_zsr=$( (die() { echo "die $*"; }; eval "$_zs"
+	printf '%s|' "$(zpool_spec raid10 a b c d)" "$(zpool_spec raidz2 a b c d)" "$(zpool_spec stripe a b)" "$(zpool_spec mirror a b)") 2>&1)
+if [ "$_zsr" = 'mirror a b mirror c d |raidz2 a b c d |a b |mirror a b |' ]; then
+	ok "install: the vdev words of raid10, raidz2, stripe and mirror"
+else
+	no "install: the vdev words of raid10, raidz2, stripe and mirror (got: $_zsr)"
+fi
+# the first-boot script applies the new keys
+_pr="$work/fbr"
+mkdir -p "$_pr/boot" "$_pr/etc/rc.conf.d" "$_pr/usr/share/zoneinfo/Europe" "$_pr/usr/share/vt/keymaps" \
+	"$_pr/usr/local/etc" "$_pr/home" "$work/fbr-bin"
+printf 'Paris zone data\n' > "$_pr/usr/share/zoneinfo/Europe/Paris"
+: > "$_pr/usr/share/vt/keymaps/fr.kbd"
+: > "$_pr/usr/share/vt/keymaps/uk.kbd"
+printf 'wtfuser:*:1001:1001:wtfuser:/home/wtfuser:/bin/sh\n' > "$_pr/etc/passwd"
+for _s in pw chown logger; do
+	cp "$STUBS/$_s" "$work/fbr-bin/"
+	chmod +x "$work/fbr-bin/$_s"
+done
+_fbrun() { # _fbrun <name> <conf lines...> — the first-boot script on the fake root
+	_fbn=$1
+	shift
+	printf '%s\n' "$@" > "$_pr/boot/firstboot-user.conf"
+	{
+		awk '/^[a-z_]+\(\) \{/,/^\}/' "$repo/overlay/base/rootfs/etc/rc.d/firstboot_user"
+		echo 'root_writable() { return 0; }'
+		echo 'note() { echo "firstboot_user: $*"; }'
+		echo "firstboot_user_conf=$_pr/boot/firstboot-user.conf"
+		echo "firstboot_user_root=$_pr"
+		echo 'firstboot_user_start'
+	} > "$work/fb_$_fbn.sh"
+	PATH="$work/fbr-bin:$PATH" STUB_LOG="$work/fbr.log" sh "$work/fb_$_fbn.sh" > "$work/fb_$_fbn.out" 2>&1
+	_fbrc=$?
+}
+_fbrun keys USERNAME=wtfuser "PASSWORD_HASH=$_oh" HOSTNAME=host.example.org TIMEZONE=Europe/Paris KEYMAP=fr
+if [ "$_fbrc" -eq 0 ] && grep -qx 'hostname="host.example.org"' "$_pr/etc/rc.conf.d/hostname" 2> /dev/null; then
+	ok "firstboot_user: HOSTNAME goes to rc.conf.d/hostname"
+else
+	no "firstboot_user: HOSTNAME goes to rc.conf.d/hostname (rc=$_fbrc)"
+	sed 's/^/      | /' "$work/fb_keys.out" 2> /dev/null | head
+fi
+if cmp -s "$_pr/etc/localtime" "$_pr/usr/share/zoneinfo/Europe/Paris" && [ "$(cat "$_pr/var/db/zoneinfo" 2> /dev/null)" = Europe/Paris ]; then
+	ok "firstboot_user: TIMEZONE becomes /etc/localtime and /var/db/zoneinfo"
+else
+	no "firstboot_user: TIMEZONE becomes /etc/localtime and /var/db/zoneinfo"
+fi
+if grep -qx 'keymap="fr"' "$_pr/etc/rc.conf.d/syscons" 2> /dev/null &&
+	grep -q 'Option "XkbLayout" "fr"' "$_pr/usr/local/etc/X11/xorg.conf.d/00-keyboard.conf" 2> /dev/null; then
+	ok "firstboot_user: KEYMAP goes to rc.conf.d/syscons and the X keyboard layout"
+else
+	no "firstboot_user: KEYMAP goes to rc.conf.d/syscons and the X keyboard layout"
+fi
+_fbrun uk USERNAME=wtfuser "PASSWORD_HASH=$_oh" KEYMAP=uk
+if grep -q 'Option "XkbLayout" "gb"' "$_pr/usr/local/etc/X11/xorg.conf.d/00-keyboard.conf" 2> /dev/null; then
+	ok "firstboot_user: the vt keymap uk is the X layout gb"
+else
+	no "firstboot_user: the vt keymap uk is the X layout gb"
+fi
+if grep -qx 'ifconfig_DEFAULT="DHCP"' "$repo/overlay/base/rootfs/etc/rc.conf.d/netif" 2> /dev/null &&
+	[ ! -e "$_pr/etc/rc.conf.d/netif" ]; then
+	ok "the image asks for DHCP on every interface; without NETWORK lines firstboot_user leaves that as it is"
+else
+	no "the image asks for DHCP on every interface; without NETWORK lines firstboot_user leaves that as it is"
+fi
+printf 'permit persist :wheel\n' > "$_pr/usr/local/etc/doas.conf"
+_fbrun net USERNAME=wtfuser "PASSWORD_HASH=$_oh" DOAS_NOPASS=yes NETWORK=vtnet0:192.0.2.10/24:192.0.2.1 \
+	NETWORK=em0:dhcp NETWORK=re0:192.0.2.20/28
+if [ "$_fbrc" -eq 0 ] && grep -qx 'ifconfig_vtnet0="inet 192.0.2.10/24"' "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'ifconfig_em0="DHCP"' "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'ifconfig_re0="inet 192.0.2.20/28"' "$_pr/etc/rc.conf.d/netif" &&
+	! grep -q DEFAULT "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'defaultrouter="192.0.2.1"' "$_pr/etc/rc.conf.d/routing" 2> /dev/null; then
+	ok "firstboot_user: NETWORK lines become ifconfig_<if> and defaultrouter"
+else
+	no "firstboot_user: NETWORK lines become ifconfig_<if> and defaultrouter (rc=$_fbrc)"
+	sed 's/^/      | /' "$work/fb_net.out" 2> /dev/null | head -5
+fi
+if grep -qx 'permit nopass wtfuser' "$_pr/usr/local/etc/doas.conf"; then
+	ok "firstboot_user: DOAS_NOPASS=yes lets the user run doas without a password"
+else
+	no "firstboot_user: DOAS_NOPASS=yes lets the user run doas without a password"
+fi
+printf 'permit persist :wheel\n' > "$_pr/usr/local/etc/doas.conf"
+_fbrun nonopass USERNAME=wtfuser "PASSWORD_HASH=$_oh"
+if [ "$_fbrc" -eq 0 ] && ! grep -q 'nopass' "$_pr/usr/local/etc/doas.conf"; then
+	ok "firstboot_user: a user with a password and no DOAS_NOPASS gets no nopass rule"
+else
+	no "firstboot_user: a user with a password and no DOAS_NOPASS gets no nopass rule"
+fi
+mkdir -p "$_pr/usr/share/locale/fr_FR.UTF-8" "$_pr/usr/local/etc/lightdm/lightdm.conf.d"
+printf 'default:\\\n\t:passwd_format=sha512:\\\n\t:lang=C.UTF-8:\n\nstandard:\\\n\t:tc=default:\n' > "$_pr/etc/login.conf"
+: > "$_pr/fbr-pw-before"
+_fbrun parity USERNAME=wtfuser "PASSWORD_HASH=$_oh" LOCALE=fr_FR.UTF-8 CLOCK=local "ROOT_HASH=$_oh" AUTOLOGIN=yes \
+	NETWORK6=vtnet0:slaac "NETWORK6=em0:2001:db8::10/64:$_gw6" DNS=192.0.2.53 DNS=2001:db8::53 WIFI_IF=iwm0
+if [ "$_fbrc" -eq 0 ] && grep -q ':lang=fr_FR.UTF-8:' "$_pr/etc/login.conf" && ! grep -q 'lang=C.UTF-8' "$_pr/etc/login.conf" &&
+	[ -e "$_pr/etc/wall_cmos_clock" ] && grep -q 'pw usermod -n root -H 0' "$work/fbr.log"; then
+	ok "firstboot_user: LOCALE in the default login class, CLOCK=local, ROOT_HASH for root"
+else
+	no "firstboot_user: LOCALE in the default login class, CLOCK=local, ROOT_HASH for root (rc=$_fbrc)"
+	sed 's/^/      | /' "$work/fb_parity.out" 2> /dev/null | head -5
+fi
+if grep -qx 'ifconfig_vtnet0_ipv6="inet6 accept_rtadv"' "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'ifconfig_em0_ipv6="inet6 2001:db8::10 prefixlen 64"' "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'ipv6_defaultrouter="2001:db8::1"' "$_pr/etc/rc.conf.d/routing" &&
+	grep -qx 'wlans_iwm0="wlan0"' "$_pr/etc/rc.conf.d/netif" && grep -qx 'ifconfig_wlan0="WPA DHCP"' "$_pr/etc/rc.conf.d/netif" &&
+	grep -qx 'name_servers="192.0.2.53 2001:db8::53"' "$_pr/etc/resolvconf.conf" &&
+	grep -qx 'rtsold_enable="YES"' "$_pr/etc/rc.conf.d/rtsold"; then
+	ok "firstboot_user: NETWORK6, WIFI_IF and DNS become rc.conf.d and resolvconf.conf"
+else
+	no "firstboot_user: NETWORK6, WIFI_IF and DNS become rc.conf.d and resolvconf.conf"
+fi
+if grep -qx 'autologin-user=wtfuser' "$_pr/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" 2> /dev/null; then
+	ok "firstboot_user: AUTOLOGIN=yes lets LightDM log the user in"
+else
+	no "firstboot_user: AUTOLOGIN=yes lets LightDM log the user in"
+fi
+rm -f "$_pr/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf"
+_fbrun noauto USERNAME=wtfuser "PASSWORD_HASH=$_oh"
+if [ "$_fbrc" -eq 0 ] && [ ! -e "$_pr/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" ]; then
+	ok "firstboot_user: no autologin unless AUTOLOGIN=yes"
+else
+	no "firstboot_user: no autologin unless AUTOLOGIN=yes"
+fi
+rm -f "$_pr/etc/rc.conf.d/hostname"
+_fbrun badtz USERNAME=wtfuser "PASSWORD_HASH=$_oh" HOSTNAME=other.example.org TIMEZONE=Mars/Olympus
+if [ "$_fbrc" -ne 0 ] && grep -q 'TIMEZONE is not a zoneinfo name' "$work/fb_badtz.out" && [ ! -e "$_pr/etc/rc.conf.d/hostname" ]; then
+	ok "firstboot_user: an unknown TIMEZONE is refused before anything is written"
+else
+	no "firstboot_user: an unknown TIMEZONE is refused before anything is written (rc=$_fbrc)"
+fi
+
+# ------------------------------------------------------------------
+# (n) the live desktop ISO: the live layer (overlay/live) goes into the
+#     stage only for the ISO, after the raw image, and comes out again.
+#     The functions are taken out of build.sh and run against a fake
+#     stage with stub chown/chmod (the suite runs without root).
+# ------------------------------------------------------------------
+_n="$work/n"
+_ns="$_n/out/desktop/stage"
+_nw="$_n/out/desktop"
+mkdir -p "$_ns/etc/rc.conf.d" "$_ns/var/db/pkg" "$_ns/root" "$_ns/usr/local/etc" \
+	"$_ns/usr/local/share/applications" "$_ns/usr/local/share/examplebsd" "$_n/bin"
+printf 'ttyv0\t"/usr/libexec/getty Pc"\txterm\tonifexists secure\nttyu0\t"/usr/libexec/getty 3wire"\tvt100\tonifconsole secure\n' > "$_ns/etc/ttys"
+printf 'default:\\\n\t:cb:ce:ck:lc:\n' > "$_ns/etc/gettytab"
+printf 'the motd\n' > "$_ns/etc/motd"
+printf 'xorg_fallback_enable="YES"\n' > "$_ns/etc/rc.conf.d/xorg_fallback"
+printf 'local.sqlite\n' > "$_ns/var/db/pkg/local.sqlite"
+printf 'PS1=x\n' > "$_ns/root/.profile"
+printf 'permit persist :wheel\n' > "$_ns/usr/local/etc/doas.conf"
+cp "$STUBS/chown" "$STUBS/chmod" "$_n/bin/"
+chmod +x "$_n/bin/chown" "$_n/bin/chmod"
+# tree_state <dir> — every path with its type and the checksum of a file
+tree_state() {
+	(cd "$1" && find . -print | LC_ALL=C sort | while IFS= read -r _tp; do
+		if [ -L "$_tp" ]; then
+			printf 'l %s\n' "$_tp"
+		elif [ -d "$_tp" ]; then
+			printf 'd %s\n' "$_tp"
+		else
+			printf 'f %s %s\n' "$_tp" "$(cksum < "$_tp")"
+		fi
+	done)
+}
+tree_state "$_ns" > "$_n/before.state"
+{
+	for _fn in rmrf subst_overlay own_overlay rename_slug in_stage fetch_installer live_snapshot \
+		live_backup live_md_size live_stage live_manifest live_revert; do
+		awk "/^$_fn\\(\\) \\{/,/^\\}/" "$repo/build.sh"
+	done
+} > "$_n/f.sh"
+printf 's|@DISTRO_NAME@|ExampleBSD|g\ns|@SLUG@|examplebsd|g\ns|@MOTD@|m|g\ns|@BRAND_URL@|https://example.org|g\n' > "$_n/sub.sed"
+# _nrun <phase> — run live_stage (stage) or live_revert (revert) on the fake stage
+_nrun() {
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		ROOT=$repo OUT="$_n/out" DISTRO_SLUG=examplebsd DISTRO_NAME=ExampleBSD SUBFILE="$_n/sub.sed" INST_TREE=${NINST:-}
+		eval "$(grep '^LIVE_APPLY=' "$repo/build.sh")"
+		VOL=EXAMPLEBSD
+		STUB_LOG="$_n/stub.log" PATH="$_n/bin:$PATH"
+		export STUB_LOG PATH
+		. "$_n/f.sh"
+		LIVE_BACKUP="$_nw/.live-backup"
+		case $1 in
+		stage) live_stage "$_ns" "$_nw" ;;
+		manifest)
+			ROOT_POOL=examplebsd_root
+			mkdir -p "$_ns/usr/local/share/examplebsd/install"
+			live_manifest "$_ns" "$_nw" "$_ns/usr/local/share/examplebsd/install" 4242
+			;;
+		revert) live_revert "$_ns" "$_nw" ;;
+		esac
+	) > "$_n/$1.log" 2>&1
+	_nrc=$?
+}
+_nrun stage
+if [ "$_nrc" -eq 0 ]; then
+	ok "live layer: build.sh adds it to a stage"
+else
+	no "live layer: build.sh adds it to a stage (rc=$_nrc)"
+	sed 's/^/      | /' "$_n/stage.log"
+fi
+# the archive of the live /etc, unpacked the way rc.initdiskless does
+mkdir -p "$_n/etc-x"
+tar -xzf "$_ns/conf/base/etc.cpio.gz" -C "$_n/etc-x" 2> /dev/null
+_nl="$_ns/usr/local/etc/lightdm/lightdm.conf.d/60-examplebsd-live.conf"
+if grep -qx 'autologin-user=live' "$_nl" 2> /dev/null && grep -qx 'autologin-session=xfce' "$_nl"; then
+	ok "live ISO: LightDM logs the live user in to Xfce"
+else
+	no "live ISO: LightDM logs the live user in to Xfce"
+fi
+if grep -qx 'Exec=/usr/local/bin/wtfbsd-installer' \
+	"$_ns/usr/local/share/wtfbsd-installer/autostart/wtfbsd-installer.desktop" 2> /dev/null; then
+	ok "live ISO: the stand-in autostart entry opens the installer launcher"
+else
+	no "live ISO: the stand-in autostart entry opens the installer launcher"
+fi
+if grep -qx 'Name=Install ExampleBSD' "$_ns/usr/local/share/applications/wtfbsd-installer.desktop" 2> /dev/null &&
+	grep -qx 'Name=Install ExampleBSD' "$_ns/usr/local/share/wtfbsd-installer/desktop/wtfbsd-installer.desktop" 2> /dev/null; then
+	ok "live ISO: an \"Install ExampleBSD\" menu entry and desktop icon"
+else
+	no "live ISO: an \"Install ExampleBSD\" menu entry and desktop icon"
+fi
+# doas: exactly one rule names the live user, for the GTK-free helper,
+# with no environment kept (the front ends run as the live user)
+_nd=$(grep -v '^[[:space:]]*#' "$_ns/usr/local/etc/doas.conf" 2> /dev/null | grep -w live)
+_ndn=$(printf '%s\n' "$_nd" | grep -c .)
+if [ "$_ndn" -eq 1 ] && [ "$_nd" = 'permit nopass live as root cmd /usr/local/libexec/wtfbsd-installer/installer-apply' ]; then
+	ok "live ISO: doas.conf has exactly one rule for live: installer-apply as root, no keepenv/setenv"
+else
+	no "live ISO: doas.conf has exactly one rule for live: installer-apply as root, no keepenv/setenv (got $_ndn: $_nd)"
+fi
+if [ -x "$_ns/usr/local/libexec/wtfbsd-installer/installer-apply" ] &&
+	! grep -v '^[[:space:]]*#' "$_ns/usr/local/libexec/wtfbsd-installer/installer-apply" | grep -q 'doas' &&
+	grep -v '^[[:space:]]*#' "$_ns/usr/local/bin/wtfbsd-installer" 2> /dev/null | grep -q 'doas \$apply' &&
+	grep -q '^apply=/usr/local/libexec/wtfbsd-installer/installer-apply$' "$_ns/usr/local/bin/wtfbsd-installer" &&
+	! grep -v '^[[:space:]]*#' "$_ns/usr/local/bin/wtfbsd-installer" | grep -Eq 'doas[^;]*(\$0|wtfbsd-installer[" ]|-install)'; then
+	ok "live ISO: the stand-in launcher runs as live and asks doas only for installer-apply"
+else
+	no "live ISO: the stand-in launcher runs as live and asks doas only for installer-apply"
+fi
+if [ "$_nrc" -eq 0 ] && grep -qx 'permit persist :wheel' "$_ns/usr/local/etc/doas.conf" 2> /dev/null; then
+	ok "live ISO: doas.conf keeps the wheel rule"
+else
+	no "live ISO: doas.conf keeps the wheel rule"
+fi
+if [ -x "$_ns/usr/local/bin/wtfbsd-installer" ] && [ -x "$_ns/usr/local/libexec/examplebsd/live-tui" ]; then
+	ok "live ISO: the stand-in launcher and the serial installer are executable"
+else
+	no "live ISO: the stand-in launcher and the serial installer are executable"
+fi
+# the read-only root: rc.initdiskless gets its switch and its archives
+_nok=yes
+[ -f "$_ns/etc/diskless" ] || _nok=no
+for _d in etc var root home; do
+	[ -s "$_ns/conf/base/$_d.cpio.gz" ] && [ -s "$_ns/conf/base/$_d/md_size" ] || _nok=no
+done
+[ -d "$_ns/home" ] || _nok=no
+if [ "$_nok" = yes ]; then
+	ok "live ISO: /etc/diskless, /home and an archive + md_size for /etc /var /root /home"
+else
+	no "live ISO: /etc/diskless, /home and an archive + md_size for /etc /var /root /home"
+fi
+if tar -tzf "$_ns/conf/base/var.cpio.gz" 2> /dev/null | grep -q '^var/db/pkg/local.sqlite$' &&
+	tar -tzf "$_ns/conf/base/root.cpio.gz" 2> /dev/null | grep -q '^root/.profile$'; then
+	ok "live ISO: the /var and /root archives hold the staged /var and /root"
+else
+	no "live ISO: the /var and /root archives hold the staged /var and /root"
+fi
+_nsz=$(cat "$_ns/conf/base/var/md_size" 2> /dev/null)
+case $_nsz in
+[1-9]*[0-9]k) ok "live ISO: the /var memory disk has a size mdmfs reads ($_nsz)" ;;
+*) no "live ISO: the /var memory disk has a size mdmfs reads (got: $_nsz)" ;;
+esac
+if grep -q '^live_session_enable="YES"' "$_n/etc-x/etc/rc.conf.d/live_session" 2> /dev/null &&
+	grep -q '^# PROVIDE: live_session' "$_n/etc-x/etc/rc.d/live_session" 2> /dev/null &&
+	! grep -q '@SLUG@' "$_n/etc-x/etc/rc.d/live_session"; then
+	ok "live ISO: the live /etc enables rc.d/live_session (placeholders substituted)"
+else
+	no "live ISO: the live /etc enables rc.d/live_session (placeholders substituted)"
+fi
+if [ -f "$_n/etc-x/etc/rc.d/live_session" ] && [ ! -e "$_ns/etc/rc.d/live_session" ] && [ ! -e "$_ns/etc/rc.conf.d/live_session" ]; then
+	ok "live ISO: the live rc.d script is only in the /etc archive, not in the staged /etc"
+else
+	no "live ISO: the live rc.d script is only in the /etc archive, not in the staged /etc"
+fi
+if grep -q '^xorg_fallback_dir="/etc/X11/xorg.conf.d"' "$_n/etc-x/etc/rc.conf.d/xorg_fallback" 2> /dev/null; then
+	ok "live ISO: the X fallback goes to the writable /etc/X11/xorg.conf.d"
+else
+	no "live ISO: the X fallback goes to the writable /etc/X11/xorg.conf.d"
+fi
+if grep -Eq '^ttyu0[[:space:]]+"/usr/libexec/getty live.tui"[[:space:]]+vt100[[:space:]]+onifconsole secure$' "$_n/etc-x/etc/ttys" 2> /dev/null &&
+	grep -q '^ttyv0' "$_n/etc-x/etc/ttys" &&
+	grep -q ':al=root:lo=/usr/local/libexec/examplebsd/live-tui:tc=3wire:' "$_n/etc-x/etc/gettytab" 2> /dev/null; then
+	ok "live ISO: the serial console (ttyu0) runs the text installer through getty"
+else
+	no "live ISO: the serial console (ttyu0) runs the text installer through getty"
+fi
+_nfs=$(printf '/dev/iso9660/EXAMPLEBSD\t/\tcd9660\tro\t0\t0')
+if [ "$(cat "$_n/etc-x/etc/fstab" 2> /dev/null)" = "$_nfs" ]; then
+	ok "live ISO: the live /etc/fstab mounts the cd9660 root, not the root of the raw image"
+else
+	no "live ISO: the live /etc/fstab mounts the cd9660 root, not the root of the raw image"
+fi
+if grep -qx 'firstboot_user_enable="NO"' "$_n/etc-x/etc/rc.conf.d/firstboot_user" 2> /dev/null &&
+	grep -qx 'firstboot_user_enable="YES"' "$repo/overlay/base/rootfs/etc/rc.conf.d/firstboot_user"; then
+	ok "live ISO: the first-boot provisioning is off on the live media (on in the installed system)"
+else
+	no "live ISO: the first-boot provisioning is off on the live media (on in the installed system)"
+fi
+# what a copy install needs: the paths of the live layer, the originals of
+# the files it replaced and the image's fstab (mkisoimages.sh puts the
+# cd9660 line into the stage's while it packs)
+printf '# Device\tMountpoint\n' > "$_n/fstab.image"
+cp "$_ns/etc/fstab" "$_n/fstab.saved" 2> /dev/null || : > "$_n/fstab.saved"
+cp "$_n/fstab.image" "$_ns/etc/fstab"
+_nrun manifest
+_ni2="$_ns/usr/local/share/examplebsd/install"
+if [ "$_nrc" -eq 0 ] && grep -qx './conf' "$_ni2/live-paths" 2> /dev/null && grep -qx './etc/diskless' "$_ni2/live-paths" &&
+	grep -qx './usr/local/share/examplebsd/install' "$_ni2/live-paths" &&
+	cmp -s "$_ni2/orig/etc/fstab" "$_n/fstab.image" && grep -qx 'permit persist :wheel' "$_ni2/orig/usr/local/etc/doas.conf" &&
+	[ "$(cat "$_ni2/system.pool")" = examplebsd_root ] && [ "$(cat "$_ni2/system.kb")" = 4242 ]; then
+	ok "live ISO: the copy install gets the live layer's paths, the replaced originals, the image's fstab, the pool name"
+else
+	no "live ISO: the copy install gets the live layer's paths, the replaced originals, the image's fstab, the pool name (rc=$_nrc)"
+	sed 's/^/      | /' "$_n/manifest.log" 2> /dev/null | head -5
+fi
+if [ -s "$_n/fstab.saved" ]; then cp "$_n/fstab.saved" "$_ns/etc/fstab"; else rm -f "$_ns/etc/fstab"; fi
+# the layer comes out again: the stage is the one of the raw image
+mkdir -p "$_ns/usr/local/share/examplebsd/install"
+: > "$_ns/usr/local/share/examplebsd/install/system.img.xz"
+_nrun revert
+tree_state "$_ns" > "$_n/after.state"
+if [ "$_nrc" -eq 0 ] && cmp -s "$_n/before.state" "$_n/after.state"; then
+	ok "live layer: after the ISO the stage is what it was (no live user, autologin or autostart)"
+else
+	no "live layer: after the ISO the stage is what it was (rc=$_nrc)"
+	diff "$_n/before.state" "$_n/after.state" 2> /dev/null | head -20 | sed 's/^/      | /'
+	sed 's/^/      | /' "$_n/revert.log" 2> /dev/null
+fi
+# the order in build.sh: raw image [6], then the layer, the ISO [7], the revert
+_n6=$(_bline 'mkimg -s gpt')
+_nls=$(_bline 'live_stage "\$STAGE" "\$PSUB"')
+_niso=$(_bline 'step sh "\$SRC/release/\$KARC/mkisoimages.sh"')
+_nlr=$(_bline 'live_revert "\$STAGE" "\$PSUB"')
+if [ -n "$_n6" ] && [ -n "$_nls" ] && [ -n "$_niso" ] && [ -n "$_nlr" ] &&
+	[ "$_n6" -lt "$_nls" ] && [ "$_nls" -lt "$_niso" ] && [ "$_niso" -lt "$_nlr" ]; then
+	ok "build.sh: raw image, then the live layer, the ISO, then the layer comes out"
+else
+	no "build.sh: raw image, then the live layer, the ISO, then the layer comes out ($_n6 $_nls $_niso $_nlr)"
+fi
+# the installed system has none of it: no overlay outside overlay/live
+# turns on an autologin, makes the live user or starts the installer
+_nleak=$(grep -rlE 'autologin-user=live|live_session|live\.tui|\.config/autostart|wtfbsd-installer/autostart' "$repo/overlay/base" "$repo/overlay/profiles" 2> /dev/null)
+if [ -z "$_nleak" ]; then
+	ok "the installed system: no autologin, live user or installer autostart outside overlay/live"
+else
+	no "the installed system: no autologin, live user or installer autostart outside overlay/live:$_nleak"
+fi
+# the installer-template: its install-into-stage.sh runs on the stage and
+# replaces the stand-in; everything it adds comes out with the layer
+_ni="$_n/inst"
+mkdir -p "$_ni"
+cat > "$_ni/install-into-stage.sh" <<'IIS'
+#!/bin/sh
+case " $* " in
+*' --artwork '*) [ ! -e "$(dirname "$0")/refuse-artwork" ] || { echo 'the artwork cannot be used' >&2; exit 2; } ;;
+esac
+d=$1/usr/local
+mkdir -p "$d/bin" "$d/libexec/wtfbsd-installer/bin" "$d/share/wtfbsd-installer/autostart"
+printf '#!/bin/sh\n' > "$d/libexec/wtfbsd-installer/installer-apply"
+chmod 755 "$d/libexec/wtfbsd-installer/installer-apply"
+printf '#!/bin/sh\necho real launcher\n' > "$d/bin/wtfbsd-installer"
+chmod 755 "$d/bin/wtfbsd-installer"
+printf '#!/bin/sh\n' > "$d/libexec/wtfbsd-installer/bin/installer-gui"
+printf '[Desktop Entry]\nExec=/usr/local/libexec/wtfbsd-installer/bin/installer-session\n' > "$d/share/wtfbsd-installer/autostart/wtfbsd-installer.desktop"
+printf '%s\n' /usr/local/bin/wtfbsd-installer /usr/local/libexec/wtfbsd-installer/bin/installer-gui > "$d/share/wtfbsd-installer/MANIFEST"
+ln -s /usr/local/libexec/wtfbsd-installer/bin/installer-gui "$d/bin/wtfbsd-installer-gui"
+ln -s /nonexistent/dangling "$d/bin/wtfbsd-dangling"
+echo "$1" > "$(dirname "$0")/ran-on"
+shift
+echo "$*" > "$(dirname "$0")/args"
+[ "$1" = --conf ] && cp "$2" "$(dirname "$0")/conf-given"
+IIS
+NINST=$_ni _nrun stage
+if [ "$_nrc" -eq 0 ] && [ "$(cat "$_ni/ran-on" 2> /dev/null)" = "$_ns" ] &&
+	grep -q 'real launcher' "$_ns/usr/local/bin/wtfbsd-installer" 2> /dev/null &&
+	grep -q 'installer-session' "$_ns/usr/local/share/wtfbsd-installer/autostart/wtfbsd-installer.desktop"; then
+	grep -qx 'PRODUCT_NAME=ExampleBSD' "$_ni/conf-given" 2> /dev/null && grep -qx 'PRODUCT_SLUG=examplebsd' "$_ni/conf-given" &&
+	grep -qx 'OS=freebsd' "$_ni/conf-given" &&
+	ok "live layer: the installer-template's install-into-stage.sh runs on the stage with the product's installer.conf and replaces the stand-in"
+else
+	no "live layer: the installer-template's install-into-stage.sh runs on the stage with the product's installer.conf and replaces the stand-in (rc=$_nrc)"
+	sed 's/^/      | /' "$_n/stage.log" 2> /dev/null | head
+fi
+# live_session names the medium early in the live boot, so the installer
+# may require it: a live root in memory without that file offers no disk
+if grep -qx 'LIVE_MEDIUM_REQUIRED=yes' "$_ni/conf-given" 2> /dev/null &&
+	[ "$(sed -n 's/^: ${live_session_medium_file:="\(.*\)"}$/\1/p' "$repo/overlay/live/etc/rc.d/live_session")" = /var/run/wtfbsd-live-medium ]; then
+	ok "live layer: the installer.conf requires the live medium (LIVE_MEDIUM_REQUIRED=yes), named where live_session writes it"
+else
+	no "live layer: the installer.conf requires the live medium (LIVE_MEDIUM_REQUIRED=yes), named where live_session writes it"
+fi
+NINST=$_ni _nrun revert
+tree_state "$_ns" > "$_n/after2.state"
+if [ "$_nrc" -eq 0 ] && cmp -s "$_n/before.state" "$_n/after2.state"; then
+	ok "live layer: the installer-template's files come out with the layer"
+else
+	no "live layer: the installer-template's files come out with the layer (rc=$_nrc)"
+	diff "$_n/before.state" "$_n/after2.state" 2> /dev/null | head -10 | sed 's/^/      | /'
+fi
+# an artwork the installer-template cannot use: the build fails, unless
+# ALLOW_UNBRANDED_INSTALLER=yes (then once more without it, loudly)
+: > "$_ni/refuse-artwork"
+mkdir -p "$_n/art"
+for _nal in no yes; do
+(
+
+	die() { echo "die: $*" >&2; exit 1; }
+	ROOT=$repo OUT="$_n/out" DISTRO_SLUG=examplebsd DISTRO_NAME=ExampleBSD SUBFILE="$_n/sub.sed" INST_TREE=$_ni
+	ART="$_n/art" VOL=EXAMPLEBSD PATH="$_n/bin:$PATH" STUB_LOG="$_n/stub.log"
+	eval "$(grep '^LIVE_APPLY=' "$repo/build.sh")"
+	export PATH STUB_LOG
+	. "$_n/f.sh"
+	LIVE_BACKUP="$_nw/.live-backup"
+	# python3 stands in for the build host's: the artwork is offered
+	python3() { :; }
+	ALLOW_UNBRANDED_INSTALLER=$_nal
+	live_stage "$_ns" "$_nw"
+) > "$_n/artretry-$_nal.log" 2>&1
+_nrc=$?
+case $_nal in
+no)
+	if [ "$_nrc" -ne 0 ] && grep -q 'cannot use the artwork.*ALLOW_UNBRANDED_INSTALLER=yes' "$_n/artretry-no.log"; then
+		ok "live layer: an artwork the installer cannot use fails the build by default"
+	else
+		no "live layer: an artwork the installer cannot use fails the build by default (rc=$_nrc)"
+	fi
+	;;
+yes)
+	if [ "$_nrc" -eq 0 ] && grep -q 'WARNING: the installer-template could not use the artwork' "$_n/artretry-yes.log" &&
+		grep -q 'real launcher' "$_ns/usr/local/bin/wtfbsd-installer"; then
+		ok "live layer: ALLOW_UNBRANDED_INSTALLER=yes runs install-into-stage.sh again without the artwork, with a warning"
+	else
+		no "live layer: ALLOW_UNBRANDED_INSTALLER=yes runs install-into-stage.sh again without the artwork, with a warning (rc=$_nrc)"
+		sed 's/^/      | /' "$_n/artretry-yes.log" | head -5
+	fi
+	;;
+esac
+NINST=$_ni _nrun revert
+done
+rm -f "$_ni/refuse-artwork"
+
+# rc.d/live_session: the live user, its autostart entry and its icon
+_nl2="$_n/ls"
+mkdir -p "$_nl2/root/etc" "$_nl2/bin" "$_nl2/src"
+printf '[Desktop Entry]\nName=auto\n' > "$_nl2/src/auto.desktop"
+printf '[Desktop Entry]\nName=icon\n' > "$_nl2/src/icon.desktop"
+cat > "$_nl2/bin/pw" <<'PWSTUB'
+#!/bin/sh
+printf 'pw %s\n' "$*" >> "$STUB_LOG"
+case "$1 $2" in
+'usershow -n')
+	[ -f "$STUB_LOG.made" ] || exit 1
+	printf 'live:*:%s:%s::0:0:Live session:/home/live:/bin/sh\n' "$(cat "$STUB_LOG.made")" "$(cat "$STUB_LOG.made")"
+	;;
+'usershow -u') [ "$3" = 1100 ] && exit 0; exit 1 ;;
+'groupshow -g') exit 1 ;;
+'groupshow -n') [ "$3" = video ] && exit 0; exit 1 ;;
+'useradd -n')
+	_a=$*
+	_uid=${_a#*-u }
+	echo "${_uid%% *}" > "$STUB_LOG.made"
+	;;
+esac
+exit 0
+PWSTUB
+printf '#!/bin/sh\necho 1101\n' > "$_nl2/bin/id"
+cp "$STUBS/mount" "$_nl2/bin/"
+cp "$STUBS/chown" "$STUBS/chmod" "$STUBS/logger" "$_nl2/bin/"
+chmod +x "$_nl2/bin/"*
+sed -e "s#^\\. /etc/rc\\.subr#. $_m2/rc.subr#" "$repo/overlay/live/etc/rc.d/live_session" > "$_nl2/live_session" 2> /dev/null
+STUB_MOUNT_ROOT=$(printf '/dev/iso9660/EXAMPLEBSD\t/\tcd9660\tro\t0\t0') \
+	live_session_medium_file="$_nl2/root/live-medium" \
+	PATH="$_nl2/bin:$PATH" STUB_LOG="$_nl2/pw.log" live_session_root="$_nl2/root" \
+	live_session_autostart="$_nl2/src/auto.desktop" live_session_icon="$_nl2/src/icon.desktop" \
+	sh "$_nl2/live_session" start > "$_nl2/out" 2>&1
+_nlrc=$?
+if [ "$_nlrc" -eq 0 ] && grep -q '^pw useradd -n live -u 1101 -c Live session -m -s /bin/sh -w none -G video$' "$_nl2/pw.log" &&
+	! grep -q 'wheel' "$_nl2/pw.log"; then
+	ok "rc.d/live_session: live gets the first free uid from 1100, no password, no group but video"
+else
+	no "rc.d/live_session: live gets the first free uid from 1100, no password, no group but video (rc=$_nlrc)"
+	sed 's/^/      | /' "$_nl2/pw.log" "$_nl2/out" 2> /dev/null | head
+fi
+if [ "$(cat "$_nl2/root/live-medium" 2> /dev/null)" = /dev/iso9660/EXAMPLEBSD ] &&
+	[ "$(ls -l "$_nl2/root/live-medium" | cut -c1-10)" = '-rw-r--r--' ]; then
+	ok "rc.d/live_session: the device of the live medium goes to /var/run/wtfbsd-live-medium (one line, 0644)"
+else
+	no "rc.d/live_session: the device of the live medium goes to /var/run/wtfbsd-live-medium (one line, 0644)"
+fi
+if cmp -s "$_nl2/root/home/live/.config/autostart/auto.desktop" "$_nl2/src/auto.desktop" &&
+	cmp -s "$_nl2/root/home/live/Desktop/icon.desktop" "$_nl2/src/icon.desktop"; then
+	ok "rc.d/live_session: the installer's autostart entry and the install icon reach the live user"
+else
+	no "rc.d/live_session: the installer's autostart entry and the install icon reach the live user"
+fi
+
+# the installer-template: unset, the pinned merged main is cloned; none
+# keeps the stand-in
+conf ninst 'PROFILE="desktop"'
+sh "$repo/build.sh" -n -c "$work/ninst.conf" -o "$work/out" > "$_n/dry-inst.log" 2>&1
+conf ninone 'PROFILE="desktop"' 'INSTALLER_REF="none"'
+sh "$repo/build.sh" -n -c "$work/ninone.conf" -o "$work/out" > "$_n/dry-none.log" 2>&1
+if grep -q 'git checkout --detach f2e9c48b051f473029ef44a78264b2239ff73141' "$_n/dry-inst.log" &&
+	grep -q 'no installer-template: the stand-in launcher' "$_n/dry-none.log" && ! grep -q 'git clone' "$_n/dry-none.log"; then
+	ok "build.sh: the installer-template defaults to its pinned merged main; INSTALLER_REF=none keeps the stand-in"
+else
+	no "build.sh: the installer-template defaults to its pinned merged main; INSTALLER_REF=none keeps the stand-in"
+fi
+# a desktop dry run plans the live layer; the appliance keeps /etc/rc.local
+conf nlive 'PROFILE="desktop"'
+sh "$repo/build.sh" -n -c "$work/nlive.conf" -o "$work/out" > "$_n/dry.log" 2>&1
+conf napp 'PROFILE="appliance"'
+sh "$repo/build.sh" -n -c "$work/napp.conf" -o "$work/out" > "$_n/dry-app.log" 2>&1
+if grep -q 'live layer' "$_n/dry.log" && ! grep -q 'etc/rc.local' "$_n/dry.log" &&
+	grep -q 'etc/rc.local' "$_n/dry-app.log" && ! grep -q 'live layer' "$_n/dry-app.log"; then
+	ok "build.sh: the desktop ISO is live (no /etc/rc.local); the appliance ISO keeps /etc/rc.local"
+else
+	no "build.sh: the desktop ISO is live (no /etc/rc.local); the appliance ISO keeps /etc/rc.local"
+fi
+# the packages of the installer front ends
+for _p in python3 xhost py312-pygobject gtk3 xterm noto-emoji; do
+	if sed 's/#.*//' "$_dl" | grep -qx "[[:space:]]*$_p[[:space:]]*"; then
+		ok "desktop profile ships $_p (the installer front ends)"
+	else
+		no "desktop profile ships $_p (the installer front ends)"
+	fi
+done
+
+
+# ------------------------------------------------------------------
+# (q) the README shows the screenshots of the proof: every image link
+#     resolves to a file of the repository, and each PNG is small
+# ------------------------------------------------------------------
+_qbad=''
+_qn=0
+for _ql in $(sed -n -e 's/.*!\[[^]]*\](\([^)]*\)).*/\1/p' -e 's/.*<img [^>]*src="\([^"]*\)".*/\1/p' "$repo/README.md"); do
+	case $_ql in
+	http://* | https://*) _qbad="$_qbad $_ql(remote)"; continue ;;
+	/* | *..*) _qbad="$_qbad $_ql(outside)"; continue ;;
+	esac
+	_qn=$((_qn + 1))
+	if [ ! -f "$repo/$_ql" ]; then
+		_qbad="$_qbad $_ql(missing)"
+	elif [ "$(wc -c < "$repo/$_ql")" -gt 358400 ]; then
+		_qbad="$_qbad $_ql(over 350 KiB)"
+	fi
+done
+if [ -z "$_qbad" ]; then
+	ok "README: every image link resolves to a small file of the repository ($_qn images)"
+else
+	no "README: every image link resolves to a small file of the repository:$_qbad"
+fi
+
+# ------------------------------------------------------------------
+# (r) branding: every spot the artwork pack marks supported on FreeBSD
+#     (branding/spots.tsv of the pinned artwork, tests/fixtures/artwork)
+#     is installed; the identity file matches product.conf; a pack whose
+#     sha256 is not the pinned one is refused
+# ------------------------------------------------------------------
+_b="$work/brand"
+_bp="$_b/examplebsd-353ef29aa000-default"
+mkdir -p "$_bp/branding" "$_bp/scripts" "$_b/stage/bin" "$_b/stage/etc" "$_b/stage/usr/local/share/fonts/dejavu"
+cp "$repo/tests/fixtures/artwork/spots.tsv" "$_bp/branding/spots.tsv"
+printf 'name=examplebsd\ncommit=353ef29aa000\nvariant=default\n' > "$_bp/PACK"
+: > "$_bp/palette.env"
+# the rendered files every FreeBSD spot reads
+for _f in boot/freebsd/gfx-examplebsd.lua boot/freebsd/loader.conf.fragment loader/examplebsd-brand.png \
+	loader/examplebsd-logo.png loader/splash.png console/motd.template console/issue lightdm/greeter-1920x1080.png \
+	lightdm/lightdm-gtk-greeter.conf lightdm/greeter-gtk.css dm/pixmaps/examplebsd-color.xpm dm/xdm/Xresources \
+	dm/xdm/Xsetup_0 installer/header.png installer/sidebar.png xfce/gtk-colors.css wallpapers/wallpaper-1-1920x1080.png \
+	wallpapers/wallpaper-1-3840x2160.png xfce/xfconf/xfce4-desktop.xml xfce/xfconf/xfce4-panel.xml \
+	xfce/xfconf/xsettings.xml xfce/xfwm4-themerc icons/hicolor/48x48/apps/examplebsd-logo.png; do
+	mkdir -p "$_bp/out/${_f%/*}"
+	printf 'art %s\n' "$_f" > "$_bp/out/$_f"
+done
+printf '\tim=\\r\\nExampleBSD (%%h) (%%t)\\r\\n\\r\\n:\n' | sed 's/^\t/\t:/' > "$_bp/out/console/gettytab.fragment"
+# the pack's xfdesktop defaults: backdrops for the monitors named monitor0
+# and monitorVirtual-1 only
+cat > "$_bp/out/xfce/xfconf/xfce4-desktop.xml" <<'XFD'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitor0" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="last-image" type="string" value="/usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png"/>
+          <property name="image-style" type="uint" value="5"/>
+        </property>
+      </property>
+      <property name="monitorVirtual-1" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="last-image" type="string" value="/usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png"/>
+          <property name="image-style" type="uint" value="5"/>
+        </property>
+      </property>
+    </property>
+  </property>
+</channel>
+XFD
+printf 'ExampleBSD art motd\n' > "$_bp/out/console/motd.template"
+# the identity scripts of the pack: identity-file.sh prints its arguments as
+# the file; identity-stamp.sh copies the image and logs that it stamped it
+cat > "$_bp/scripts/identity-file.sh" <<'IDF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+	case $1 in
+	--product) P=$2 ;; --version) V=$2 ;; --base) B=$2 ;; --variant) VA=$2 ;; --arch) A=$2 ;; --build) BU=$2 ;;
+	esac
+	shift 2
+done
+printf 'PRODUCT=%s\nVERSION=%s\nBASE=%s\nVARIANT=%s\nARCH=%s\nBUILD=%s\n' "$P" "$V" "$B" "$VA" "$A" "${BU:-}"
+IDF
+cat > "$_bp/scripts/identity-stamp.sh" <<'IDS'
+#!/bin/sh
+while [ $# -gt 3 ]; do shift; done
+grep -q '^PRODUCT=' "$1" || exit 1
+{ cat "$2"; printf 'stamped with %s\n' "$(tr '\n' ' ' < "$1")"; } > "$3"
+IDS
+printf '#!/bin/sh\necho 16.0-CURRENT\n' > "$_b/stage/bin/freebsd-version"
+printf 'default:\\\n\t:cb:ce:ck:lc:fd#1000:im=\\r\\n%%s/%%m (%%h) (%%t)\\r\\n\\r\\n:sp#1200:\\\n\t:if=/etc/issue:\n\nstd.9600:\\\n\t:im=other:\n' > "$_b/stage/etc/gettytab"
+: > "$_b/stage/usr/local/share/fonts/dejavu/DejaVuSans.ttf"
+{
+	for _fn in rmrf artwork_pinned_sha sha256_of fetch_artwork spots_freebsd stamp_identity brand_identity brand_spot brand_stage; do
+		awk "/^$_fn\\(\\) \\{/,/^\\}/" "$repo/build.sh"
+	done
+} > "$_b/f.sh"
+_brun() { # _brun <name> <profile> — brand_stage on the fake stage
+	(
+		die() { echo "die: $*" >&2; exit 1; }
+		ART=$_bp OUT="$_b" DISTRO_SLUG=examplebsd DISTRO_NAME=ExampleBSD DISTRO_ARCH=amd64
+		ARTWORK_VARIANT=default PRODUCT_VERSION=${BRAND_VERSION:-} MOTD='Welcome to ExampleBSD' PKG_ABI=x
+		. "$_b/f.sh"
+		brand_stage "$_b/stage" "$2"
+	) > "$_b/$1.log" 2>&1
+	_brc=$?
+}
+BRAND_VERSION=1.0 _brun desk desktop
+if [ "$_brc" -eq 0 ]; then
+	ok "branding: every spot of the pinned spots.tsv supported on FreeBSD is installed (desktop)"
+else
+	no "branding: every spot of the pinned spots.tsv supported on FreeBSD is installed (desktop) (rc=$_brc)"
+	sed 's/^/      | /' "$_b/desk.log" | head -5
+fi
+_bs="$_b/stage"
+_bmiss=''
+for _f in boot/lua/gfx-examplebsd.lua boot/images/examplebsd-brand.png boot/images/examplebsd-logo.png \
+	boot/images/examplebsd-splash.png boot/loader.conf.d/examplebsd-brand.conf etc/issue \
+	usr/local/share/examplebsd/lightdm/greeter-1920x1080.png usr/local/etc/lightdm/lightdm-gtk-greeter.conf \
+	usr/local/share/themes/examplebsd-greeter/gtk-3.0/gtk.css usr/local/share/examplebsd/dm/pixmaps/examplebsd-color.xpm \
+	usr/local/etc/X11/xdm/Xresources usr/local/share/examplebsd/installer/header.png \
+	usr/local/share/examplebsd/installer/sidebar.png usr/local/share/examplebsd/xfce/gtk-colors.css \
+	usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png \
+	usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml \
+	usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml \
+	usr/local/share/themes/ExampleBSD/xfwm4/themerc usr/local/share/icons/hicolor/48x48/apps/examplebsd-logo.png \
+	usr/local/share/examplebsd/identity; do
+	[ -f "$_bs/$_f" ] || _bmiss="$_bmiss $_f"
+done
+if [ -z "$_bmiss" ]; then
+	ok "branding: the loader, splash, console, greeter, installer, wallpaper, icon and Xfce files are in the stage"
+else
+	no "branding: the loader, splash, console, greeter, installer, wallpaper, icon and Xfce files are in the stage; missing:$_bmiss"
+fi
+if grep -qx 'PRODUCT=ExampleBSD' "$_bs/usr/local/share/examplebsd/identity" 2> /dev/null &&
+	grep -qx 'VERSION=1.0' "$_bs/usr/local/share/examplebsd/identity" &&
+	grep -qx 'BASE=FreeBSD 16.0-CURRENT' "$_bs/usr/local/share/examplebsd/identity" &&
+	grep -qx 'VARIANT=Default' "$_bs/usr/local/share/examplebsd/identity" &&
+	grep -qx 'ARCH=amd64' "$_bs/usr/local/share/examplebsd/identity" && grep -qx 'BUILD=' "$_bs/usr/local/share/examplebsd/identity"; then
+	ok "branding: the identity file matches product.conf, BASE from the built system's freebsd-version"
+else
+	no "branding: the identity file matches product.conf, BASE from the built system's freebsd-version"
+fi
+if grep -q '^stamped with PRODUCT=ExampleBSD' "$_bs/usr/local/share/examplebsd/lightdm/greeter-1920x1080.png" 2> /dev/null &&
+	grep -q '^stamped with' "$_bs/usr/local/share/examplebsd/wallpapers/wallpaper-1-3840x2160.png" 2> /dev/null; then
+	ok "branding: the identity line is stamped on the greeter background and every wallpaper"
+else
+	no "branding: the identity line is stamped on the greeter background and every wallpaper"
+fi
+# xfdesktop 4.20 keys the backdrop by the output's name: the scfb and vesa
+# drivers call theirs "default", which the pack does not list
+_xd="$_bs/usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+if [ -f "$_xd" ] && grep -q '<property name="monitordefault" type="empty">' "$_xd" &&
+	grep -q '<property name="monitor0" type="empty">' "$_xd" &&
+	[ "$(grep -c 'last-image" type="string" value="/usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png"' "$_xd")" -eq 3 ] &&
+	{ ! command -v python3 > /dev/null 2>&1 || python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' "$_xd"; }; then
+	ok "branding: the desktop backdrop also names the monitor \"default\" (scfb, vesa), the pack's monitors kept"
+else
+	no "branding: the desktop backdrop also names the monitor \"default\" (scfb, vesa), the pack's monitors kept"
+	sed 's/^/      | /' "$_xd" 2> /dev/null | head -30
+fi
+if grep -q 'im=\\r\\nExampleBSD (%h) (%t)' "$_bs/etc/gettytab" && grep -q ':im=other:' "$_bs/etc/gettytab" &&
+	grep -qx 'Welcome to ExampleBSD' "$_bs/etc/motd.template"; then
+	ok "branding: the default getty banner and the motd are the product's (other gettytab entries untouched)"
+else
+	no "branding: the default getty banner and the motd are the product's (other gettytab entries untouched)"
+fi
+BRAND_VERSION='' _brun noversion appliance
+if [ "$_brc" -eq 0 ] && grep -q '^VERSION=20[0-9][0-9]\.[01][0-9]$' "$_bs/usr/local/share/examplebsd/identity" &&
+	grep -q '^BUILD=20[0-9][0-9]-' "$_bs/usr/local/share/examplebsd/identity"; then
+	ok "branding: without PRODUCT_VERSION the version is the build's year.month and the build date is set"
+else
+	no "branding: without PRODUCT_VERSION the version is the build's year.month and the build date is set"
+fi
+printf 'brand-new-spot\tx\tx\t/usr/local/x\tn/a\tn/a\tn/a\tn/a\tx\tx\tx\tx\n' >> "$_bp/branding/spots.tsv"
+_brun newspot desktop
+if [ "$_brc" -ne 0 ] && grep -q 'brand-new-spot supported on FreeBSD and this template does not install it' "$_b/newspot.log"; then
+	ok "branding: a spot the artwork supports on FreeBSD and the template does not install fails the build"
+else
+	no "branding: a spot the artwork supports on FreeBSD and the template does not install fails the build (rc=$_brc)"
+fi
+cp "$repo/tests/fixtures/artwork/spots.tsv" "$_bp/branding/spots.tsv"
+sed -i.bak '1s/\tfreebsd\t/\tfbsd\t/' "$_bp/branding/spots.tsv"
+_brun nocol desktop
+if [ "$_brc" -ne 0 ] && grep -q 'a column is missing' "$_b/nocol.log"; then
+	ok "branding: spots.tsv is read by column name; a missing column fails the build"
+else
+	no "branding: spots.tsv is read by column name; a missing column fails the build (rc=$_brc)"
+fi
+# the pack is refused when its sha256 is not the pinned one
+printf 'not the pack\n' > "$_b/fake.tar.xz"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	OUT="$_b/fo" DISTRO_SLUG=examplebsd ARTWORK_REF=353ef29aa000eda6c1f274774170a7a691768490
+	ARTWORK_VARIANT=default ARTWORK_PACK="$_b/fake.tar.xz" ARTWORK_SHA256='' ARTWORK_URL=x
+	mkdir -p "$OUT"
+	. "$_b/f.sh"
+	fetch_artwork
+) > "$_b/sha.log" 2>&1
+_brc=$?
+if [ "$_brc" -ne 0 ] && grep -q 'not the pinned 10f2507cd0bb325534157f073d79bc08da6a5e1ded34686ebe683a75a0a1d3e4: refusing it' "$_b/sha.log"; then
+	ok "branding: an artwork pack whose sha256 is not the pinned one is refused"
+else
+	no "branding: an artwork pack whose sha256 is not the pinned one is refused (rc=$_brc)"
+fi
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

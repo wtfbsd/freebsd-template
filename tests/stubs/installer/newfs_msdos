@@ -1,0 +1,9 @@
+#!/bin/sh
+# newfs_msdos — test stub for newfs_msdos(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG and changes nothing.
+
+printf 'newfs_msdos %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+exit 0

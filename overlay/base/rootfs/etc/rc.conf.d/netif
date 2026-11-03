@@ -1,0 +1,8 @@
+# rc.conf.d/netif — base rc.conf.d fragment, named after the service.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Every interface asks for an address by DHCP (in the background: the boot
+# does not wait). The installer replaces this file when the user named
+# adapters (rc.d/firstboot_user, NETWORK= lines).
+ifconfig_DEFAULT="DHCP"

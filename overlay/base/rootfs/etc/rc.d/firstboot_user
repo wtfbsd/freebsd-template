@@ -20,6 +20,37 @@
 #   SSH_KEY=ssh-...       one authorized_keys line, repeatable
 #   PASSWORD_HASH=$6$...  crypt(3) starting with $6$ or $2b$ (optional)
 #   WHEEL=yes|no          default yes
+#   HOSTNAME=host.example RFC 1123 host name                 (optional)
+#   TIMEZONE=Europe/Paris a file under /usr/share/zoneinfo   (optional)
+#   KEYMAP=fr             a vt(4) keymap of /usr/share/vt/keymaps (optional)
+#   DOAS_NOPASS=yes|no    the wheel user runs doas without a password (default no)
+#   NETWORK=vtnet0:dhcp   DHCP on an interface, repeatable (optional)
+#   NETWORK=vtnet0:192.0.2.10/24:192.0.2.1
+#                         a static IPv4 address, the gateway may be left out
+#
+#   NETWORK6=vtnet0:slaac IPv6 autoconfiguration, repeatable (optional)
+#   NETWORK6=IF:ADDR6/LEN:GW6  a static IPv6 address (e.g. 2001:db8::10,
+#                         prefix length 64, gateway 2001:db8::1); the gateway
+#                         may be left out
+#   DNS=192.0.2.53        a resolver, repeatable (optional)
+#   WIFI_IF=iwm0          the Wi-Fi adapter: wlan0 on it with WPA + DHCP
+#                         (the installer wrote /etc/wpa_supplicant.conf)
+#   LOCALE=fr_FR.UTF-8    the language of the default login class (optional)
+#   CLOCK=utc|local       the hardware clock (/etc/wall_cmos_clock for local)
+#   ROOT_HASH=$6$...      root's own password; without it root stays locked
+#   AUTOLOGIN=yes         LightDM logs the user in (default: the greeter)
+#   UPDATE=yes            pkg upgrade once the network is up (kmods locked)
+#
+# NETWORK, NETWORK6 and WIFI_IF lines replace /etc/rc.conf.d/netif (whose
+# default in the image is DHCP on every interface); a gateway goes to
+# /etc/rc.conf.d/routing. Both are applied at once (netif and routing are
+# restarted). Without them the network stays as the image has it.
+#
+# HOSTNAME goes to /etc/rc.conf.d/hostname and is set at once; TIMEZONE
+# becomes /etc/localtime and /var/db/zoneinfo (what tzsetup(8) writes);
+# KEYMAP goes to /etc/rc.conf.d/syscons (rc.d/syscons runs after this
+# script, so it applies on the same boot) and the X keyboard layout of
+# its first part goes to xorg.conf.d/00-keyboard.conf (uk becomes gb).
 #
 # With a PASSWORD_HASH the hash is fed to pw(8) over stdin; without one
 # the password stays '*' (the pw useradd default) so SSH key login works.
@@ -43,6 +74,9 @@ rcvar=firstboot_user_enable
 
 : ${firstboot_user_enable:="YES"}
 : ${firstboot_user_conf:="/boot/firstboot-user.conf"}
+# the root the settings are written under (the test suite points it at a
+# directory of its own; the system itself uses "")
+: ${firstboot_user_root:=""}
 load_rc_config "$name"
 
 note() { # note <msg> — to the console and to syslog
@@ -51,8 +85,9 @@ note() { # note <msg> — to the console and to syslog
 }
 
 root_writable() { # root_writable — is the root filesystem writable?
-	# the live image is mounted read-only: access(2) answers EROFS
-	[ -w /etc ]
+	# the live image is mounted read-only: access(2) answers EROFS. The
+	# root itself is asked, not /etc: the live ISO's /etc is a memory disk
+	[ -w / ]
 }
 
 # fbu_owned_by <path> <uid>... — is <path> itself (a symbolic link is not
@@ -218,6 +253,9 @@ fbu_install_keys() {
 firstboot_user_start() {
 	local _conf="$firstboot_user_conf"
 	local _k _l _v _user _full _keys _nkeys _hash _wheel _home _n
+	local _host _tz _kmap _r _xl _nopass _nets _ni _nv _na _ng _gw
+	local _nets6 _dns _wifi _locale _clock _rhash _autologin _update _n6 _g6
+	_r=$firstboot_user_root
 	if ! root_writable; then
 		echo 'firstboot_user: read-only root (live media), skipped'
 		return 0
@@ -239,6 +277,19 @@ firstboot_user_start() {
 	_nkeys=0
 	_hash=''
 	_wheel='yes'
+	_host=''
+	_tz=''
+	_kmap=''
+	_nopass=no
+	_nets=''
+	_nets6=''
+	_dns=''
+	_wifi=''
+	_locale=''
+	_clock=''
+	_rhash=''
+	_autologin=no
+	_update=no
 	while IFS= read -r _l || [ -n "$_l" ]; do
 		case $_l in
 		'' | '#'*) continue ;;
@@ -303,6 +354,108 @@ $_v"
 			esac
 			_wheel=$_v
 			;;
+		HOSTNAME)
+			if [ "$(printf %s "$_v" | wc -c)" -gt 253 ] || ! printf '%s\n' "$_v" \
+				| grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'; then
+				note 'HOSTNAME must be an RFC 1123 host name'
+				return 1
+			fi
+			_host=$_v
+			;;
+		TIMEZONE)
+			case $_v in
+			*..* | /* | */ | *//*)
+				note "TIMEZONE is not a zoneinfo name: $_v"
+				return 1
+				;;
+			esac
+			if ! printf '%s\n' "$_v" | grep -Eq '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$' \
+				|| [ ! -f "$_r/usr/share/zoneinfo/$_v" ]; then
+				note "TIMEZONE is not a zoneinfo name: $_v"
+				return 1
+			fi
+			_tz=$_v
+			;;
+		KEYMAP)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' \
+				|| [ ! -f "$_r/usr/share/vt/keymaps/${_v%.kbd}.kbd" ]; then
+				note "KEYMAP is not a vt(4) keymap: $_v"
+				return 1
+			fi
+			_kmap=${_v%.kbd}
+			;;
+		DOAS_NOPASS)
+			case $_v in
+			yes | no) _nopass=$_v ;;
+			*)
+				note "DOAS_NOPASS must be yes or no (got: $_v)"
+				return 1
+				;;
+			esac
+			;;
+		NETWORK)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[a-z][a-z0-9]{0,14}[0-9]:(dhcp|[0-9]{1,3}(\.[0-9]{1,3}){3}/([0-9]{1,2}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:([0-9]{1,3}(\.[0-9]{1,3}){3})?)?)$'; then
+				note "NETWORK must be IF:dhcp or IF:ADDR/MASK[:GW] (got: $_v)"
+				return 1
+			fi
+			_nets="$_nets $_v"
+			;;
+		NETWORK6)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[a-z][a-z0-9]{0,14}:(slaac|[0-9A-Fa-f:]{2,39}/[0-9]{1,3}(:([0-9A-Fa-f:]{2,39})?)?)$'; then
+				note "NETWORK6 must be IF:slaac or IF:ADDR6/LEN[:GW6] (got: $_v)"
+				return 1
+			fi
+			_nets6="$_nets6 $_v"
+			;;
+		DNS)
+			if ! printf '%s\n' "$_v" | grep -Eq '^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9A-Fa-f:]{2,39}(%[a-z][a-z0-9]{0,14})?)$'; then
+				note "DNS must be an IPv4 or IPv6 address (got: $_v)"
+				return 1
+			fi
+			_dns="$_dns $_v"
+			;;
+		WIFI_IF)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[a-z][a-z0-9]{0,14}$'; then
+				note "WIFI_IF must be an interface name (got: $_v)"
+				return 1
+			fi
+			_wifi=$_v
+			;;
+		LOCALE)
+			if ! printf '%s\n' "$_v" | grep -Eq '^[a-z]{2,3}_[A-Z]{2}\.UTF-8$' || [ ! -d "$_r/usr/share/locale/$_v" ]; then
+				note "LOCALE is not a locale of /usr/share/locale: $_v"
+				return 1
+			fi
+			_locale=$_v
+			;;
+		CLOCK)
+			case $_v in
+			utc | local) _clock=$_v ;;
+			*)
+				note "CLOCK must be utc or local (got: $_v)"
+				return 1
+				;;
+			esac
+			;;
+		ROOT_HASH)
+			case $_v in
+			'$6$'* | '$2b$'*) _rhash=$_v ;;
+			*)
+				note 'ROOT_HASH must be a crypt(3) string starting with $6$ or $2b$'
+				return 1
+				;;
+			esac
+			;;
+		AUTOLOGIN | UPDATE)
+			case $_v in
+			yes | no) ;;
+			*)
+				note "$_k must be yes or no (got: $_v)"
+				return 1
+				;;
+			esac
+			if [ "$_k" = AUTOLOGIN ]; then _autologin=$_v; else _update=$_v; fi
+			;;
 		*)
 			note "unknown key in $_conf: $_k"
 			return 1
@@ -319,7 +472,143 @@ $_v"
 		return 1
 	fi
 
-	# pass 2: apply
+	# pass 2: apply. The settings of the machine come first: they do not
+	# depend on the account.
+	if [ -n "$_host" ]; then
+		if printf '# written by firstboot_user from the installer\nhostname="%s"\n' "$_host" \
+			> "$_r/etc/rc.conf.d/hostname"; then
+			[ -n "$_r" ] || hostname "$_host"
+			note "host name set to $_host"
+		else
+			note "cannot write $_r/etc/rc.conf.d/hostname"
+			return 1
+		fi
+	fi
+	if [ -n "$_tz" ]; then
+		if cp "$_r/usr/share/zoneinfo/$_tz" "$_r/etc/localtime" \
+			&& mkdir -p "$_r/var/db" && printf '%s\n' "$_tz" > "$_r/var/db/zoneinfo"; then
+			note "time zone set to $_tz"
+		else
+			note "cannot set the time zone $_tz"
+			return 1
+		fi
+	fi
+	if [ -n "$_kmap" ]; then
+		# the X layout is the first part of the vt name; vt calls the
+		# British layout uk, X calls it gb
+		_xl=${_kmap%%.*}
+		case $_xl in uk) _xl=gb ;; esac
+		if printf '# written by firstboot_user from the installer\nkeymap="%s"\n' "$_kmap" \
+			> "$_r/etc/rc.conf.d/syscons" \
+			&& mkdir -p "$_r/usr/local/etc/X11/xorg.conf.d" \
+			&& printf 'Section "InputClass"\n\tIdentifier "keyboard"\n\tMatchIsKeyboard "on"\n\tOption "XkbLayout" "%s"\nEndSection\n' "$_xl" \
+			> "$_r/usr/local/etc/X11/xorg.conf.d/00-keyboard.conf"; then
+			note "keymap set to $_kmap (X layout $_xl)"
+		else
+			note "cannot set the keymap $_kmap"
+			return 1
+		fi
+	fi
+
+	# the network: the image's DHCP on every interface, unless the
+	# installer named adapters
+	_gw=''
+	_g6=''
+	if [ -n "$_nets$_nets6$_wifi" ]; then
+	{
+		echo '# written by firstboot_user from the installer'
+		[ -n "$_nets" ] || [ -n "$_wifi" ] || echo 'ifconfig_DEFAULT="DHCP"'
+		for _ni in $_nets; do
+			_nv=${_ni#*:}
+			_ni=${_ni%%:*}
+			if [ "$_nv" = dhcp ]; then
+				printf 'ifconfig_%s="DHCP"\n' "$_ni"
+			else
+				_na=${_nv%%:*}
+				_ng=''
+				[ "$_na" = "$_nv" ] || _ng=${_nv#*:}
+				case ${_na#*/} in
+				*.*) printf 'ifconfig_%s="inet %s netmask %s"\n' "$_ni" "${_na%%/*}" "${_na#*/}" ;;
+				*) printf 'ifconfig_%s="inet %s"\n' "$_ni" "$_na" ;;
+				esac
+				[ -z "$_ng" ] || [ -n "$_gw" ] || _gw=$_ng
+			fi
+		done
+		for _ni in $_nets6; do
+			_nv=${_ni#*:}
+			_ni=${_ni%%:*}
+			if [ "$_nv" = slaac ]; then
+				printf 'ifconfig_%s_ipv6="inet6 accept_rtadv"\n' "$_ni"
+			else
+				# ADDR6/LEN[:GW6]: the gateway follows the first ":" after "/"
+				_na=${_nv%%/*}
+				_nl=${_nv#*/}
+				_ng=''
+				case $_nl in *:*) _ng=${_nl#*:}; _nl=${_nl%%:*} ;; esac
+				printf 'ifconfig_%s_ipv6="inet6 %s prefixlen %s"\n' "$_ni" "$_na" "$_nl"
+				[ -z "$_ng" ] || [ -n "$_g6" ] || _g6=$_ng
+			fi
+		done
+		if [ -n "$_wifi" ]; then
+			printf 'wlans_%s="wlan0"\nifconfig_wlan0="WPA DHCP"\n' "$_wifi"
+		fi
+	} > "$_r/etc/rc.conf.d/netif" || { note "cannot write $_r/etc/rc.conf.d/netif"; return 1; }
+	if [ -n "$_gw" ] || [ -n "$_g6" ]; then
+		{
+			echo '# written by firstboot_user from the installer'
+			[ -z "$_gw" ] || printf 'defaultrouter="%s"\n' "$_gw"
+			[ -z "$_g6" ] || printf 'ipv6_defaultrouter="%s"\n' "$_g6"
+		} > "$_r/etc/rc.conf.d/routing" || { note "cannot write $_r/etc/rc.conf.d/routing"; return 1; }
+	fi
+	case $_nets6 in *slaac*) printf 'rtsold_enable="YES"\n' > "$_r/etc/rc.conf.d/rtsold" ;; esac
+	fi
+	if [ -n "$_dns" ]; then
+		printf '# written by firstboot_user from the installer\nname_servers="%s"\n' "${_dns# }" \
+			> "$_r/etc/resolvconf.conf" || { note 'cannot write resolvconf.conf'; return 1; }
+		for _ni in $_dns; do printf 'nameserver %s\n' "$_ni"; done > "$_r/etc/resolv.conf"
+	fi
+	if [ -n "$_nets$_nets6$_wifi$_dns" ]; then
+		note "network: ${_nets:- DHCP}${_nets6:+ IPv6:$_nets6}${_wifi:+ Wi-Fi on $_wifi}${_dns:+ DNS:$_dns}"
+		if [ -z "$_r" ]; then
+			/etc/rc.d/netif restart > /dev/null 2>&1 || note 'netif restart failed'
+			/etc/rc.d/routing restart > /dev/null 2>&1 || :
+		fi
+	fi
+
+	# the language, the clock, root, the autologin
+	if [ -n "$_locale" ] && [ -f "$_r/etc/login.conf" ]; then
+		# the lang of the default class (its block ends at the first line
+		# that does not end in a backslash)
+		awk -v l="$_locale" 'BEGIN { d = 0 }
+			/^default:/ { d = 1 }
+			d && /:lang=[^:]*:/ { sub(/:lang=[^:]*:/, ":lang=" l ":"); done = 1 }
+			d && !/\\$/ { if (!done) { sub(/:$/, ":lang=" l ":") ; done = 1 } d = 0 }
+			{ print }' "$_r/etc/login.conf" > "$_r/etc/login.conf.new" \
+			&& cat "$_r/etc/login.conf.new" > "$_r/etc/login.conf" && rm -f "$_r/etc/login.conf.new" \
+			|| { note 'cannot set the locale in login.conf'; return 1; }
+		[ -n "$_r" ] || cap_mkdb /etc/login.conf || note 'cap_mkdb /etc/login.conf failed'
+		note "locale set to $_locale"
+	fi
+	case $_clock in
+	local) : > "$_r/etc/wall_cmos_clock" && note 'hardware clock: local time' ;;
+	utc) rm -f "$_r/etc/wall_cmos_clock" && note 'hardware clock: UTC' ;;
+	esac
+	if [ -n "$_rhash" ]; then
+		if printf '%s\n' "$_rhash" | pw usermod -n root -H 0; then
+			note 'root has its own password'
+		else
+			note 'pw usermod -H 0 failed for root'
+			return 1
+		fi
+	fi
+	if [ "$_autologin" = yes ] && [ -d "$_r/usr/local/etc/lightdm/lightdm.conf.d" ]; then
+		printf '# written by firstboot_user from the installer\n[Seat:*]\nautologin-user=%s\nautologin-user-timeout=0\n' "$_user" \
+			> "$_r/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" \
+			|| { note 'cannot write the LightDM autologin'; return 1; }
+		note "LightDM logs $_user in automatically"
+	fi
+
+	# the account
 	if ! pw usershow -n "$_user" > /dev/null 2>&1; then
 		set -- -n "$_user" -c "${_full:-$_user}" -s /bin/sh -m
 		if [ "$_wheel" = yes ]; then
@@ -350,11 +639,12 @@ $_v"
 
 	# /etc/passwd is 7 fields: the home directory is field 6
 	# (the FULLNAME value is validated to never contain ':', so -F: is safe)
-	_home=$(u="$_user" awk -F: '$1 == ENVIRON["u"] { print $6 }' /etc/passwd)
+	_home=$(u="$_user" awk -F: '$1 == ENVIRON["u"] { print $6 }' "$_r/etc/passwd")
 	case $_home in
 	/*) ;;
 	*) _home="/home/$_user" ;;
 	esac
+	_home=$_r$_home
 	if ! fbu_install_keys "$_user" "$_home" "${_keys#?}"; then
 		return 1
 	fi
@@ -362,9 +652,27 @@ $_v"
 
 	# key-only wheel user (no password to type): let doas accept the
 	# SSH-authenticated session, otherwise the account could never get root
-	if [ "$_wheel" = yes ] && [ -z "$_hash" ] && [ -f /usr/local/etc/doas.conf ]; then
-		printf 'permit nopass %s\n' "$_user" >> /usr/local/etc/doas.conf
+	if [ "$_wheel" = yes ] && [ "$_nopass" = yes ] && [ -n "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
+		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf"
+		note "doas: $_user may run commands as root without a password (DOAS_NOPASS=yes)"
+	fi
+	if [ "$_wheel" = yes ] && [ -z "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
+		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf"
 		note "doas: key-only wheel user $_user may run commands as root without a password"
+	fi
+
+	# the package update: once, in the background, when the network is up;
+	# every package that owns a kernel module stays as it is (pkg lock), a
+	# module must match the kernel it was built for
+	if [ "$_update" = yes ] && [ -z "$_r" ]; then
+		(
+			sleep 30
+			for _n in $(pkg query -a '%n %Fp' | awk '$2 ~ /\.ko$/ { print $1 }' | sort -u); do
+				pkg lock -y "$_n" > /dev/null 2>&1
+			done
+			pkg update && pkg upgrade -y
+		) 2>&1 | logger -t firstboot_user-update &
+		note 'the packages are updated in the background (kernel modules locked)'
 	fi
 
 	if mv "$_conf" "$_conf.done" && chmod 600 "$_conf.done"; then

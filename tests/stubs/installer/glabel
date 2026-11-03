@@ -1,0 +1,18 @@
+#!/bin/sh
+# glabel — test stub for glabel(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. `glabel status -s` prints the table
+# in $STUB_GLABEL ("name state component" lines), empty without it.
+
+printf 'glabel %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+case "$*" in
+'status -s')
+	if [ -n "${STUB_GLABEL:-}" ]; then
+		printf '%s\n' "$STUB_GLABEL"
+	fi
+	;;
+esac
+exit 0

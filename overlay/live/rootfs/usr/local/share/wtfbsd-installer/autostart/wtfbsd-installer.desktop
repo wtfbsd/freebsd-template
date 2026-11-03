@@ -1,0 +1,11 @@
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+# The stand-in start of the live session: the installer opens first
+# (rc.d/live_session copies it into ~/.config/autostart of the live user;
+# the installer-template's install-into-stage.sh replaces it).
+[Desktop Entry]
+Type=Application
+Name=@DISTRO_NAME@ Installer
+Exec=/usr/local/bin/wtfbsd-installer
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

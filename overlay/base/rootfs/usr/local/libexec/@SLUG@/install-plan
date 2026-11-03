@@ -1,0 +1,202 @@
+#!/usr/local/bin/python3 -I
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+"""install-plan — check a disk plan (version 1) for @SLUG@-install.
+
+    install-plan PLANFILE IMAGEFS
+
+The plan is the JSON file the graphical installer writes (the contract of
+the installer-template).  The root helper checked it already; the install
+command checks it again before it writes anything.  The whole schema is
+checked; then the part this release installs, mode erase:
+
+    PATH=image  one disk, layout single, the file system of the image
+                (IMAGEFS), no encryption, no data pools: the image is
+                written to the disk (dd) and grown
+    PATH=copy   ZFS on one or more disks (single, stripe, mirror, raid10,
+                raidz1-3), optionally GELI-encrypted, data pools, "usage":
+                "separate": the disks are partitioned, the pools made and
+                the system copied
+
+Both take swap (encrypted with a one-time key when encryption.swap is set).
+On success it prints shell-safe KEY=value lines (PATH, DISK, DISKS, LAYOUT,
+ENC, BOOT, SWAP_MB, SWAP_ENC, TRIM, SECTOR4K and one DATA line per data
+pool: name|layout|mount|disk,disk) and exits 0.  On failure it prints one line, the reason,
+on stderr and exits 2 (bad plan) or 3 (a plan this release cannot
+install yet).
+"""
+import json
+import os
+import re
+import stat
+import sys
+
+KEYS = {"version", "mode", "boot", "disks", "layout", "filesystem", "encryption",
+        "swap_mb", "sector_4k", "trim", "wipe", "confirm_foreign", "alongside",
+        "partitions", "data", "usage"}
+LAYOUTS = {"single": 1, "stripe": 2, "mirror": 2, "raid10": 4, "raidz1": 3,
+           "raidz2": 4, "raidz3": 5}
+DISK = re.compile(r"^[a-z]+[0-9]+$")
+POOLNAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+MOUNT = re.compile(r"^/[A-Za-z0-9._/-]*$")
+
+
+def check_layout(layout, n, fs):
+    if layout not in LAYOUTS:
+        raise Bad("unknown layout: %s" % layout)
+    if n < LAYOUTS[layout] or (layout == "raid10" and n % 2):
+        raise Bad("layout %s does not fit %d disks" % (layout, n))
+    if layout == "single" and n != 1:
+        raise Bad("layout single takes one disk")
+    if fs not in ("zfs", "ufs"):
+        raise Bad("filesystem must be zfs or ufs")
+    if fs == "ufs" and layout != "single":
+        raise Bad("ufs takes layout single")
+
+
+class Bad(Exception):
+    pass
+
+
+class Unsupported(Exception):
+    pass
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check(plan, imagefs):
+    if not isinstance(plan, dict):
+        raise Bad("the plan is not a JSON object")
+    unknown = sorted(set(plan) - KEYS)
+    if unknown:
+        raise Bad("unknown keys in the plan: " + ", ".join(unknown))
+    if plan.get("version") != 1:
+        raise Bad("the plan is not version 1")
+    mode = plan.get("mode")
+    if mode not in ("erase", "alongside", "manual"):
+        raise Bad("mode must be erase, alongside or manual")
+    if mode != "erase":
+        # the other modes carry no disk list (alongside, partitions instead)
+        raise Unsupported("mode %s is not supported by this release: erase the disks, "
+                          "or install alongside with another installer" % mode)
+    boot = plan.get("boot", "uefi")
+    if boot not in ("uefi", "bios"):
+        raise Bad("boot must be uefi or bios")
+    disks = plan.get("disks")
+    if not isinstance(disks, list) or not disks or \
+            not all(isinstance(d, str) and DISK.match(d) for d in disks):
+        raise Bad("disks must be a list of bare disk names")
+    seen = list(disks)
+    data = plan.get("data") or []
+    if not isinstance(data, list):
+        raise Bad("data must be a list")
+    mounts = set()
+    for d in data:
+        if not isinstance(d, dict) or set(d) - {"name", "disks", "layout", "filesystem", "mount"}:
+            raise Bad("a data entry is not valid")
+        if not isinstance(d.get("disks"), list) or not d["disks"] or \
+                not all(isinstance(x, str) and DISK.match(x) for x in d["disks"]):
+            raise Bad("a data entry needs a list of bare disk names")
+        if not isinstance(d.get("name"), str) or not POOLNAME.match(d["name"]):
+            raise Bad("a data pool name must match ^[a-z][a-z0-9_-]{0,31}$")
+        m = d.get("mount")
+        if not isinstance(m, str) or not MOUNT.match(m) or "/../" in m + "/" or "/./" in m + "/" \
+                or m == "/" or m in mounts:
+            raise Bad("a data pool needs an absolute, unique mount point")
+        mounts.add(m)
+        check_layout(d.get("layout", "single"), len(d["disks"]), d.get("filesystem", "zfs"))
+        seen += d["disks"]
+    if len(seen) != len(set(seen)):
+        raise Bad("a disk appears twice in the plan")
+    layout = plan.get("layout", "single")
+    fs = plan.get("filesystem", imagefs)
+    check_layout(layout, len(disks), fs)
+    enc = plan.get("encryption", {}) or {}
+    if not isinstance(enc, dict) or set(enc) - {"enabled", "swap"}:
+        raise Bad("encryption must be {enabled, swap}")
+    swap = plan.get("swap_mb", 0)
+    if not is_int(swap) or swap < 0 or swap > 1048576:
+        raise Bad("swap_mb must be 0..1048576")
+    if enc.get("swap") and swap == 0:
+        raise Bad("encryption.swap needs swap_mb > 0")
+    for k in ("sector_4k", "trim"):
+        if k in plan and not isinstance(plan[k], bool):
+            raise Bad("%s must be true or false" % k)
+    wipe = plan.get("wipe", {}) or {}
+    if not isinstance(wipe, dict) or any(v not in ("quick", "secure") for v in wipe.values()):
+        raise Bad("wipe must map disks to quick or secure")
+
+    usage = plan.get("usage")
+    if usage not in (None, "together", "separate"):
+        raise Bad("usage must be together or separate")
+    if usage == "separate":
+        if len(disks) != 1 or layout != "single" or \
+                any(len(d["disks"]) != 1 or d.get("layout", "single") != "single" for d in data):
+            raise Bad("usage separate takes one system disk and single-disk data pools")
+    for d in plan.get("confirm_foreign", []) or []:
+        if not isinstance(d, str) or d not in seen:
+            raise Bad("confirm_foreign names a disk that is not in the plan")
+
+    # what this release installs
+    if mode != "erase":
+        raise Unsupported("mode %s is not supported by this release: erase the disks, "
+                          "or install alongside with another installer" % mode)
+    if "secure" in wipe.values():
+        raise Unsupported("a secure wipe is not supported by this release (quick only)")
+    single = layout == "single" and not enc.get("enabled") and not data and fs == imagefs
+    if not single:
+        if fs != "zfs" or any(d.get("filesystem", "zfs") != "zfs" for d in data):
+            raise Unsupported("this release installs ufs on a single unencrypted disk only")
+    out = {"PATH": "image" if single else "copy", "DISK": disks[0], "DISKS": ",".join(disks),
+           "LAYOUT": layout, "ENC": "yes" if enc.get("enabled") else "no", "BOOT": boot,
+           "SWAP_MB": str(swap), "SWAP_ENC": "yes" if enc.get("swap") else "no",
+           "TRIM": "yes" if plan.get("trim", True) else "no",
+           "SECTOR4K": "yes" if plan.get("sector_4k", True) else "no"}
+    lines = list(out.items())
+    for d in data:
+        lines.append(("DATA", "%s|%s|%s|%s" % (d["name"], d.get("layout", "single"), d["mount"], ",".join(d["disks"]))))
+    return lines
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("zfs", "ufs"):
+        print("usage: install-plan PLANFILE zfs|ufs", file=sys.stderr)
+        return 2
+    path = argv[0]
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        print("cannot open the plan: %s" % e.strerror, file=sys.stderr)
+        return 2
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            print("the plan is not a regular file", file=sys.stderr)
+            return 2
+        if st.st_mode & 0o077:
+            print("the plan must be mode 0600", file=sys.stderr)
+            return 2
+        data = f.read(65537)
+    if len(data) > 65536:
+        print("the plan is larger than 64 KiB", file=sys.stderr)
+        return 2
+    try:
+        plan = json.loads(data.decode("utf-8"))
+        out = check(plan, argv[1])
+    except (ValueError, UnicodeDecodeError) as e:
+        print("the plan is not valid JSON: %s" % e, file=sys.stderr)
+        return 2
+    except Bad as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except Unsupported as e:
+        print(str(e), file=sys.stderr)
+        return 3
+    for k, v in out:
+        print("%s=%s" % (k, v))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

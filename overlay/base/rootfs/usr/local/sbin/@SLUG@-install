@@ -13,11 +13,25 @@
 # (growfs for UFS, zpool online -e for ZFS), mounts the root under /mnt
 # and writes /boot/firstboot-user.conf (the format parsed by
 # etc/rc.d/firstboot_user) so the first boot of the installed system
-# provisions the user + SSH key.
+# provisions the user, the password, the SSH key, the host name, the time
+# zone and the keymap.
+#
+# Two ways to run it:
+#
+#   interactive   the questions are asked on the terminal (bsddialog for
+#                 the disk); what is given as an option is not asked
+#   --progress    the graphical installer's way: every answer comes as an
+#                 option, nothing is asked (-y is required), and stdout
+#                 carries only "PROGRESS <0-100> <message>" lines and an
+#                 "ERROR <message>" line before a non-zero exit; everything
+#                 else goes to stderr
+#
+# The password reaches the installer as a crypt(3) hash in a file (-H) of
+# mode 0600: the cleartext never touches the disk or the command line.
 #
 # Every destructive step is guarded: the target must be a real disk,
-# must never be the disk holding the running root, and is confirmed
-# interactively unless -y is given.
+# must never be the disk holding the running root (the live media), and is
+# confirmed interactively unless -y is given.
 
 set -u
 
@@ -26,6 +40,24 @@ prog=${0##*/}
 # environment; the defaults are the ones of the live system
 img=${INSTALL_IMG:-/usr/local/share/@SLUG@/install/system.img.xz}
 mnt=${INSTALL_MNT:-/mnt}
+# the time zones and the keymaps of the live system (the same base as the
+# installed one): -z and -K are checked against them when they are there
+zoneinfo=${INSTALL_ZONEINFO:-/usr/share/zoneinfo}
+keymaps=${INSTALL_KEYMAPS:-/usr/share/vt/keymaps}
+# where the disk devices are (a test points it at a directory of its own)
+devdir=${INSTALL_DEVDIR:-/dev}
+# the checker of the disk plan (-p), the catalogue of the licensed software
+# (-l) and the file system of the image (written by build.sh next to it)
+planner=${INSTALL_PLANNER:-/usr/local/libexec/@SLUG@/install-plan}
+catalogue=${INSTALL_CATALOGUE:-/usr/local/share/@SLUG@/licensed-software.json}
+imagefs=$(cat "${img%/*}/system.fs" 2> /dev/null || echo zfs)
+# a copy install copies the system from the root of the live media (a second
+# read-only mount of it, or INSTALL_SRCROOT), leaving out the live layer that
+# build.sh lists next to the image, and the boot code from the source's /boot
+srcroot=${INSTALL_SRCROOT:-}
+# the list of the installer's own files (installer-template's
+# install-into-stage.sh): none of them may stay on the installed system
+manifest=${INSTALL_MANIFEST:-/usr/local/share/wtfbsd-installer/MANIFEST}
 
 # rc(8) starts the installer with no TERM, and bsddialog then draws
 # without cursor movement and reads an arrow key as ESC (cancel): give
@@ -35,24 +67,108 @@ case ${TERM:-} in
 esac
 export TERM
 
+# --progress and --capabilities are the long options; they are taken out of
+# the arguments before getopts sees them
+progress=0
+capabilities=0
+for _a in "$@"; do
+	shift
+	case $_a in
+	--progress) progress=1 ;;
+	--capabilities) capabilities=1 ;;
+	*) set -- "$@" "$_a" ;;
+	esac
+done
+
+# --capabilities: what this command takes in a disk plan, in the shape of
+# the installer's os_layouts (lib/diskplan.py --check-capabilities). It
+# needs no root and touches nothing.
+if [ "$capabilities" -eq 1 ]; then
+	_cimg=${INSTALL_IMG:-/usr/local/share/@SLUG@/install/system.img.xz}
+	_cfs=$(cat "${_cimg%/*}/system.fs" 2> /dev/null || echo zfs)
+	if [ "$_cfs" = ufs ]; then
+		# a UFS image goes to one disk as it is; the ZFS layouts need a
+		# ZFS image to copy from
+		printf '{"modes":["erase"],"data_pools":false,"boot":["uefi","bios"],'
+		printf '"encryption":"none (the image is UFS)","not_offered":"not offered by this release",'
+		printf '"filesystems":[["ufs","UFS"]],'
+		printf '"layouts":[{"ident":"single","title":"Single disk","min_disks":1,"max_disks":1}]}\n'
+	else
+		printf '{"modes":["erase"],"data_pools":true,"boot":["uefi","bios"],'
+		printf '"encryption":"GELI","not_offered":"not offered by this release",'
+		printf '"filesystems":[["zfs","ZFS"]],"layouts":['
+		printf '{"ident":"single","title":"Single disk","min_disks":1,"max_disks":1},'
+		printf '{"ident":"stripe","title":"Stripe","min_disks":2,"note":"all the space, no redundancy"},'
+		printf '{"ident":"mirror","title":"Mirror","min_disks":2},'
+		printf '{"ident":"raid10","title":"RAID 10","min_disks":4,"even":true,"note":"mirrors, striped"},'
+		printf '{"ident":"raidz1","title":"RAID-Z1","min_disks":3},'
+		printf '{"ident":"raidz2","title":"RAID-Z2","min_disks":4},'
+		printf '{"ident":"raidz3","title":"RAID-Z3","min_disks":5}]}\n'
+	fi
+	exit 0
+fi
+
+# in progress mode fd 3 is the caller's stdout (the machine-readable
+# lines) and stdout itself goes to stderr, so that no tool's output can
+# reach the caller as a stray line
+if [ "$progress" -eq 1 ]; then
+	exec 3>&1 1>&2
+fi
+
 warn() { echo "$prog: $*" >&2; }
-die() { warn "$*"; exit 1; }
+die() {
+	warn "$*"
+	if [ "$progress" -eq 1 ]; then
+		printf 'ERROR %s\n' "$*" | tr -d '\r' | head -n 1 >&3
+	fi
+	exit 1
+}
+step() { # step <percent> <message> — a progress line, or a note on stderr
+	if [ "$progress" -eq 1 ]; then
+		printf 'PROGRESS %s %s\n' "$1" "$2" >&3
+	else
+		printf '%s\n' "$2" >&2
+	fi
+}
 
 _rootstty=''
 usage() {
-	echo "usage: $prog [-d disk] [-u user] [-k pubkeyfile] [-p] [-y]"
+	echo "usage: $prog [-d disk | -p planfile] [-u user] [-k pubkeyfile] [-H hashfile]"
+	echo "       [-c fullname] [-P] [-A] [-n hostname] [-z timezone] [-Z utc|local]"
+	echo "       [-K keymap] [-L locale] [-r locked|roothashfile] [-E passphrasefile]"
+	echo "       [-N if:addr/mask:gw | -N if:dhcp ...] [-6 if:slaac | -6 if:addr6/len:gw6 ...]"
+	echo "       [-D dns ...] [-W wififile] [-U] [-l acceptfile] [-y] [--progress]"
 	echo ''
 	echo '  -d disk        target disk, e.g. ada0 (default: pick from a menu)'
-	echo '  -u user        user for the first-boot account (needs -k)'
+	echo '  -u user        user for the first-boot account (needs -k or -H)'
 	echo '  -k pubkeyfile  ssh public keys, one authorized_keys line each'
-	echo '  -p             also prompt for an optional password'
+	echo '  -H hashfile    a mode 0600 file with the crypt(3) hash of the password'
+	echo '  -p planfile    the disk plan (JSON, mode 0600) of the graphical installer'
+	echo '  -c fullname    the full name of the account (default: the user name)'
+	echo '  -P             the user may run doas without a password'
+	echo '  -A             the user is logged in to the desktop without a password'
+	echo '  -Z utc|local   the hardware clock'
+	echo '  -L locale      the system locale, e.g. en_US.UTF-8'
+	echo '  -r locked      root stays locked (default); -r FILE: the hash of its password'
+	echo '  -E file        the passphrase of the disk encryption (mode 0600)'
+	echo '  -6 if:slaac    IPv6 autoconfiguration; -6 if:addr6/len:gw6 a static address'
+	echo '  -D dns         a resolver (repeatable)'
+	echo '  -W file        the Wi-Fi network (JSON, mode 0600)'
+	echo '  -U             update the packages after the first boot'
+	echo '  -l file        the licences the user accepted (JSON, mode 0600)'
+	echo '  -n hostname    host name of the installed system'
+	echo '  -z timezone    time zone, e.g. Europe/Paris (a zoneinfo name)'
+	echo '  -K keymap      console keymap, e.g. fr (a vt(4) keymap name; the X layout follows)'
+	echo '  -N if:addr/mask:gw  a static IPv4 address of an interface (the gateway may be empty)'
+	echo '  -N if:dhcp     DHCP on an interface; without -N every wired interface uses DHCP'
 	echo '  -y             proceed without typing yes'
+	echo '  --progress     no questions; PROGRESS/ERROR lines on stdout (needs -y)'
 	echo ''
 	echo "image: $img"
 	exit "${1:-0}"
 }
 
-# the same username/key checks that rc.d/firstboot_user applies
+# the same username/key/hash checks that rc.d/firstboot_user applies
 is_username() {
 	printf '%s\n' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'
 }
@@ -60,6 +176,117 @@ is_username() {
 keyprefix() {
 	case $1 in
 	ssh-ed25519* | ssh-rsa* | ecdsa-sha2-nistp256* | ecdsa-sha2-nistp384* | ecdsa-sha2-nistp521* | sk-ssh-ed25519@openssh.com* | sk-ecdsa-sha2-nistp256@openssh.com*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+is_hash() { # is_hash <string> — a crypt(3) hash firstboot_user accepts
+	case $1 in
+	*[[:space:]]* | *:*) return 1 ;;
+	'$6$'?* | '$2b$'?*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+is_hostname() { # RFC 1123 labels, at most 253 characters
+	[ "$(printf %s "$1" | wc -c)" -le 253 ] || return 1
+	printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+}
+
+is_timezone() { # a zoneinfo name: Area/Location, no "..", no leading "/"
+	case $1 in
+	*..* | /* | */ | *//*) return 1 ;;
+	esac
+	printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$' || return 1
+	# the zoneinfo of the live system, when it has one
+	if [ -d "$zoneinfo" ]; then
+		[ -f "$zoneinfo/$1" ] || return 1
+	fi
+	return 0
+}
+
+is_keymap() { # a vt(4) keymap name, e.g. us, fr.acc, uk
+	printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' || return 1
+	if [ -d "$keymaps" ]; then
+		[ -f "$keymaps/${1%.kbd}.kbd" ] || return 1
+	fi
+	return 0
+}
+
+is_fullname() { # a GECOS field: no ":" and no control character, at most 128 bytes
+	[ -n "$1" ] || return 1
+	[ "$(printf %s "$1" | wc -c)" -le 128 ] || return 1
+	case $1 in *:*) return 1 ;; esac
+	! printf '%s' "$1" | grep -q '[[:cntrl:]]'
+}
+
+is_ipv6() { # an IPv6 address: hex groups, at most one double colon
+	printf '%s\n' "$1" | grep -Eq '^[0-9A-Fa-f:]{2,39}$' || return 1
+	case $1 in *:::*) return 1 ;; esac
+	[ "$(printf %s "$1" | awk '{ print gsub(/:[:]/, "") }')" -le 1 ] || return 1
+	! printf '%s\n' "$1" | tr ':' '\n' | grep -Eq '^[0-9A-Fa-f]{5,}$'
+}
+
+is_net6spec() { # IF:slaac or IF:ADDR6/PREFIXLEN[:GW6]; the gateway is after the last "/LEN:"
+	_6i=${1%%:*}
+	_6r=${1#*:}
+	[ "$_6i" != "$1" ] || return 1
+	printf '%s\n' "$_6i" | grep -Eq '^[a-z][a-z0-9]{0,14}$' || return 1
+	[ "$_6r" = slaac ] && return 0
+	_6a=${_6r%%/*}
+	_6t=${_6r#*/}
+	[ "$_6a" != "$_6r" ] || return 1
+	_6l=${_6t%%:*}
+	_6g=''
+	[ "$_6l" = "$_6t" ] || _6g=${_6t#*:}
+	is_ipv6 "$_6a" || return 1
+	case $_6l in '' | *[!0-9]*) return 1 ;; esac
+	[ "$_6l" -ge 1 ] && [ "$_6l" -le 128 ] || return 1
+	[ -z "$_6g" ] || is_ipv6 "$_6g"
+}
+
+private_file() { # private_file <file> <what> — a regular file of mode 0600, not a link
+	[ -f "$1" ] && [ ! -L "$1" ] || die "no such $2 file: $1"
+	mode_is_private "$1" || die "the $2 file must be mode 0600 (no group or other access)"
+}
+
+is_ipv4() { # a dotted quad, every part 0..255
+	printf '%s\n' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
+	for _q in $(printf %s "$1" | tr '.' ' '); do
+		[ "$_q" -le 255 ] || return 1
+	done
+	return 0
+}
+
+is_netspec() { # IF:dhcp or IF:ADDR/MASK[:GW] (MASK a prefix length or a dotted mask)
+	_ni=${1%%:*}
+	_nr=${1#*:}
+	[ "$_ni" != "$1" ] || return 1
+	printf '%s\n' "$_ni" | grep -Eq '^[a-z][a-z0-9]{0,14}[0-9]$' || return 1
+	[ "$_nr" = dhcp ] && return 0
+	_na=${_nr%%/*}
+	_nm=${_nr#*/}
+	[ "$_na" != "$_nr" ] || return 1
+	_ng=''
+	case $_nm in
+	*:*)
+		_ng=${_nm#*:}
+		_nm=${_nm%%:*}
+		;;
+	esac
+	is_ipv4 "$_na" || return 1
+	case $_nm in
+	[0-9] | [12][0-9] | 3[0-2]) ;;
+	*) is_ipv4 "$_nm" || return 1 ;;
+	esac
+	[ -z "$_ng" ] || is_ipv4 "$_ng"
+}
+
+mode_is_private() { # mode_is_private <file> — no group or other permission bits
+	# ls -l works the same on FreeBSD and elsewhere: "-rw-------"
+	_m=$(ls -ln -- "$1" 2>/dev/null | awk 'NR == 1 { print $1 }')
+	case $_m in
+	-??-------*) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -87,48 +314,285 @@ pwread() { # pwread <prompt> — read one line with echoing disabled
 	printf '%s' "$_p"
 }
 
+# disk_of <device name> — the disk of a partition or slice (ada0p3 -> ada0,
+# da0s1a -> da0); a name that is not a partition stays as it is
+disk_of() {
+	printf '%s\n' "${1#/dev/}" | sed -e 's|p[0-9][0-9]*$||' -e 's|s[0-9][0-9]*[a-h]\{0,1\}$||'
+}
+
+# root_disks — the disks that hold the running root, separated by spaces.
+# On the live ISO the root is a cd9660 file system with a GEOM label
+# (/dev/iso9660/<LABEL>): a cd(4) drive, or the disk the ISO was written
+# to (a USB stick). A label is resolved with glabel(8), a ZFS root with
+# zpool(8). mount -p prints "device mountpoint type options ...".
+root_disks() {
+	_dev=$(mount -p 2>/dev/null | awk '$2 == "/" { print $1; exit }')
+	_typ=$(mount -p 2>/dev/null | awk '$2 == "/" { print $3; exit }')
+	case $_dev in
+	'') return 0 ;;
+	/dev/iso9660/* | /dev/ufs/* | /dev/gpt/* | /dev/gptid/* | /dev/label/* | /dev/msdosfs/*)
+		_l=${_dev#/dev/}
+		_c=$(glabel status -s 2>/dev/null | awk -v l="$_l" '$1 == l { print $3; exit }')
+		if [ -n "$_c" ]; then
+			disk_of "$_c"
+		elif [ "$_typ" = cd9660 ]; then
+			# the live media whose disk cannot be told: no disk is safe
+			echo '?'
+		fi
+		;;
+	/dev/*) disk_of "$_dev" ;;
+	*)
+		# a ZFS dataset: the devices of its pool
+		_pool=${_dev%%/*}
+		zpool status -P "$_pool" 2>/dev/null \
+			| awk '$1 ~ /^\/dev\// { print $1 }' | while IFS= read -r _zd; do
+				disk_of "$_zd"
+			done
+		;;
+	esac
+}
+
 if [ -t 0 ]; then
 	_rootstty=$(stty -g)
 fi
-trap '[ -n "$_rootstty" ] && stty "$_rootstty"' EXIT HUP INT TERM
+_ddpid=''
+trap '[ -n "$_rootstty" ] && stty "$_rootstty"' EXIT
+# a signal stops the installer, and the image writer it may have started
+trap '[ -z "$_ddpid" ] || kill "$_ddpid" 2> /dev/null; die "interrupted"' HUP INT TERM
 
-while getopts 'd:u:k:pyh' _o; do
+nets=''
+nets6=''
+dnss=''
+while getopts 'd:u:k:H:n:z:K:c:N:p:L:Z:r:E:6:D:W:l:PAUyh' _o; do
 	case $_o in
 	d) disk=$OPTARG ;;
 	u) user=$OPTARG ;;
 	k) keyfile=$OPTARG ;;
-	p) askpw=1 ;;
+	H) hashfile=$OPTARG ;;
+	n) hostname=$OPTARG ;;
+	z) timezone=$OPTARG ;;
+	K) keymap=$OPTARG ;;
+	c) fullname=$OPTARG ;;
+	N)
+		is_netspec "$OPTARG" || die "bad -N (IF:dhcp or IF:ADDR/MASK[:GW]): $OPTARG"
+		nets="$nets$OPTARG
+"
+		;;
+	P) nopass=1 ;;
+	p) planfile=$OPTARG ;;
+	L) locale=$OPTARG ;;
+	Z) clock=$OPTARG ;;
+	r) rootmode=$OPTARG ;;
+	E) passfile=$OPTARG ;;
+	6)
+		is_net6spec "$OPTARG" || die "bad -6 (IF:slaac or IF:ADDR6/LEN[:GW6]): $OPTARG"
+		nets6="$nets6$OPTARG
+"
+		;;
+	D)
+		# an IPv6 resolver may name its adapter (a link-local address, "%em0")
+		_dz=${OPTARG#*%}
+		[ "$_dz" = "$OPTARG" ] || printf '%s\n' "$_dz" | grep -Eq '^[a-z][a-z0-9]{0,14}$' \
+			|| die "bad -D (the zone is not an adapter name): $OPTARG"
+		is_ipv4 "$OPTARG" || is_ipv6 "${OPTARG%%\%*}" || die "bad -D (an IPv4 or IPv6 address): $OPTARG"
+		dnss="$dnss $OPTARG"
+		;;
+	W) wififile=$OPTARG ;;
+	l) acceptfile=$OPTARG ;;
+	A) autologin=1 ;;
+	U) update=1 ;;
 	y) assume=1 ;;
 	h) usage 0 ;;
-	*) usage 2 >&2 ;;
+	*)
+		[ "$progress" -eq 1 ] && die 'unknown option'
+		usage 2 >&2
+		;;
 	esac
 done
 shift $((OPTIND - 1))
 [ $# -eq 0 ] || die "unexpected argument: $1"
 
-[ "$(id -u)" = 0 ] || die 'must be run as root'
-[ -f "$img" ] || die "missing $img (run this from the live install image)"
-
-[ -n "${user:-}" ] || [ -z "${keyfile:-}" ] || die '-k needs -u'
-[ -n "${keyfile:-}" ] || [ -z "${user:-}" ] || die '-u needs -k (they go together)'
 : ${askpw:=0}
+: ${nopass:=0}
+: ${autologin:=0}
+: ${update:=0}
+planfile=${planfile:-}
+locale=${locale:-}
+clock=${clock:-}
+rootmode=${rootmode:-locked}
+passfile=${passfile:-}
+wififile=${wififile:-}
+acceptfile=${acceptfile:-}
+fullname=${fullname:-}
 : ${assume:=0}
 user=${user:-}
 keyfile=${keyfile:-}
+hashfile=${hashfile:-}
 disk=${disk:-}
+hostname=${hostname:-}
+timezone=${timezone:-}
+keymap=${keymap:-}
+
+step 1 'Checking the answers'
+[ "$(id -u)" = 0 ] || die 'must be run as root'
+[ -f "$img" ] || die "missing $img (run this from the live install image)"
+
+if [ "$progress" -eq 1 ]; then
+	# nothing may be asked: every answer comes as an option
+	[ "$assume" -eq 1 ] || die '--progress needs -y'
+	[ -n "$disk" ] || [ -n "$planfile" ] || die '--progress needs -p PLANFILE or -d DISK'
+	[ -n "$user" ] || die '--progress needs -u USER'
+fi
+[ -z "$disk" ] || [ -z "$planfile" ] || die '-p and -d do not go together (the plan names the disks)'
+
+# ---- the disk plan (-p): checked again here, before anything is written ----
+swap_mb=0
+swap_enc=no
+installpath=image
+sysdisks=''
+layout=single
+encrypt=no
+datapools=''
+sector4k=yes
+if [ -n "$planfile" ]; then
+	private_file "$planfile" plan
+	command -v python3 > /dev/null 2>&1 || die 'a disk plan (-p) needs python3'
+	[ -f "$planner" ] || die "missing $planner"
+	_po=$(python3 -I "$planner" "$planfile" "$imagefs" 2>&1)
+	_prc=$?
+	[ "$_prc" -eq 0 ] || die "disk plan: $(printf '%s' "$_po" | tr '\n' ' ')"
+	while IFS='=' read -r _pk _pv; do
+		case $_pk in
+		DISK) disk=$_pv ;;
+		DISKS) sysdisks=$(printf '%s' "$_pv" | tr ',' ' ') ;;
+		PATH) installpath=$_pv ;;
+		LAYOUT) layout=$_pv ;;
+		ENC) encrypt=$_pv ;;
+		SECTOR4K) sector4k=$_pv ;;
+		DATA) datapools="$datapools$_pv
+" ;;
+		SWAP_MB) swap_mb=$_pv ;;
+		SWAP_ENC) swap_enc=$_pv ;;
+		esac
+	done <<PLAN
+$_po
+PLAN
+	case $swap_mb in '' | *[!0-9]*) die 'disk plan: bad swap size' ;; esac
+	[ -n "$disk" ] || die 'disk plan: no disk'
+fi
+# the passphrase of the disk encryption: required exactly when the plan
+# encrypts; one line, 8..1024 bytes, never on a command line
+if [ "$encrypt" = yes ]; then
+	[ -n "$passfile" ] || die 'the plan encrypts the system: -E PASSPHRASEFILE is needed'
+	private_file "$passfile" passphrase
+	_pl=$(wc -c < "$passfile" | tr -d ' ')
+	[ "$_pl" -ge 8 ] && [ "$_pl" -le 1025 ] || die 'the passphrase must be 8 to 1024 bytes'
+	[ "$(tr -d '\000' < "$passfile" | wc -c | tr -d ' ')" = "$_pl" ] || die 'the passphrase may not hold a NUL byte'
+	[ "$(wc -l < "$passfile" | tr -d ' ')" -le 1 ] || die 'the passphrase is one line'
+else
+	[ -z "$passfile" ] || die '-E is given but the plan has no disk encryption'
+fi
+case $clock in '' | utc | local) ;; *) die "-Z must be utc or local (got: $clock)" ;; esac
+if [ -n "$locale" ]; then
+	printf '%s\n' "$locale" | grep -Eq '^[a-z]{2,3}_[A-Z]{2}\.UTF-8$' || die "bad locale: $locale"
+	[ ! -d "${INSTALL_LOCALES:-/usr/share/locale}" ] || [ -d "${INSTALL_LOCALES:-/usr/share/locale}/$locale" ] \
+		|| die "unknown locale: $locale"
+fi
+roothash=''
+case $rootmode in
+locked) ;;
+*)
+	private_file "$rootmode" 'root hash'
+	IFS= read -r roothash < "$rootmode" || [ -n "$roothash" ] || die "$rootmode is empty"
+	is_hash "$roothash" || die "$rootmode does not hold a crypt(3) hash starting with \$6\$ or \$2b\$"
+	;;
+esac
+wifi_if=''
+wifi_conf=''
+if [ -n "$wififile" ]; then
+	private_file "$wififile" Wi-Fi
+	command -v python3 > /dev/null 2>&1 || die 'a Wi-Fi network (-W) needs python3'
+	# the wpa_supplicant.conf of the installed system, made from the JSON;
+	# the key is never on a command line or in a log
+	wifi_conf=$(python3 -I -c '
+import json, re, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(d, dict) or set(d) - {"if", "ssid", "security", "psk"}:
+    sys.exit("the Wi-Fi file has unknown keys")
+i, ssid, sec, psk = d.get("if"), d.get("ssid"), d.get("security"), d.get("psk", "")
+if not isinstance(i, str) or not re.match(r"^[a-z][a-z0-9]{0,14}$", i):
+    sys.exit("bad Wi-Fi interface")
+if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32 or "\n" in ssid or "\"" in ssid:
+    sys.exit("bad SSID")
+if sec not in ("wpa2", "wpa3", "open"):
+    sys.exit("bad Wi-Fi security")
+lines = ["IF=" + i, "network={", "\tssid=\"%s\"" % ssid]
+if sec == "open":
+    lines.append("\tkey_mgmt=NONE")
+else:
+    if not isinstance(psk, str) or not (re.match(r"^[ -~]{8,63}$", psk) or re.match(r"^[0-9A-Fa-f]{64}$", psk)) or "\"" in psk:
+        sys.exit("bad Wi-Fi key")
+    lines.append("\tkey_mgmt=" + ("SAE" if sec == "wpa3" else "WPA-PSK"))
+    if sec == "wpa3":
+        lines.append("\tieee80211w=2")
+    lines.append("\tpsk=" + (psk if len(psk) == 64 and re.match(r"^[0-9A-Fa-f]+$", psk) else "\"%s\"" % psk))
+lines.append("}")
+print("\n".join(lines))
+' "$wififile" 2>&1) || die "Wi-Fi: $(printf '%s' "$wifi_conf" | head -n 1)"
+	wifi_if=$(printf '%s\n' "$wifi_conf" | sed -n 's/^IF=//p')
+	wifi_conf=$(printf '%s\n' "$wifi_conf" | sed '/^IF=/d')
+fi
+if [ -n "$acceptfile" ]; then
+	private_file "$acceptfile" 'accepted licences'
+	command -v python3 > /dev/null 2>&1 || die 'accepted licences (-l) need python3'
+	# every accepted id must be an item of the catalogue on the media
+	_lo=$(python3 -I -c '
+import json, sys
+acc = json.load(open(sys.argv[1], encoding="utf-8"))
+try:
+    cat = json.load(open(sys.argv[2], encoding="utf-8"))
+except OSError:
+    cat = {"items": []}
+ids = {i.get("id") for i in cat.get("items", []) if isinstance(i, dict)}
+items = acc if isinstance(acc, list) else acc.get("accepted", []) if isinstance(acc, dict) else None
+if not isinstance(items, list):
+    sys.exit("the accepted licences are not a list")
+for a in items:
+    if not isinstance(a, dict) or a.get("id") not in ids:
+        sys.exit("not an item of the catalogue: %r" % (a.get("id") if isinstance(a, dict) else a))
+' "$acceptfile" "$catalogue" 2>&1) || die "licences: $_lo"
+fi
+
+[ -n "$user" ] || [ -z "$keyfile" ] || die '-k needs -u'
+[ -n "$user" ] || [ -z "$hashfile" ] || die '-H needs -u'
+if [ -n "$user" ] && [ -z "$keyfile" ] && [ -z "$hashfile" ]; then
+	[ -t 0 ] && [ "$progress" -eq 0 ] || die '-u needs -k PUBKEYFILE or -H HASHFILE'
+	askpw=1
+fi
 
 if [ -n "$user" ]; then
 	is_username "$user" || die "bad username: $user (must match ^[a-z_][a-z0-9_-]{0,31}\$)"
+fi
+if [ -n "$hostname" ]; then
+	is_hostname "$hostname" || die "bad host name: $hostname"
+fi
+if [ -n "$timezone" ]; then
+	is_timezone "$timezone" || die "unknown time zone: $timezone"
+fi
+if [ -n "$keymap" ]; then
+	is_keymap "$keymap" || die "unknown keymap: $keymap"
+	keymap=${keymap%.kbd}
 fi
 
 keys=''
 nkeys=0
 if [ -n "$keyfile" ]; then
+	[ -f "$keyfile" ] || die "no such key file: $keyfile"
 	while IFS= read -r _l || [ -n "$_l" ]; do
 		case $_l in
 		'' | '#'*) continue ;;
 		esac
-		keyprefix "$_l" || die "$keyfile: not a supported ssh public key line: $_l"
+		keyprefix "$_l" || die "$keyfile: not a supported ssh public key line"
 		keys="$_l
 $keys"
 		nkeys=$((nkeys + 1))
@@ -136,11 +600,22 @@ $keys"
 	[ "$nkeys" -gt 0 ] || die "no ssh public key lines in $keyfile"
 fi
 
-fullname=$user
+pwhash=''
+if [ -n "$hashfile" ]; then
+	[ -f "$hashfile" ] && [ ! -L "$hashfile" ] || die "no such hash file: $hashfile"
+	mode_is_private "$hashfile" || die "$hashfile must be mode 0600 (no group or other access)"
+	IFS= read -r pwhash < "$hashfile" || [ -n "$pwhash" ] || die "$hashfile is empty"
+	is_hash "$pwhash" || die "$hashfile does not hold a crypt(3) hash starting with \$6\$ or \$2b\$"
+fi
 
-# interactive user/key/password (when -u/-k are not given)
+if [ -n "$fullname" ]; then
+	is_fullname "$fullname" || die 'bad full name (no ":" or control characters, at most 128 bytes)'
+fi
+fullname=${fullname:-$user}
+
+# interactive user/key/password (when -u is not given)
 if [ -z "$user" ]; then
-	[ -t 0 ] || die 'no terminal: use -u USER -k PUBKEYFILE'
+	[ -t 0 ] || die 'no terminal: use -u USER with -k PUBKEYFILE or -H HASHFILE'
 	while :; do
 		printf ' Username for the new account: ' >&2
 		IFS= read -r _u || die 'aborted'
@@ -149,17 +624,17 @@ if [ -z "$user" ]; then
 		esac
 		if is_username "$_u"; then
 			user=$_u
-			fullname=$_u
+			[ -n "$fullname" ] && [ "$fullname" != "$user" ] || fullname=$_u
 			break
 		fi
 		warn 'bad username ([a-z_][a-z0-9_-]{0,31}); try again'
 	done
 	_prev_keys=$keys
 	while :; do
-		printf ' Paste ONE ssh public key line: ' >&2
+		printf ' Paste ONE ssh public key line (Return to skip): ' >&2
 		IFS= read -r _l || die 'aborted'
 		case ${_l:-} in
-		'') continue ;;
+		'') break ;;
 		esac
 		if keyprefix "$_l"; then
 			keys="$_l
@@ -172,14 +647,21 @@ $_prev_keys"
 	askpw=1
 fi
 
-pwhash=''
 if [ "$askpw" -eq 1 ]; then
 	[ -t 0 ] || die 'a password prompt needs a terminal'
 	_p1=''
 	while :; do
-		printf ' Optional password for %s (Return to skip)\n' "$user" >&2
+		if [ "$nkeys" -gt 0 ]; then
+			printf ' Optional password for %s (Return to skip)\n' "$user" >&2
+		else
+			printf ' Password for %s (there is no ssh key, so it is required)\n' "$user" >&2
+		fi
 		_p1=$(pwread '  password: ')
-		[ -n "$_p1" ] || break
+		if [ -z "$_p1" ]; then
+			[ "$nkeys" -gt 0 ] && break
+			warn 'a password is required without an ssh key'
+			continue
+		fi
 		_p2=$(pwread '  confirm:  ')
 		if [ "$_p1" = "$_p2" ]; then
 			pwhash=$(printf '%s\n' "$_p1" | openssl passwd -6 -stdin) || die 'openssl passwd failed'
@@ -193,6 +675,7 @@ fi
 
 # ---- target disk selection -------------------------------------------------
 
+step 2 'Looking at the disks'
 disks=$(sysctl -n kern.disks 2>/dev/null)
 [ -n "$disks" ] || die 'cannot read kern.disks'
 _list=''
@@ -205,9 +688,11 @@ done
 disks=${_list# }
 [ -n "$disks" ] || die 'no disks to install to (only cd*/md* devices present)'
 
-# the disk backing the running root ("" on the live ISO); never destroyed
-_rootdev=$(mount | awk '$2 == "/" && $1 ~ /^\/dev\// { print $1 }' \
-	| sed -e 's|^/dev/||' -e 's|p[0-9][0-9]*$||' -e 's|s[0-9][0-9a-h]*$||')
+# the disks backing the running root (the live media); never destroyed
+_rootdisks=$(root_disks | tr '\n' ' ')
+case " $_rootdisks " in
+*' ? '*) die 'cannot tell which disk holds the live media (glabel status names no provider for the root label)' ;;
+esac
 
 if [ -n "$disk" ]; then
 	case $disk in
@@ -216,13 +701,15 @@ if [ -n "$disk" ]; then
 	case $disk in
 	'' | *[!a-zA-Z0-9]*) die "bad disk name: $disk" ;;
 	esac
-	[ -e "/dev/$disk" ] || die "no such device: /dev/$disk"
+	[ -e "$devdir/$disk" ] || die "no such device: /dev/$disk"
 	inlist "$disk" $disks || die "$disk is not a known disk (kern.disks: $disks)"
 elif command -v bsddialog >/dev/null 2>&1; then
 	_menu=''
 	for _d in $disks; do
+		inlist "$_d" $_rootdisks && continue
 		_menu="$_menu $_d DESTROYS-ALL-DATA"
 	done
+	[ -n "$_menu" ] || die 'no disk to install to (every disk holds the running system)'
 	while :; do
 		# bsddialog(8) draws its screen on stdout and writes the
 		# answer on stderr: swap the two streams, so that the screen
@@ -252,7 +739,23 @@ else
 	done
 fi
 
-[ "$disk" != "$_rootdev" ] || die "refusing to overwrite /dev/$disk: it holds the running root"
+if inlist "$disk" $_rootdisks; then
+	die "refusing to overwrite /dev/$disk: it holds the running system (the live media)"
+fi
+# every disk of a copy install: the system disks and the disks of the data pools
+alldisks=''
+if [ "$installpath" = copy ]; then
+	alldisks=$sysdisks
+	for _dl in $(printf '%s' "$datapools" | awk -F'|' '{ print $4 }' | tr ',' ' '); do
+		alldisks="$alldisks $_dl"
+	done
+	for _d in $alldisks; do
+		[ -e "$devdir/$_d" ] || die "no such device: /dev/$_d"
+		inlist "$_d" $disks || die "$_d is not a known disk (kern.disks: $disks)"
+		inlist "$_d" $_rootdisks && die "refusing to overwrite /dev/$_d: it holds the running system (the live media)"
+	done
+	[ "$imagefs" = zfs ] || die 'a copy install needs a ZFS image'
+fi
 
 if [ "$assume" -ne 1 ]; then
 	printf 'ALL DATA ON /dev/%s WILL BE DESTROYED, type yes: ' "$disk" >&2
@@ -260,20 +763,231 @@ if [ "$assume" -ne 1 ]; then
 	[ "${_a:-}" = yes ] || die 'cancelled'
 fi
 
+# ---- the copy install: partitions, GELI, pools, the system copied ---------
+
+zpool_spec() { # zpool_spec <layout> <devices...> — the vdev words of a pool
+	_zl=$1
+	shift
+	case $_zl in
+	single | stripe) printf '%s ' "$@" ;;
+	mirror) printf 'mirror %s ' "$*" ;;
+	raidz1 | raidz2 | raidz3) printf '%s %s ' "$_zl" "$*" ;;
+	raid10)
+		while [ $# -ge 2 ]; do
+			printf 'mirror %s %s ' "$1" "$2"
+			shift 2
+		done
+		;;
+	*) die "unknown layout $_zl" ;;
+	esac
+}
+
+copy_install() {
+	pool=$(cat "${img%/*}/system.pool" 2> /dev/null)
+	printf '%s\n' "$pool" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*$' || die "no root pool name next to $img"
+	livepaths=${img%/*}/live-paths
+	[ -f "$livepaths" ] || die "missing $livepaths (the live layer the copy leaves out)"
+	_syskb=$(cat "${img%/*}/system.kb" 2> /dev/null)
+	case $_syskb in '' | *[!0-9]*) _syskb=0 ;; esac
+	# the source: the cd9660 root of the live media, seen through a read-only
+	# nullfs mount of / (the live root has memory disks on /etc, /var, /root
+	# and /home, which nullfs does not show; a second cd9660 mount of the
+	# device in use fails with "Device busy")
+	srcmnt=''
+	if [ -z "$srcroot" ]; then
+		_rtyp=$(mount -p | awk '$2 == "/" { print $3; exit }')
+		[ "$_rtyp" = cd9660 ] || die 'a copy install runs from the live media (its root is not cd9660)'
+		srcmnt=$(mktemp -d -t installsrc) || die 'mktemp failed'
+		mount -t nullfs -o ro / "$srcmnt" || die 'cannot mount the live root read-only (nullfs)'
+		srcroot=$srcmnt
+	fi
+	[ -f "$srcroot/boot/loader.efi" ] || die "no /boot/loader.efi in $srcroot"
+	# an earlier run in this live session may have left the pool imported
+	if zpool list -H -o name "$pool" > /dev/null 2>&1; then
+		zpool export -f "$pool" || die "zpool export $pool failed"
+	fi
+	keyfile=''
+	if [ "$encrypt" = yes ]; then
+		# geli reads every byte of the file: the newline goes, the loader
+		# prompt has none
+		keyfile=$(mktemp -t installkey) || die 'mktemp failed'
+		chmod 600 "$keyfile"
+		printf '%s' "$(cat "$passfile")" > "$keyfile" || die 'cannot copy the passphrase'
+	fi
+	step 5 'Partitioning the disks'
+	_i=0
+	zdevs=''
+	swaplabels=''
+	_secsz=512
+	[ "$sector4k" != yes ] || _secsz=4096
+	for _d in $sysdisks; do
+		gpart destroy -F "$_d" > /dev/null 2>&1 || :
+		gpart create -s gpt "$_d" || die "gpart create on $_d failed"
+		gpart add -t freebsd-boot -s 512k -l "gptzfsboot$_i" "$_d" || die "gpart add freebsd-boot on $_d failed"
+		gpart bootcode -b "$srcroot/boot/pmbr" -p "$srcroot/boot/gptzfsboot" -i 1 "$_d" || die "gpart bootcode on $_d failed"
+		gpart add -t efi -a 1m -s 260m -l "efiboot$_i" "$_d" || die "gpart add efi on $_d failed"
+		newfs_msdos -F 32 -c 1 -L EFISYS "/dev/${_d}p2" > /dev/null || die "newfs_msdos on ${_d}p2 failed"
+		_esp=$(mktemp -d -t installesp) || die 'mktemp failed'
+		mount -t msdosfs "/dev/${_d}p2" "$_esp" || die "cannot mount the EFI partition of $_d"
+		mkdir -p "$_esp/EFI/BOOT" && cp "$srcroot/boot/loader.efi" "$_esp/EFI/BOOT/BOOTX64.EFI" \
+			|| { umount "$_esp"; die "cannot install the EFI loader on $_d"; }
+		umount "$_esp" || warn "umount $_esp failed"
+		rmdir "$_esp" 2> /dev/null || :
+		if [ "$swap_mb" -gt 0 ]; then
+			gpart add -t freebsd-swap -a 1m -s "${swap_mb}m" -l "swap$_i" "$_d" || die "gpart add swap on $_d failed"
+			swaplabels="$swaplabels swap$_i"
+		fi
+		gpart add -t freebsd-zfs -a 1m -l "zfs$_i" "$_d" || die "gpart add freebsd-zfs on $_d failed"
+		_zd=gpt/zfs$_i
+		if [ "$encrypt" = yes ]; then
+			# -b: the passphrase is asked at boot, -g: the loader asks it
+			geli init -b -g -e AES-XTS -l 256 -s "$_secsz" -J "$keyfile" "/dev/$_zd" > /dev/null \
+				|| die "geli init on $_zd failed"
+			geli attach -j "$keyfile" "/dev/$_zd" || die "geli attach of $_zd failed"
+			_zd=$_zd.eli
+		fi
+		zdevs="$zdevs $_zd"
+		_i=$((_i + 1))
+	done
+	[ -z "$keyfile" ] || { rm -f "$keyfile"; keyfile=''; }
+	step 15 'Making the ZFS pool'
+	set -- -f -o altroot="$mnt" -O mountpoint=/ -O compression=lz4 -O atime=off
+	[ "$sector4k" != yes ] || set -- "$@" -o ashift=12
+	# shellcheck disable=SC2046
+	zpool create "$@" "$pool" $(zpool_spec "$layout" $zdevs) || die "zpool create $pool ($layout) failed"
+	zpool set bootfs="$pool" "$pool" || die "zpool set bootfs on $pool failed"
+	mkdir -p "$mnt/etc/zfs" "$mnt/boot/zfs"
+	zpool set cachefile="$mnt/etc/zfs/zpool.cache" "$pool" || warn "cannot set the cache file of $pool"
+	printf '%s' "$datapools" | while IFS='|' read -r _dn _dlay _dmnt _ddisks; do
+		[ -n "$_dn" ] || continue
+		_dz=''
+		for _d in $(printf '%s' "$_ddisks" | tr ',' ' '); do
+			gpart destroy -F "$_d" > /dev/null 2>&1 || :
+			gpart create -s gpt "$_d" || die "gpart create on $_d failed"
+			gpart add -t freebsd-zfs -a 1m -l "$_dn-$_d" "$_d" || die "gpart add freebsd-zfs on $_d failed"
+			_dz="$_dz gpt/$_dn-$_d"
+		done
+		# shellcheck disable=SC2046
+		zpool create -f -o altroot="$mnt" -O mountpoint="$_dmnt" -O compression=lz4 -O atime=off \
+			"$_dn" $(zpool_spec "$_dlay" $_dz) || die "zpool create $_dn ($_dlay) failed"
+		zpool set cachefile="$mnt/etc/zfs/zpool.cache" "$_dn" || warn "cannot set the cache file of $_dn"
+	done || exit 1
+	step 20 'Copying the system'
+	# the paths of the live layer are left out; tar matches them as written
+	# in the list ("./usr/local/share/...")
+	_cpst=$(mktemp -t install) || die 'mktemp failed'
+	{ (cd "$srcroot" && tar -cf - -X "$livepaths" .) || echo fail > "$_cpst"; } \
+		| (cd "$mnt" && tar -xpf -) &
+	_cppid=$!
+	_last=20
+	while kill -0 "$_cppid" 2> /dev/null; do
+		sleep 3
+		[ "$_syskb" -gt 0 ] || continue
+		_used=$(zfs list -Hp -o used "$pool" 2> /dev/null)
+		case $_used in '' | *[!0-9]*) continue ;; esac
+		_pct=$((20 + _used / 1024 * 65 / _syskb))
+		[ "$_pct" -le 85 ] || _pct=85
+		if [ "$_pct" -gt "$_last" ]; then
+			step "$_pct" 'Copying the system'
+			_last=$_pct
+		fi
+	done
+	wait "$_cppid" || die 'copying the system failed'
+	[ ! -s "$_cpst" ] || die "reading the system from $srcroot failed"
+	rm -f "$_cpst"
+	# the files the live layer replaced come back as the image has them
+	if [ -d "${img%/*}/orig" ]; then
+		(cd "${img%/*}/orig" && tar -cf - .) | (cd "$mnt" && tar -xpf -) \
+			|| die 'cannot restore the files the live layer replaced'
+	fi
+	cp "$mnt/etc/zfs/zpool.cache" "$mnt/boot/zfs/zpool.cache" 2> /dev/null || :
+	# never the live media's root line (a second guard: build.sh keeps the
+	# image's fstab in orig/)
+	if grep -q '[[:space:]]cd9660[[:space:]]' "$mnt/etc/fstab" 2> /dev/null; then
+		grep -v '[[:space:]]cd9660[[:space:]]' "$mnt/etc/fstab" > "$mnt/etc/fstab.new" \
+			&& cat "$mnt/etc/fstab.new" > "$mnt/etc/fstab" && rm -f "$mnt/etc/fstab.new" \
+			|| die 'cannot take the live root out of the installed fstab'
+	fi
+	# every system disk has an EFI partition with the volume label EFISYS:
+	# with two or more the label is ambiguous, and an EFI partition left
+	# unmounted shows as a volume icon on the desktop. Each is mounted by
+	# its GPT label: the first on /boot/efi, the others on /boot/efi1...
+	_esps=''
+	_i=0
+	for _d in $sysdisks; do
+		_emp=/boot/efi
+		[ "$_i" -eq 0 ] || _emp=/boot/efi$_i
+		mkdir -p "$mnt$_emp" || die "cannot make $_emp"
+		_esps="$_esps$(printf '/dev/gpt/efiboot%s\t%s\tmsdosfs\trw,failok\t2\t2' "$_i" "$_emp")
+"
+		_i=$((_i + 1))
+	done
+	{ grep -v '^/dev/msdosfs/EFISYS[[:space:]]' "$mnt/etc/fstab" || :; printf '%s' "$_esps"; } > "$mnt/etc/fstab.new" &&
+		cat "$mnt/etc/fstab.new" > "$mnt/etc/fstab" && rm -f "$mnt/etc/fstab.new" ||
+		die 'cannot write the EFI partitions into the installed fstab'
+	if [ "$encrypt" = yes ]; then
+		mkdir -p "$mnt/boot/loader.conf.d"
+		printf 'geom_eli_load="YES"\n' > "$mnt/boot/loader.conf.d/geli.conf" \
+			|| die 'cannot write the GELI loader setting'
+	fi
+	if [ -n "$srcmnt" ]; then
+		umount "$srcmnt" || warn "umount $srcmnt failed"
+		rmdir "$srcmnt" 2> /dev/null || :
+	fi
+	ftype=zfscopy
+}
+
 # ---- destructive steps ------------------------------------------------------
+
+if [ "$installpath" = copy ]; then
+	copy_install
+else
 
 ddstatus=''
 if dd if=/dev/null of=/dev/null status=progress 2>/dev/null; then
 	ddstatus=status=progress
 fi
+step 5 "Writing the system to /dev/$disk"
 echo "Writing $img to /dev/$disk ..." >&2
 # set -o pipefail is not POSIX: check xz separately via a status file
 _xzst=$(mktemp -t install) || die 'mktemp failed'
-{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus || die "dd to /dev/$disk failed"
+if [ "$progress" -eq 1 ]; then
+	# the pipeline runs in the background; dd's status=progress lines
+	# (bytes written so far) are read from its log and turned into
+	# PROGRESS lines between 5 and 70 against the size of the image
+	_total=$(xz --robot -l "$img" 2>/dev/null | awk -F '\t' '$1 == "totals" { print $5; exit }')
+	case $_total in '' | *[!0-9]*) _total=0 ;; esac
+	_ddlog=$(mktemp -t install) || die 'mktemp failed'
+	{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus 2> "$_ddlog" &
+	_ddpid=$!
+	_last=5
+	while kill -0 "$_ddpid" 2>/dev/null; do
+		sleep 2
+		[ "$_total" -gt 0 ] || continue
+		_done=$(tr '\r' '\n' < "$_ddlog" | awk '$1 ~ /^[0-9]+$/ && $2 == "bytes" { b = $1 } END { print b + 0 }')
+		_pct=$((5 + _done * 65 / _total))
+		[ "$_pct" -le 70 ] || _pct=70
+		if [ "$_pct" -gt "$_last" ]; then
+			step "$_pct" "Writing the system to /dev/$disk"
+			_last=$_pct
+		fi
+	done
+	wait "$_ddpid" || {
+		_ddpid=''
+
+		tr '\r' '\n' < "$_ddlog" | tail -n 3 >&2
+		die "dd to /dev/$disk failed"
+	}
+	_ddpid=''
+	rm -f "$_ddlog"
+else
+	{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus || die "dd to /dev/$disk failed"
+fi
 [ ! -s "$_xzst" ] || die "xz -dc $img failed"
 rm -f "$_xzst"
 sync
 
+step 72 'Growing the partition table'
 if ! gpart recover /dev/"$disk"; then
 	die "gpart recover /dev/$disk failed"
 fi
@@ -283,11 +997,26 @@ fi
 lastidx=$(gpart show /dev/"$disk" \
 	| awk '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { print $3 }' | tail -n 1)
 [ -n "$lastidx" ] || die 'could not determine the last partition index (gpart show)'
+# swap (the plan's swap_mb) goes at the end of the disk, aligned to 1 MiB,
+# and the root partition grows up to it
+swaplabel='@SLUG@swap'
+if [ "$swap_mb" -gt 0 ]; then
+	_secsz=$(diskinfo "$disk" 2> /dev/null | awk '{ print $2; exit }')
+	case $_secsz in '' | *[!0-9]* | 0) _secsz=512 ;; esac
+	_end=$(gpart show /dev/"$disk" | awk '/^=>/ { print $2 + $3; exit }')
+	case $_end in '' | *[!0-9]*) die 'could not read the size of the partition table (gpart show)' ;; esac
+	_align=$((1048576 / _secsz))
+	_sstart=$((_end - swap_mb * (1048576 / _secsz)))
+	_sstart=$((_sstart - _sstart % _align))
+	gpart add -t freebsd-swap -l "$swaplabel" -b "$_sstart" -s "${swap_mb}M" /dev/"$disk" \
+		|| die "gpart add of $swap_mb MiB of swap failed (the disk may be too small)"
+fi
 gpart resize -i "$lastidx" /dev/"$disk" || die "gpart resize -i $lastidx failed"
 ptype=$(gpart show /dev/"$disk" \
 	| idx="$lastidx" awk '/^=>/ { next } $1 ~ /^[0-9]+$/ && $3 == ENVIRON["idx"] { print $4 }')
 [ -n "$ptype" ] || die "could not read the type of partition $lastidx (gpart show)"
 
+step 80 'Growing the root file system'
 mkdir -p "$mnt"
 ftype=''
 case $ptype in
@@ -310,10 +1039,63 @@ freebsd-zfs)
 	;;
 *) die "unexpected type of partition $lastidx: $ptype" ;;
 esac
+fi
 
-# ---- first-boot user config (same format rc.d/firstboot_user parses) -------
+# ---- the installer itself never stays on the installed system -------------
 
+if [ -f "$manifest" ]; then
+	while IFS= read -r _mp || [ -n "$_mp" ]; do
+		case $_mp in
+		/*) ;;
+		*) continue ;;
+		esac
+		case /$_mp/ in
+		*/../* | */./*) warn "MANIFEST: skipped $_mp"; continue ;;
+		esac
+		# a directory of the installer (a trailing slash, the deepest
+		# first): it goes when it is empty
+		case $_mp in
+		*/)
+			[ ! -d "$mnt$_mp" ] || [ -L "${mnt}${_mp%/}" ] || rmdir -- "$mnt$_mp" 2> /dev/null || :
+			continue
+			;;
+		esac
+		if [ -f "$mnt$_mp" ] || [ -L "$mnt$_mp" ]; then
+			rm -f -- "$mnt$_mp" || die "cannot remove $_mp from the installed system"
+		fi
+	done < "$manifest"
+fi
+
+# ---- what the installed system gets directly -------------------------------
+
+if [ "$swap_mb" -gt 0 ]; then
+	# an .eli suffix makes rc.d/swap encrypt it with a one-time key
+	[ "$installpath" = copy ] || swaplabels=$swaplabel
+	for _sl in $swaplabels; do
+		_sdev=/dev/gpt/$_sl
+		[ "$swap_enc" != yes ] || _sdev=$_sdev.eli
+		printf '%s\tnone\tswap\tsw\t0\t0\n' "$_sdev" >> "$mnt/etc/fstab" || die "cannot add the swap to $mnt/etc/fstab"
+	done
+fi
+if [ -n "$wifi_conf" ]; then
+	_oldumask=$(umask)
+	umask 077
+	printf '%s\n' "$wifi_conf" > "$mnt/etc/wpa_supplicant.conf" || die 'cannot write wpa_supplicant.conf'
+	umask "$_oldumask"
+	chmod 600 "$mnt/etc/wpa_supplicant.conf"
+	wifi_conf=''
+fi
+if [ -n "$acceptfile" ]; then
+	mkdir -p "$mnt/var/db/@SLUG@" && cp "$acceptfile" "$mnt/var/db/@SLUG@/licenses-accepted.json" \
+		&& chmod 600 "$mnt/var/db/@SLUG@/licenses-accepted.json" || die 'cannot record the accepted licences'
+fi
+
+# ---- first-boot config (same format rc.d/firstboot_user parses) ------------
+
+step 90 'Writing the first boot settings'
 dst=$mnt/boot/firstboot-user.conf
+_oldumask=$(umask)
+umask 077 # no world-readable window on the password hash
 {
 	printf 'USERNAME=%s\n' "$user"
 	printf 'FULLNAME=%s\n' "$fullname"
@@ -326,9 +1108,53 @@ KEYS
 	if [ -n "$pwhash" ]; then
 		printf 'PASSWORD_HASH=%s\n' "$pwhash"
 	fi
+	if [ -n "$hostname" ]; then
+		printf 'HOSTNAME=%s\n' "$hostname"
+	fi
+	if [ -n "$timezone" ]; then
+		printf 'TIMEZONE=%s\n' "$timezone"
+	fi
+	if [ -n "$keymap" ]; then
+		printf 'KEYMAP=%s\n' "$keymap"
+	fi
+	if [ "$nopass" -eq 1 ]; then
+		printf 'DOAS_NOPASS=yes\n'
+	fi
+	printf '%s' "$nets" | while IFS= read -r _l; do
+		[ -z "$_l" ] || printf 'NETWORK=%s\n' "$_l"
+	done
+	printf '%s' "$nets6" | while IFS= read -r _l; do
+		[ -z "$_l" ] || printf 'NETWORK6=%s\n' "$_l"
+	done
+	for _l in $dnss; do
+		printf 'DNS=%s\n' "$_l"
+	done
+	if [ -n "$wifi_if" ]; then
+		printf 'WIFI_IF=%s\n' "$wifi_if"
+	fi
+	if [ -n "$locale" ]; then
+		printf 'LOCALE=%s\n' "$locale"
+	fi
+	if [ -n "$clock" ]; then
+		printf 'CLOCK=%s\n' "$clock"
+	fi
+	if [ -n "$roothash" ]; then
+		printf 'ROOT_HASH=%s\n' "$roothash"
+	fi
+	if [ "$autologin" -eq 1 ]; then
+		printf 'AUTOLOGIN=yes\n'
+	fi
+	if [ "$update" -eq 1 ]; then
+		printf 'UPDATE=yes\n'
+	fi
+	:
 } > "$dst" || die "cannot write $dst"
+umask "$_oldumask"
 chmod 600 "$dst" || die "chmod 600 $dst failed"
+pwhash=''
+roothash=''
 
+step 96 'Finishing'
 case $ftype in
 ufs)
 	umount "$mnt" || warn "umount $mnt failed"
@@ -337,7 +1163,17 @@ zfs)
 	umount "$mnt" || warn "umount $mnt failed"
 	zpool export "$pool" || warn "zpool export $pool failed"
 	;;
+zfscopy)
+	# the pools stay imported in the live session (an export would take
+	# them out of the cache file the installed system imports them from);
+	# a new run exports the root pool first
+	zfs unmount -a 2> /dev/null || :
+	;;
 esac
 sync
-echo 'done, remove the install media and reboot'
+if [ "$progress" -eq 1 ]; then
+	step 100 'The system is installed'
+else
+	echo 'done, remove the install media and reboot'
+fi
 exit 0

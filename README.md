@@ -9,6 +9,62 @@ are built with stock release(7)-style tooling:
 `src/release/<arch>/mkisoimages.sh` for ISOs. License: BSD-2-Clause (see
 `LICENSE`).
 
+## What it looks like
+
+The desktop ISO of ExampleBSD (the placeholder product of this template) on
+FreeBSD 16.0-CURRENT, amd64, in a bhyve VM with a 1280x1024 display and two
+empty disks: the graphical installer of the installer-template puts the
+system on an encrypted ZFS mirror of both. The disk serials are made-up
+ones; the account is the placeholder `wtfuser`.
+
+**1. Boot** — the product's loader menu: its name, its logo and
+"Welcome to ExampleBSD" (FreeBSD 16.0-CURRENT).
+
+![The ExampleBSD loader menu on FreeBSD 16.0-CURRENT](docs/screenshots/01-boot-loader.png)
+
+**2. The installer opens first** in the live session (user `live`, logged
+in by LightDM), full screen, in the product's colours, with the identity
+line in the lower left (FreeBSD 16.0-CURRENT).
+
+![The ExampleBSD installer welcome page on the FreeBSD 16.0-CURRENT live desktop](docs/screenshots/02-installer-first.png)
+
+**3. "Try the live desktop"** closes it into Xfce; the "Install ExampleBSD"
+icon opens it again (FreeBSD 16.0-CURRENT live session).
+
+![The Xfce live desktop of ExampleBSD on FreeBSD 16.0-CURRENT with the Install ExampleBSD icon](docs/screenshots/03-live-desktop.png)
+
+**4. The disk page**: the live medium is not offered; the two disks are
+used together, as a mirror (FreeBSD 16.0-CURRENT).
+
+![The ExampleBSD installer disk page with a two-disk mirror on FreeBSD 16.0-CURRENT](docs/screenshots/04-disk.png)
+
+**5. The summary**: both disks erased, each with an EFI partition, swap and
+its half of the ZFS mirror, encrypted with GELI (FreeBSD 16.0-CURRENT).
+
+![The ExampleBSD installer summary of an encrypted two-disk mirror on FreeBSD 16.0-CURRENT](docs/screenshots/05-summary.png)
+
+**6. Installing**: `examplebsd-install --progress` copies the system from
+the live medium onto the new pool (FreeBSD 16.0-CURRENT).
+
+![The ExampleBSD installer copying the system on FreeBSD 16.0-CURRENT](docs/screenshots/06-installing.png)
+
+**7. The first boot of the installed system**: the loader asks for the
+GELI passphrase, once for both disks (FreeBSD 16.0-CURRENT).
+
+![The GELI passphrase prompt of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/07-geli-prompt.png)
+
+**8. The login screen**: the product's greeter, no autologin, no live user;
+the full name comes from the installer (installed ExampleBSD on FreeBSD
+16.0-CURRENT).
+
+![The LightDM login screen of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/08-login-screen.png)
+
+**9. The user's Xfce desktop** after the login, with the product's
+wallpaper and no volume icon for the EFI partitions (installed ExampleBSD on
+FreeBSD 16.0-CURRENT).
+
+![The Xfce desktop of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/09-user-desktop.png)
+
 ## Layout
 
 ```
@@ -38,6 +94,11 @@ are built with stock release(7)-style tooling:
         └── desktop/         X11 only: packages.list, branding.conf, rc.conf.d/{dbus,lightdm,xorg_fallback},
                            rc.d/xorg_fallback, usr/local/share/@SLUG@/xorg/20-scfb.conf,
                            lightdm configs under rootfs/usr/local/etc (lightdm.conf.d/50-@SLUG@.conf)
+    └── live/                the live desktop ISO only (never in the raw image):
+        ├── rootfs/          copied over the stage for the ISO: LightDM autologin, the
+        │                    installer autostart, menu entry and icon, the stand-in launcher
+        └── etc/             copied over the ISO's /etc archive: rc.d/live_session,
+                             rc.conf.d/{live_session,xorg_fallback}
 ```
 
 ## Overlay rules
@@ -95,7 +156,15 @@ FULLNAME=Alice                       # no ':' / control characters, optional (de
 SSH_KEY=ssh-ed25519 <base64> ci@host # one authorized_keys line, may repeat (required)
 PASSWORD_HASH=$6$...                 # crypt(3), $6$ or $2b$ only, optional ($6$|$2b$)
 WHEEL=yes                            # yes|no, default yes
+HOSTNAME=host.example.org            # RFC 1123, optional: rc.conf.d/hostname
+TIMEZONE=Europe/Paris                # a file of /usr/share/zoneinfo, optional: /etc/localtime
+KEYMAP=fr                            # a vt(4) keymap, optional: rc.conf.d/syscons + X layout
+DOAS_NOPASS=yes                      # yes|no, default no: "permit nopass USER" in doas.conf
+NETWORK=vtnet0:192.0.2.10/24:192.0.2.1  # IF:ADDR/MASK[:GW] or IF:dhcp, may repeat
 ```
+
+Without a `NETWORK` line every interface uses DHCP (`ifconfig_DEFAULT` in
+`/etc/rc.conf.d/netif`); a gateway goes to `/etc/rc.conf.d/routing`.
 
 The config is validated line by line, the user is created with
 `pw useradd -n USER -c FULLNAME -m -s /bin/sh [-G wheel]`, a given hash is
@@ -117,21 +186,167 @@ For CI/test images, `build.sh` bakes the same conf in:
 
 For real installs, boot the ISO (it carries the raw image as
 `/usr/local/share/<slug>/install/system.img.xz` (xz-compressed; ISO9660 cannot hold files over 4 GiB), added just before the ISO is
-packed and removed again afterwards). Root is locked, so the ISO starts the
-installer on the console by itself (an ISO-only `/etc/rc.local`, like stock
-FreeBSD install media); it can also be run by hand:
+packed and removed again afterwards). Root is locked, so the appliance ISO
+starts the installer on the console by itself (an ISO-only `/etc/rc.local`,
+like stock FreeBSD install media). The desktop ISO is a live desktop (see
+**The live desktop ISO** below). The installer can also be run by hand:
 
 ```
-<slug>-install [-d disk] [-u user] [-k pubkeyfile] [-p] [-y]
+<slug>-install [-d disk | -p planfile] [-u user] [-k pubkeyfile] [-H hashfile]
+               [-c fullname] [-P] [-A] [-n hostname] [-z timezone] [-Z utc|local]
+               [-K keymap] [-L locale] [-r locked|roothashfile] [-E passphrasefile]
+               [-N if:addr/mask:gw | -N if:dhcp ...] [-6 if:slaac | -6 if:addr6/len:gw6 ...]
+               [-D dns ...] [-W wififile] [-U] [-l acceptfile] [-y] [--progress]
 ```
 
 It lists disks from `kern.disks` (menu via `bsddialog` when available),
-refuses the disk holding the running root, confirms unless `-y`, dd's the
-image, recovers/resizes the partition table, grows UFS with `growfs -y`
-or the ZFS pool with `zpool online -e`, writes the same first-boot conf
-(keys prompted or from `-k`, password hashed via `openssl passwd -6`
-with echoing turned off via `stty`), then unmounts/exports and asks you
-to remove the media and reboot.
+refuses the disks holding the running root (the live media: the cd9660
+label of the ISO is resolved with `glabel status`, so an ISO written to a
+USB stick is refused too), confirms unless `-y`, dd's the image,
+recovers/resizes the partition table, grows UFS with `growfs -y` or the ZFS
+pool with `zpool online -e`, writes the same first-boot conf, then
+unmounts/exports and asks you to remove the media and reboot.
+Interactively it asks for the user, an optional ssh key and a password
+(required when there is no key), hashed via `openssl passwd -6` with
+echoing turned off via `stty`.
+
+`-p PLANFILE` is the disk plan of the graphical installer (JSON, mode
+0600, at most 64 KiB), checked again by
+`/usr/local/libexec/<slug>/install-plan` (python3) before anything is
+written. Two ways of installing an `erase` plan:
+
+- **image**: one disk, layout `single`, the file system of the image, no
+  encryption, no data pools — the image is written (`dd`), the partition
+  table and the root grown, and swap (`swap_mb`) added at the end of the
+  disk (`encryption.swap`: `.eli`, a one-time key).
+- **copy**: everything else on ZFS — `single`, `stripe`, `mirror`,
+  `raid10`, `raidz1`-`raidz3` across the system disks, GELI full-disk
+  encryption (`encryption.enabled`, the passphrase from `-E`, asked by the
+  loader at boot: `geli init -b -g`), data pools (`data[]`, each with its
+  own layout and mount point) and `usage: separate`. Every system disk gets
+  GPT with `freebsd-boot` (`gptzfsboot`), an EFI partition (`loader.efi`),
+  swap and `freebsd-zfs`; the pool is made, and the system is copied from a
+  second read-only mount of the live media's cd9660 root, leaving out the
+  live layer (`live-paths` next to the image) and restoring the files it
+  replaced and the image's own fstab (`orig/`).
+
+`alongside` and `manual` plans, a secure wipe, and UFS on more than one
+disk or encrypted are refused with an `ERROR` line naming what is missing.
+`-L` (the default login class's `lang`), `-Z`, `-r FILE` (root's own
+password; root stays locked otherwise), `-A` (LightDM autologin of the
+user), `-6`, `-D` (`resolvconf.conf`), `-W` (a 0600 JSON Wi-Fi network:
+`wpa_supplicant.conf` written straight to the target, `wlan0` on the
+adapter; the key is never in a log or the first-boot conf) and `-U` (one
+`pkg upgrade` after the first boot, every package that owns a kernel
+module locked) reach the installed system through the first-boot conf.
+`-l ACCEPTFILE` (0600 JSON) may only name items of
+`/usr/local/share/<slug>/licensed-software.json`, and is recorded as
+`/var/db/<slug>/licenses-accepted.json`. The catalogue is empty in the
+template: nothing in the default package lists needs a licence to be
+accepted.
+
+`-H HASHFILE` names a mode 0600 file holding the crypt(3) hash of the
+password (`$6$` or `$2b$`): the cleartext never touches the disk or the
+command line. `-n`, `-z` and `-K` give the host name, the time zone (a name
+under `/usr/share/zoneinfo`) and the vt(4) keymap of the installed system
+(its first part, `uk` as `gb`, becomes the X keyboard layout). `-c` is the
+full name of the account, `-P` lets it run doas without a password, `-N`
+(repeatable) sets the network; without `-N` every wired interface uses
+DHCP. Every path in the installer-template's `MANIFEST`
+(`/usr/local/share/wtfbsd-installer/MANIFEST` on the live system) is
+removed from the installed system.
+`--progress` is the graphical installer's mode: nothing is asked (`-d`,
+`-u` and `-y` are required), and stdout carries only `PROGRESS <0-100>
+<message>` lines and an `ERROR <message>` line before a non-zero exit;
+the output of the tools goes to stderr. The image is written between 5 and
+70, from the bytes `dd status=progress` reports against the size `xz -l`
+gives.
+
+## Branding and the identity line
+
+`build.sh` step [4b] installs the product's artwork from a pre-rendered pack
+of the artwork template, pinned by commit (`ARTWORK_REF`, default the
+commit pinned in build.sh; `ARTWORK_VARIANT`, default `default`, e.g.
+`cyberpunk`), fetched from the artwork template's releases (or
+`ARTWORK_PACK`, a local copy) and refused unless its sha256 is the pinned
+one (`ARTWORK_SHA256` for another product or commit). `ARTWORK_REF=none`
+builds without branding.
+
+- Every row of the pack's `branding/spots.tsv` whose `freebsd` column (read
+  by its header name) is not `n/a` or `check` is installed: the Lua loader
+  brand and logo, the menu title and the vt splash, the motd, the getty
+  banner and `/etc/issue`, the LightDM greeter background and theme, the
+  xdm logo and colours, the installer header, side panel and palette, the
+  wallpapers, the icons and the Xfce theme. A supported spot this template
+  does not know fails the build.
+- `/usr/local/share/<slug>/identity` holds PRODUCT, VERSION
+  (`PRODUCT_VERSION`, or the build's year.month), BASE (`FreeBSD` and the
+  release of the built userland, from the stage's `freebsd-version`),
+  VARIANT, ARCH and, on builds without `PRODUCT_VERSION`, BUILD.
+- The identity line (`ExampleBSD 2026.11 · FreeBSD 16.0-CURRENT · Default ·
+  amd64`) is stamped in the lower left of the greeter background and of
+  every wallpaper (the pack's `identity-stamp.sh`, which needs ImageMagick
+  on the build host: `pkg install ImageMagick7-nox11`).
+
+The EFI partition is mounted on `/boot/efi` (`failok`), as the stock
+installer does, so the desktop shows no volume icon for it. A copy install
+gives every system disk an EFI partition and mounts each by its GPT label:
+`/dev/gpt/efiboot0` on `/boot/efi`, `efiboot1` on `/boot/efi1` and so on.
+xfdesktop 4.20 keys the wallpaper by the name of the display output; the
+build adds the `default` output of the scfb and vesa drivers to the pack's
+list. The desktop
+profile ships `noto-emoji` (SIL Open Font License 1.1) for colour emoji,
+the language flags of the installer among them.
+
+## The live desktop ISO
+
+The desktop ISO boots a live Xfce session with the installer open first.
+Everything that makes it live is in `overlay/live` and reaches only the
+ISO: `build.sh` adds it in step [6b], after the raw image [6] is written,
+and takes every path it added out again after the ISO [7] (the files it
+replaced come back), so the installed system has no live user, no
+autologin and no installer autostart.
+
+- **Read-only root.** The ISO's root is cd9660. `build.sh` puts
+  `/etc/diskless` and `/conf/base/{etc,var,root,home}.cpio.gz` (plus an
+  `md_size` for each) on the ISO, and the stock `rc.initdiskless`, which
+  `/etc/rc` runs when `/etc/diskless` exists, mounts a memory disk on each
+  of `/etc`, `/var`, `/root` and `/home` and unpacks the archive into it
+  before any rc.d script runs (the mechanism of NanoBSD and diskless(8)
+  machines). `/tmp` gets its memory disk from `rc.d/tmp` (`tmpmfs=AUTO`).
+  The archived `/etc` is the stage's plus `overlay/live/etc`.
+- **The live user.** `rc.d/live_session` (in the archived `/etc` only)
+  makes `live` on every boot of the media: the first free uid from 1100,
+  no password, the installer's autostart entry
+  (`/usr/local/share/wtfbsd-installer/autostart/wtfbsd-installer.desktop`)
+  in its `~/.config/autostart` and the "Install" icon on its desktop.
+- **The session.** LightDM logs `live` in to Xfce
+  (`lightdm.conf.d/60-<slug>-live.conf`); the autostart entry opens the
+  installer launcher `/usr/local/bin/wtfbsd-installer`. The front ends (GTK
+  and text) run as `live`, which is not in wheel; the ISO's `doas.conf`
+  gets one rule, `permit nopass live as root cmd
+  /usr/local/libexec/wtfbsd-installer/installer-apply` (no keepenv, no
+  setenv), for the installer's GTK-free helper: a GTK program running as
+  root on the user's display would load modules the user controls. The
+  stand-in launcher runs the text installer through a stand-in of that
+  helper inside an `xterm` of the live user. "Try the live desktop"
+  (the installer exits 10) leaves the Xfce session; the desktop icon and
+  the menu entry "Install <product>" open it again.
+- **The installer.** The launcher comes from the installer-template: its
+  `install-into-stage.sh` is run on the stage. `product.conf` names it with
+  `INSTALLER_DIR` (a local checkout, copied into the build) or
+  `INSTALLER_REF` (a git ref, cloned from `INSTALLER_URL`, by default the
+  public installer-template repository; unset, the merged main pinned in
+  build.sh, which needs git and the network). `INSTALLER_REF=none` carries a
+  stand-in launcher and root helper that run the text installer full
+  screen in `xterm` instead. The tree must install the launcher and the helper.
+  The graphical installer calls `<slug>-install ... -y --progress`.
+- **Serial and headless.** The archived `/etc/ttys` runs getty on `ttyu0`
+  (when it is the console) with a `live.tui` gettytab entry that logs in
+  automatically into `/usr/local/libexec/<slug>/live-tui`: the text
+  installer, then install again / shell / reboot / power off.
+- **X.** The scfb fallback of `rc.d/xorg_fallback` goes to the writable
+  `/etc/X11/xorg.conf.d` on the live media (Xorg reads it as well).
 
 ## Building
 

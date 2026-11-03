@@ -13,12 +13,10 @@ printf 'mktemp %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
 _dir=${TMPDIR:-/tmp}
 _prefix=tmp
+_mkdir=no
 while [ $# -gt 0 ]; do
 	case $1 in
-	-d)
-		_dir=$2
-		shift
-		;;
+	-d) _mkdir=yes ;; # as on FreeBSD: make a directory
 	-t) ;;
 	*) _prefix=$1 ;;
 	esac
@@ -34,6 +32,10 @@ while :; do
 	[ ! -e "$_f" ] && break
 	_n=$((_n + 1))
 done
-: > "$_f" || exit 1
+if [ "$_mkdir" = yes ]; then
+	mkdir "$_f" || exit 1
+else
+	: > "$_f" || exit 1
+fi
 printf '%s\n' "$_f"
 exit 0

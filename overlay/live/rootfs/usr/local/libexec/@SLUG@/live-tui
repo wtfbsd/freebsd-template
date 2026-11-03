@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# live-tui — the text installer on the serial console of the live ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Live ISO only. /etc/ttys runs getty(8) on ttyu0 with the gettytab entry
+# that build.sh adds to the ISO's /etc (autologin, this file as the login
+# program): getty starts it as "login -fp root" on the terminal, and init(8)
+# starts getty again when it exits. The arguments are not used. On a
+# headless machine with a serial console this is the installer; with a
+# display, the graphical session runs at the same time.
+
+TERM=${TERM:-vt100}
+export TERM
+/usr/local/sbin/@SLUG@-install
+printf '\n[i]nstall again, [s]hell, [r]eboot, [p]oweroff? '
+read -r _a || _a=''
+case $_a in
+s) exec /bin/sh -l ;;
+r) exec /sbin/shutdown -r now ;;
+p) exec /sbin/shutdown -p now ;;
+esac
+exit 0

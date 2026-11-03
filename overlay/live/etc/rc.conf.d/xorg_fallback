@@ -1,0 +1,9 @@
+# rc.conf.d/xorg_fallback — the X fallback on the live ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# The ISO's /usr/local is read-only, and /etc is a memory disk: on the live
+# media the scfb fallback goes to /etc/X11/xorg.conf.d, which Xorg reads
+# as well as /usr/local/etc/X11/xorg.conf.d. Live ISO only.
+xorg_fallback_enable="YES"
+xorg_fallback_dir="/etc/X11/xorg.conf.d"

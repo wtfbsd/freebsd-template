@@ -3,14 +3,26 @@
 #
 # Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
 #
-# Logs its arguments to $STUB_LOG. Without arguments it prints the
-# mount table of the live system (the root of the live image is a ramfs,
-# not a device under /dev, so the table has no entry for "/").
+# Logs its arguments to $STUB_LOG. With -p it prints the mount table of
+# the live system in the fstab(5) form ("device mountpoint type options
+# 0 0"); without arguments in the form of mount(8) itself ("device on
+# mountpoint (type, options)"). The root line comes from $STUB_MOUNT_ROOT
+# in the -p form (for example the cd9660 root of the live ISO); without
+# it the table has no entry for "/" (a ramfs root, not a device under
+# /dev).
 
 printf 'mount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
-if [ $# -eq 0 ]; then
-	printf 'devfs /dev devfs rw 0 0\n'
-	printf 'tmpfs /tmp tmpfs rw 0 0\n'
+_table() {
+	if [ -n "${STUB_MOUNT_ROOT:-}" ]; then
+		printf '%s\n' "$STUB_MOUNT_ROOT"
+	fi
+	printf 'devfs\t/dev\tdevfs\trw\t0\t0\n'
+	printf 'tmpfs\t/tmp\ttmpfs\trw\t0\t0\n'
+}
+if [ "$*" = -p ]; then
+	_table
+elif [ $# -eq 0 ]; then
+	_table | awk '{ printf "%s on %s (%s, %s)\n", $1, $2, $3, $4 }'
 fi
 exit 0

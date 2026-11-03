@@ -1,0 +1,11 @@
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+# The stand-in "Install" entry of the menu of the live ISO (live ISO only;
+# the installer-template's install-into-stage.sh replaces it).
+[Desktop Entry]
+Type=Application
+Name=Install @DISTRO_NAME@
+Comment=Install @DISTRO_NAME@ on a disk of this machine
+Exec=/usr/local/bin/wtfbsd-installer
+Icon=system-software-install
+Terminal=false
+Categories=System;
