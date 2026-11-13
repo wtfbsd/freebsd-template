@@ -14,6 +14,82 @@
 
 printf 'gpart %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
+# With $STUB_GEOM (a directory, the device directory of the run) the stub
+# keeps the partition tables it made and the GPT labels GEOM makes from
+# them, the way the kernel does:
+#
+#   $STUB_GEOM/.gpart/<disk>/n      the last partition index of <disk>
+#   $STUB_GEOM/.labels/<label>      the provider GEOM gave gpt/<label>
+#   $STUB_GEOM/gpt/<label>          the /dev/gpt/<label> node (the same)
+#
+# `gpart add -l LABEL` names the partition in the table, but GEOM makes no
+# second provider with a name that exists ("Label gpt/LABEL already
+# exists"): the label stays with the partition that had it first, on
+# whatever disk that is. `gpart destroy -F` refuses a disk a GELI provider,
+# a pool or a mount still holds ("Device busy"). A disk the stub made no
+# table for is the canned one below (three partitions).
+if [ -n "${STUB_GEOM:-}" ]; then
+	_G=$STUB_GEOM
+	for _a in "$@"; do _last=$_a; done
+	_d=${_last#/dev/}
+	case $1 in
+	create)
+		if [ -d "$_G/.gpart/$_d" ]; then
+			echo "gpart: geom '$_d': File exists" >&2
+			exit 1
+		fi
+		mkdir -p "$_G/.gpart/$_d"
+		echo 0 > "$_G/.gpart/$_d/n"
+		echo "$_d created"
+		exit 0
+		;;
+	destroy)
+		[ -d "$_G/.gpart/$_d" ] || exit 0
+		# a holder of a partition of the disk: a GELI provider, a pool, a mount
+		if cat "$_G"/.geli/* "$_G"/.pools/* "$_G/.mounts" 2> /dev/null \
+			| awk -v d="$_d" '{ for (i = 1; i <= NF; i++) if ($i ~ "^(/dev/)?" d "p[0-9]+$") f = 1 } END { exit !f }'; then
+			echo "gpart: Device busy" >&2
+			exit 1
+		fi
+		for _l in "$_G"/.labels/*; do
+			[ -f "$_l" ] || continue
+			if grep -Eqx "${_d}p[0-9]+" "$_l"; then
+				rm -f "$_l" "$_G/gpt/${_l##*/}"
+			fi
+		done
+		rm -rf "$_G/.gpart/$_d"
+		echo "$_d destroyed"
+		exit 0
+		;;
+	add)
+		_lab=''
+		_prev=''
+		for _a in "$@"; do
+			[ "$_prev" = -l ] && _lab=$_a
+			_prev=$_a
+		done
+		if [ ! -d "$_G/.gpart/$_d" ]; then
+			mkdir -p "$_G/.gpart/$_d"
+			echo 3 > "$_G/.gpart/$_d/n"
+		fi
+		_n=$(($(cat "$_G/.gpart/$_d/n") + 1))
+		echo "$_n" > "$_G/.gpart/$_d/n"
+		_prov=${_d}p$_n
+		if [ -n "$_lab" ]; then
+			if [ -e "$_G/.labels/$_lab" ]; then
+				printf 'GEOM_LABEL: Label gpt/%s already exists (%s)\n' "$_lab" "$_prov" >> "${STUB_LOG:-/dev/null}"
+			else
+				mkdir -p "$_G/.labels" "$_G/gpt"
+				printf '%s\n' "$_prov" > "$_G/.labels/$_lab"
+				printf '%s\n' "$_prov" > "$_G/gpt/$_lab"
+			fi
+		fi
+		echo "$_prov added"
+		exit 0
+		;;
+	esac
+fi
+
 case $1 in
 show)
 	_p=''
