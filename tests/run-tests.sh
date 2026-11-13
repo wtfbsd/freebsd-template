@@ -2284,7 +2284,12 @@ fi
 #      left as they were. A configuration path with a space in it works.
 _k7=$work/k7
 mkdir -p "$_k7/bin" "$_k7/rootdir" "$_k7/etc"
-cp "$STUBS/pw" "$STUBS/logger" "$_k7/bin/"
+cp "$STUBS/logger" "$_k7/bin/"
+cat > "$_k7/bin/pw" <<'K7PW'
+#!/bin/sh
+printf 'pw %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+[ "$1" != useradd ] || cat "$K7_NEWUSER" >> "$K7_PASSWD"
+K7PW
 cat > "$_k7/bin/chown" <<'K7CHOWN'
 #!/bin/sh
 printf 'chown %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
@@ -2296,7 +2301,8 @@ cp "$_k7/etc/master.passwd" "$_k7/master.passwd.orig"
 # every function of the script, with the password file of the test tree
 awk '/^[a-z_]+\(\) \{/,/^\}/' "$_fbrc" | sed "s#/etc/passwd#$_k7/passwd#g" > "$_k7/functions.sh"
 _k7run() { # _k7run <name> <home> <conf> — run the start command once
-	printf 'fbuser:*:1001:1001:Fb User:%s:/bin/sh\n' "$2" > "$_k7/passwd"
+	: > "$_k7/passwd"
+	printf 'fbuser:*:1001:1001:Fb User:%s:/bin/sh\n' "$2" > "$_k7/passwd.new"
 	printf 'USERNAME=fbuser\nWHEEL=no\nSSH_KEY=ssh-ed25519 %s k7\n' 'k7data' > "$3"
 	{
 		cat "$_k7/functions.sh"
@@ -2304,7 +2310,8 @@ _k7run() { # _k7run <name> <home> <conf> — run the start command once
 		printf 'firstboot_user_conf=%s\n' "'$3'"
 		echo 'firstboot_user_start'
 	} > "$_k7/$1.sh"
-	PATH="$_k7/bin:$PATH" STUB_LOG="$_k7/$1.stub" sh "$_k7/$1.sh" > "$_k7/$1.out" 2>&1
+	PATH="$_k7/bin:$PATH" STUB_LOG="$_k7/$1.stub" K7_PASSWD="$_k7/passwd" K7_NEWUSER="$_k7/passwd.new" \
+		sh "$_k7/$1.sh" > "$_k7/$1.out" 2>&1
 	_k7rc=$?
 }
 # .ssh is a link to a directory of root
@@ -3746,7 +3753,7 @@ mkdir -p "$_pr/boot" "$_pr/etc/rc.conf.d" "$_pr/usr/share/zoneinfo/Europe" "$_pr
 printf 'Paris zone data\n' > "$_pr/usr/share/zoneinfo/Europe/Paris"
 : > "$_pr/usr/share/vt/keymaps/fr.kbd"
 : > "$_pr/usr/share/vt/keymaps/uk.kbd"
-printf 'wtfuser:*:1001:1001:wtfuser:/home/wtfuser:/bin/sh\n' > "$_pr/etc/passwd"
+printf 'root:*:0:0:Charlie &:/root:/bin/sh\n' > "$_pr/etc/passwd"
 for _s in pw chown logger; do
 	cp "$STUBS/$_s" "$work/fbr-bin/"
 	chmod +x "$work/fbr-bin/$_s"
@@ -4049,8 +4056,8 @@ cp "$_ns/etc/fstab" "$_n/fstab.saved" 2> /dev/null || : > "$_n/fstab.saved"
 cp "$_n/fstab.image" "$_ns/etc/fstab"
 _nrun manifest
 _ni2="$_ns/usr/local/share/examplebsd/install"
-if [ "$_nrc" -eq 0 ] && grep -qx './conf' "$_ni2/live-paths" 2> /dev/null && grep -qx './etc/diskless' "$_ni2/live-paths" &&
-	grep -qx './usr/local/share/examplebsd/install' "$_ni2/live-paths" &&
+if [ "$_nrc" -eq 0 ] && grep -qxF '^./conf' "$_ni2/live-paths" 2> /dev/null && grep -qxF '^./etc/diskless' "$_ni2/live-paths" &&
+	grep -qxF '^./usr/local/share/examplebsd/install' "$_ni2/live-paths" &&
 	cmp -s "$_ni2/orig/etc/fstab" "$_n/fstab.image" && grep -qx 'permit persist :wheel' "$_ni2/orig/usr/local/etc/doas.conf" &&
 	[ "$(cat "$_ni2/system.pool")" = examplebsd_root ] && [ "$(cat "$_ni2/system.kb")" = 4242 ]; then
 	ok "live ISO: the copy install gets the live layer's paths, the replaced originals, the image's fstab, the pool name"
@@ -4698,5 +4705,253 @@ if grep -qx 'netif restart' "$_nr/calls" 2> /dev/null && grep -qx 'dhclient quie
 else
 	no "firstboot_user: after the netif restart, dhclient is asked for every interface (quietstart skips the ones not on DHCP)"
 fi
+# ------------------------------------------------------------------
+# (r) review fixes, one section: install-plan refuses a data pool that
+#     would take a system directory, a name zpool or the system holds, or
+#     a GPT label longer than 36 characters (all before a disk is
+#     touched); build.sh anchors the live paths it lists for tar -X; and
+#     firstboot_user leaves an account that existed before it alone.
+# ------------------------------------------------------------------
+_rf="$work/rf"
+mkdir -p "$_rf"
+# (r1) the plan checks, on the planner itself
+sed -e 's|@SLUG@|examplebsd|g' "$repo/overlay/base/rootfs/usr/local/libexec/@SLUG@/install-plan" > "$_rf/install-plan"
+_rfd() { # _rfd <name> <mount> [disk] — one data entry of a plan
+	printf '{"name":"%s","disks":["%s"],"layout":"single","filesystem":"zfs","mount":"%s"}' "$1" "${3:-nvd0}" "$2"
+}
+_rfplan() { # _rfplan <planner> <data entries> — rc in _rfrc
+	printf '{"version":1,"mode":"erase","disks":["vtbd0"],"layout":"single","filesystem":"zfs","data":[%s]}\n' "$2" > "$_rf/plan.json"
+	chmod 600 "$_rf/plan.json"
+	python3 -I "$1" "$_rf/plan.json" zfs > "$_rf/plan.out" 2> "$_rf/plan.err"
+	_rfrc=$?
+}
+_rfbad='' _rfgood=''
+_rfno() { # _rfno <regex> <data entries> [planner] — refused: rc 2, one line on stderr, nothing on stdout
+	_rfplan "${3:-$_rf/install-plan}" "$2"
+	if [ "$_rfrc" -ne 2 ] || [ -s "$_rf/plan.out" ] || [ "$(grep -c '' "$_rf/plan.err")" -ne 1 ] ||
+		! grep -Eqi "$1" "$_rf/plan.err"; then
+		_rfbad="$_rfbad [$2 -> rc=$_rfrc: $(head -n 1 "$_rf/plan.err")]"
+	fi
+}
+_rfyes() { # _rfyes <data entries> — taken: rc 0 and a DATA line
+	_rfplan "$_rf/install-plan" "$1"
+	if [ "$_rfrc" -ne 0 ] || ! grep -q '^DATA=' "$_rf/plan.out"; then
+		_rfgood="$_rfgood [$1 -> rc=$_rfrc: $(head -n 1 "$_rf/plan.err")]"
+	fi
+}
+if ! command -v python3 > /dev/null 2>&1; then
+	no "install-plan: the data-pool checks (no python3 to check)"
+else
+	for _rfm in /boot /boot/efi /etc /etc/zfs /lib /libexec /bin /sbin /usr /usr/local /usr/lib /var /var/db \
+		/dev /tmp /root /compat /rescue /proc; do
+		_rfno 'system directory' "$(_rfd data "$_rfm")"
+	done
+	if [ -z "$_rfbad" ]; then
+		ok "install-plan: a data pool on or inside a system directory is refused"
+	else
+		no "install-plan: a data pool on or inside a system directory is refused:$_rfbad"
+	fi
+	_rfbad=''
+	for _rfm in / /data/../etc /data/.. /data/./x /data/ //data /data//x data; do
+		_rfno 'mount point' "$(_rfd data "$_rfm")"
+	done
+	_rfno 'twice' "$(_rfd data /data nvd0),$(_rfd more /data nvd1)"
+	_rfno 'inside' "$(_rfd data /data nvd0),$(_rfd more /data/x nvd1)"
+	_rfno 'inside' "$(_rfd more /data/x nvd1),$(_rfd data /data nvd0)"
+	_rfno 'twice' "$(_rfd data /home nvd0),$(_rfd more /usr/home nvd1)"
+	_rfno 'inside' "$(_rfd data /usr/home nvd0),$(_rfd more /home/alice nvd1)"
+	_rfno 'mount point' "$(_rfd data "/$(printf '%0201d' 0)")"
+	_rfno 'mount point' "$(_rfd data '/data\n')"
+	if [ -z "$_rfbad" ]; then
+		ok "install-plan: a mount point with . or .., an empty component, used twice or nested in another is refused"
+	else
+		no "install-plan: a mount point with . or .., an empty component, used twice or nested in another is refused:$_rfbad"
+	fi
+	_rfbad=''
+	_rfsys=$(DISTRO_SLUG=examplebsd && eval "$(grep '^ROOT_POOL=' "$repo/build.sh")" && printf '%s' "$ROOT_POOL")
+	_rfno 'system pool' "$(_rfd "$_rfsys" /data)"
+	sed -e 's|@SLUG@|my-os|g' "$repo/overlay/base/rootfs/usr/local/libexec/@SLUG@/install-plan" > "$_rf/install-plan-dash"
+	_rfno 'system pool' "$(_rfd my_os_root /data)" "$_rf/install-plan-dash"
+	_rfno 'twice' "$(_rfd data /data nvd0),$(_rfd data /srv nvd1)"
+	for _rfn in mirror mirror2 raidz raidz1 raidz2 raidz3 draid draid2 spare spares log cache special dedup c0data; do
+		_rfno 'reserved' "$(_rfd "$_rfn" /data)"
+	done
+	_rfno 'pool name must match' "$(_rfd 'data\n' /data)"
+	if [ -z "$_rfbad" ]; then
+		ok "install-plan: a data pool named like the system pool ($_rfsys), another data pool or a word zpool reserves is refused"
+	else
+		no "install-plan: a data pool named like the system pool ($_rfsys), another data pool or a word zpool reserves is refused:$_rfbad"
+	fi
+	_rfbad=''
+	_rf32=abcdefghijklmnopqrstuvwxyzabcdef
+	_rfno 'GPT label .*36' "$(_rfd "$_rf32" /data nvd0)"
+	_rfno 'GPT label .*36' "$(_rfd data /data nvd1234567890123456789012345678901)"
+	if [ -z "$_rfbad" ]; then
+		ok "install-plan: a data pool whose GPT label <pool>-<disk> is longer than 36 characters is refused"
+	else
+		no "install-plan: a data pool whose GPT label <pool>-<disk> is longer than 36 characters is refused:$_rfbad"
+	fi
+	# what stays allowed: the user's own places, names that only look close
+	for _rfm in /data /srv/www /home /usr/home /usr/home/alice /mnt/data /usrdata /bootstrap /variable; do
+		_rfyes "$(_rfd data "$_rfm")"
+	done
+	_rfyes "$(_rfd data /data nvd0),$(_rfd more /data2 nvd1)"
+	_rfyes "$(_rfd logs /data)"
+	_rfyes "$(_rfd tank /data)"
+	_rfyes "$(_rfd "${_rf32%?}" /data nvd0)"
+	_rfyes "$(_rfd data "/$(printf '%0199d' 0)")"
+	_rfyes "$(_rfd data /home nvd0),$(_rfd more /homes nvd1)"
+	if [ -z "$_rfgood" ]; then
+		ok "install-plan: /home, /usr/home, /srv, /data and look-alike names stay allowed (a 36-character label too)"
+	else
+		no "install-plan: /home, /usr/home, /srv, /data and look-alike names stay allowed (a 36-character label too):$_rfgood"
+	fi
+fi
+# (r1b) the install command stops on the planner's refusal: no disk is touched
+_pplan rfsys '{"version":1,"mode":"erase","usage":"separate","disks":["vtbd0"],"layout":"single","filesystem":"zfs","swap_mb":0,"data":[{"name":"data","disks":["nvd0"],"layout":"single","filesystem":"zfs","mount":"/etc"}]}'
+IR_SRCROOT=$_cs
+irun rfsys "$INSTDIR/mnt-rfsys" -p "$work/plan-rfsys.json" -u wtfuser -H "$work/o.hash" -y --progress
+IR_SRCROOT=''
+if [ -n "$_nopy" ]; then
+	no "install -p: a data pool on /etc is refused before any disk is touched (no python3 to check)"
+elif [ "$_ir_rc" -ne 0 ] && grep -q 'system directory' "$INSTDIR/rfsys.out" "$INSTDIR/rfsys.err" 2> /dev/null &&
+	! grep -Eq '^(gpart|zpool|geli|newfs_msdos|dd) ' "$INSTDIR/rfsys.log"; then
+	ok "install -p: a data pool on /etc is refused before any disk is touched"
+else
+	no "install -p: a data pool on /etc is refused before any disk is touched (rc=$_ir_rc)"
+	sed 's/^/      | /' "$INSTDIR/rfsys.out" "$INSTDIR/rfsys.err" "$INSTDIR/rfsys.log" 2> /dev/null | head -8
+fi
+# (r2) the live paths: build.sh lists the live layer for the install
+#      command's "tar -cf - -X live-paths .", and bsdtar matches an
+#      exclusion at any path component unless it is anchored. The list
+#      build.sh writes is run through the real bsdtar on a fake stage.
+_rs="$_rf/stage" _rw="$_rf/w"
+mkdir -p "$_rs/etc" "$_rs/usr/home/alice" "$_rs/usr/local/share/foo/conf" "$_rs/usr/local/lib" "$_rs/var/etc" "$_rw/.live-backup"
+printf '# Device\tMountpoint\n' > "$_rs/etc/fstab"
+for _rff in usr/home/alice/keep.me usr/local/share/foo/conf/keep.me usr/local/lib/liveness usr/local/lib/live1 var/etc/diskless; do
+	printf 'system\n' > "$_rs/$_rff"
+done
+{
+	awk '/^live_snapshot\(\) \{/,/^\}/' "$repo/build.sh"
+	awk '/^live_manifest\(\) \{/,/^\}/' "$repo/build.sh"
+} > "$_rf/live.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	. "$_rf/live.sh"
+	live_snapshot "$_rs" "$_rw/.live-before"
+	# the live layer: /conf, a /home the stage did not have, /etc/diskless,
+	# the install directory, and a name with a glob character in it
+	mkdir -p "$_rs/conf/base" "$_rs/home/live" "$_rs/usr/local/share/examplebsd/install"
+	: > "$_rs/conf/base/etc.cpio.gz"
+	: > "$_rs/home/live/.profile"
+	: > "$_rs/etc/diskless"
+	: > "$_rs/usr/local/lib/live*"
+	: > "$_rs/usr/local/lib/live[1]"
+	: > "$_rs/usr/local/share/examplebsd/install/system.img.xz"
+	LIVE_BACKUP="$_rw/.live-backup" ROOT_POOL=examplebsd_root
+	live_manifest "$_rs" "$_rw" "$_rs/usr/local/share/examplebsd/install" 1
+) > "$_rf/live.log" 2>&1
+_rfrc=$?
+_rfbt=''
+if tar --version 2> /dev/null | grep -q bsdtar; then
+	_rfbt=tar
+elif command -v bsdtar > /dev/null 2>&1; then
+	_rfbt=bsdtar
+fi
+if [ -z "$_rfbt" ]; then
+	no "live paths: tar -X with the list build.sh writes (no bsdtar to check)"
+elif [ "$_rfrc" -ne 0 ] || [ ! -s "$_rs/usr/local/share/examplebsd/install/live-paths" ]; then
+	no "live paths: tar -X with the list build.sh writes (live_manifest rc=$_rfrc)"
+	sed 's/^/      | /' "$_rf/live.log" | head -5
+else
+	(cd "$_rs" && "$_rfbt" -cf - -X "$_rs/usr/local/share/examplebsd/install/live-paths" .) | "$_rfbt" -tf - > "$_rf/copied" 2> "$_rf/copied.err"
+	_rfmiss='' _rfleak=''
+	for _rff in ./usr/home/alice/keep.me ./usr/local/share/foo/conf/keep.me ./usr/local/lib/liveness ./usr/local/lib/live1 \
+		./var/etc/diskless ./etc/fstab; do
+		grep -qxF "$_rff" "$_rf/copied" || _rfmiss="$_rfmiss $_rff"
+	done
+	for _rff in ./conf ./home ./etc/diskless './usr/local/lib/live*' './usr/local/lib/live[1]' ./usr/local/share/examplebsd/install; do
+		if grep -qxF "$_rff" "$_rf/copied" || grep -qF "$_rff/" "$_rf/copied"; then
+			_rfleak="$_rfleak $_rff"
+		fi
+	done
+	if [ -z "$_rfmiss$_rfleak" ]; then
+		ok "live paths: tar -X with the list build.sh writes leaves out the live layer only (nested conf/, usr/home, glob characters survive)"
+	else
+		no "live paths: tar -X with the list build.sh writes leaves out the live layer only (dropped:${_rfmiss:- none}; copied:${_rfleak:- none})"
+	fi
+fi
+# (r3) firstboot_user: a USERNAME that is already an account (operator,
+#      a system account) gets no password, keys, doas rule or autologin;
+#      the rest of the configuration still applies. A new name still
+#      gets its account.
+_rfr="$_rf/fbroot"
+mkdir -p "$_rfr/boot" "$_rfr/etc/rc.conf.d" "$_rfr/usr/local/etc/lightdm/lightdm.conf.d" "$_rf/fbbin"
+cat > "$_rf/fbbin/pw" <<'RFPW'
+#!/bin/sh
+# pw stand-in: logs, answers usershow from $RF_PASSWD, useradd adds the line
+printf 'pw %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+case $1 in
+useradd) printf '%s:*:1002:1002:%s:/home/%s:/bin/sh\n' "$3" "$3" "$3" >> "$RF_PASSWD" ;;
+usershow) grep -q "^$3:" "$RF_PASSWD" ;;
+esac
+RFPW
+cp "$STUBS/chown" "$STUBS/logger" "$_rf/fbbin/"
+chmod +x "$_rf/fbbin/pw" "$_rf/fbbin/chown" "$_rf/fbbin/logger"
+_rffb() { # _rffb <name> <conf lines...> — the first-boot script on its own fake root
+	_rffn=$1
+	shift
+	printf 'root:*:0:0:Charlie &:/root:/bin/sh\noperator:*:2:5:System &:/:/usr/sbin/nologin\n' > "$_rfr/etc/passwd"
+	printf 'permit persist :wheel\n' > "$_rfr/usr/local/etc/doas.conf"
+	rm -rf "${_rfr:?}/.ssh" "${_rfr:?}/home" "${_rfr:?}/etc/rc.conf.d/hostname" \
+		"${_rfr:?}/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf"
+	: > "$_rf/fb-$_rffn.log"
+	printf '%s\n' "$@" > "$_rfr/boot/firstboot-user.conf"
+	{
+		awk '/^[a-z_]+\(\) \{/,/^\}/' "$repo/overlay/base/rootfs/etc/rc.d/firstboot_user"
+		echo 'root_writable() { return 0; }'
+		echo 'note() { echo "firstboot_user: $*"; }'
+		echo "firstboot_user_conf=$_rfr/boot/firstboot-user.conf"
+		echo "firstboot_user_root=$_rfr"
+		echo 'firstboot_user_start'
+	} > "$_rf/fb-$_rffn.sh"
+	PATH="$_rf/fbbin:$PATH" STUB_LOG="$_rf/fb-$_rffn.log" RF_PASSWD="$_rfr/etc/passwd" \
+		sh "$_rf/fb-$_rffn.sh" > "$_rf/fb-$_rffn.out" 2>&1
+	_rffrc=$?
+}
+_rffb op USERNAME=operator "SSH_KEY=ssh-ed25519 rfdata rf" "PASSWORD_HASH=$_oh" WHEEL=yes DOAS_NOPASS=yes AUTOLOGIN=yes \
+	HOSTNAME=host.example.org
+if ! grep -q '^pw use[a-z]* -n operator' "$_rf/fb-op.log" &&
+	[ ! -e "$_rfr/.ssh" ] && ! grep -q operator "$_rfr/usr/local/etc/doas.conf" &&
+	[ ! -e "$_rfr/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" ] &&
+	[ "$(grep -c 'operator' "$_rf/fb-op.out")" -eq 1 ] && grep -q 'operator.*exists' "$_rf/fb-op.out" &&
+	grep -qx 'hostname="host.example.org"' "$_rfr/etc/rc.conf.d/hostname" 2> /dev/null; then
+	ok "firstboot_user: an existing account (operator) is not touched, the rest still applies, one note says so"
+else
+	no "firstboot_user: an existing account (operator) is not touched, the rest still applies, one note says so (rc=$_rffrc)"
+	sed 's/^/      | /' "$_rf/fb-op.out" "$_rf/fb-op.log" 2> /dev/null | head -10
+fi
+_rffb new USERNAME=newuser "SSH_KEY=ssh-ed25519 rfdata rf" "PASSWORD_HASH=$_oh" WHEEL=yes
+if [ "$_rffrc" -eq 0 ] && grep -q '^pw useradd -n newuser ' "$_rf/fb-new.log" && grep -q '^pw usermod -n newuser -H 0' "$_rf/fb-new.log" &&
+	grep -qx 'ssh-ed25519 rfdata rf' "$_rfr/home/newuser/.ssh/authorized_keys" 2> /dev/null; then
+	ok "firstboot_user: a name that is not an account yet is created and gets its password and keys"
+else
+	no "firstboot_user: a name that is not an account yet is created and gets its password and keys (rc=$_rffrc)"
+	sed 's/^/      | /' "$_rf/fb-new.out" 2> /dev/null | head -6
+fi
+# the password file cannot be read (here: it is a directory): no account,
+# no autologin, the run fails
+rm -f "$_rfr/etc/passwd"
+mkdir "$_rfr/etc/passwd"
+_rffb nopw USERNAME=newuser "SSH_KEY=ssh-ed25519 rfdata rf" AUTOLOGIN=yes 2> /dev/null
+rmdir "$_rfr/etc/passwd"
+if [ "$_rffrc" -ne 0 ] && ! grep -q '^pw ' "$_rf/fb-nopw.log" &&
+	[ ! -e "$_rfr/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" ] && grep -q 'cannot read' "$_rf/fb-nopw.out"; then
+	ok "firstboot_user: a password file that cannot be read stops the account part (no pw call, no autologin)"
+else
+	no "firstboot_user: a password file that cannot be read stops the account part (no pw call, no autologin) (rc=$_rffrc)"
+	sed 's/^/      | /' "$_rf/fb-nopw.out" 2> /dev/null | head -6
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

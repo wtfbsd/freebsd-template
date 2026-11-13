@@ -35,9 +35,57 @@ KEYS = {"version", "mode", "boot", "disks", "layout", "filesystem", "encryption"
         "partitions", "data", "usage"}
 LAYOUTS = {"single": 1, "stripe": 2, "mirror": 2, "raid10": 4, "raidz1": 3,
            "raidz2": 4, "raidz3": 5}
-DISK = re.compile(r"^[a-z]+[0-9]+$")
-POOLNAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
-MOUNT = re.compile(r"^/[A-Za-z0-9._/-]*$")
+DISK = re.compile(r"[a-z]+[0-9]+\Z")
+POOLNAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+MOUNT_PART = re.compile(r"[A-Za-z0-9._-]+\Z")
+# A data pool is mounted under the altroot before the system is copied: on
+# a directory of the system, or inside one, it would take the system's own
+# files (and the boot needs them on the system pool). /usr/home is the
+# exception: it holds the homes (/home links to it), which is user data.
+SYSTEM_DIRS = ("/boot", "/etc", "/lib", "/libexec", "/bin", "/sbin", "/usr", "/var",
+               "/dev", "/tmp", "/root", "/compat", "/rescue", "/proc")
+USER_DIRS = ("/usr/home",)
+# zpool(8) refuses a pool named mirror*, raidz*, draid*, spare* or log, or
+# starting with c and a digit; cache, special and dedup are vdev classes
+RESERVED_PREFIXES = ("mirror", "raidz", "draid", "spare")
+RESERVED_NAMES = {"log", "cache", "special", "dedup"}
+# the root pool, named as build.sh names it: the slug, - as _, then _root
+SYSTEM_POOL = "@SLUG@".replace("-", "_") + "_root"
+GPT_LABEL_MAX = 36  # the data disks are labelled <pool>-<disk>
+MOUNT_MAX = 200  # the installer's own limit (diskplan.py, mount_ok)
+
+
+def within(path, top):
+    return path == top or path.startswith(top + "/")
+
+
+def check_data_name(n, names):
+    if n == SYSTEM_POOL:
+        raise Bad("data pool %s has the name of the system pool" % n)
+    if n in RESERVED_NAMES or n.startswith(RESERVED_PREFIXES) or re.match(r"c[0-9]", n):
+        raise Bad("data pool name %s is reserved by zpool" % n)
+    if n in names:
+        raise Bad("data pool name %s is used twice" % n)
+
+
+def same_dir(m):
+    """/home is a link to usr/home: compare the two as one directory."""
+    return "/usr" + m if within(m, "/home") else m
+
+
+def check_data_mount(n, m, mounts):
+    if not isinstance(m, str) or len(m) > MOUNT_MAX or not m.startswith("/") or m == "/" or \
+            not all(MOUNT_PART.fullmatch(p) and p not in (".", "..") for p in m[1:].split("/")):
+        raise Bad("data pool %s: the mount point is not a clean absolute path" % n)
+    if any(within(m, s) for s in SYSTEM_DIRS) and not any(within(m, u) for u in USER_DIRS):
+        raise Bad("data pool %s: %s is a system directory" % (n, m))
+    for o in mounts:
+        cm, co = same_dir(m), same_dir(o)
+        if cm == co:
+            raise Bad("data pool %s: the mount point %s is used twice" % (n, m))
+        if within(cm, co) or within(co, cm):
+            inner, outer = (m, o) if within(cm, co) else (o, m)
+            raise Bad("data pool %s: %s is inside %s" % (n, inner, outer))
 
 
 def check_layout(layout, n, fs):
@@ -85,26 +133,31 @@ def check(plan, imagefs):
         raise Bad("boot must be uefi or bios")
     disks = plan.get("disks")
     if not isinstance(disks, list) or not disks or \
-            not all(isinstance(d, str) and DISK.match(d) for d in disks):
+            not all(isinstance(d, str) and DISK.fullmatch(d) for d in disks):
         raise Bad("disks must be a list of bare disk names")
     seen = list(disks)
     data = plan.get("data") or []
     if not isinstance(data, list):
         raise Bad("data must be a list")
-    mounts = set()
+    mounts = []
+    names = set()
     for d in data:
         if not isinstance(d, dict) or set(d) - {"name", "disks", "layout", "filesystem", "mount"}:
             raise Bad("a data entry is not valid")
         if not isinstance(d.get("disks"), list) or not d["disks"] or \
-                not all(isinstance(x, str) and DISK.match(x) for x in d["disks"]):
+                not all(isinstance(x, str) and DISK.fullmatch(x) for x in d["disks"]):
             raise Bad("a data entry needs a list of bare disk names")
-        if not isinstance(d.get("name"), str) or not POOLNAME.match(d["name"]):
+        if not isinstance(d.get("name"), str) or not POOLNAME.fullmatch(d["name"]):
             raise Bad("a data pool name must match ^[a-z][a-z0-9_-]{0,31}$")
-        m = d.get("mount")
-        if not isinstance(m, str) or not MOUNT.match(m) or "/../" in m + "/" or "/./" in m + "/" \
-                or m == "/" or m in mounts:
-            raise Bad("a data pool needs an absolute, unique mount point")
-        mounts.add(m)
+        n = d["name"]
+        check_data_name(n, names)
+        names.add(n)
+        for x in d["disks"]:
+            if len(n) + 1 + len(x) > GPT_LABEL_MAX:
+                raise Bad("data pool %s: the GPT label %s-%s is longer than %d characters"
+                          % (n, n, x, GPT_LABEL_MAX))
+        check_data_mount(n, d.get("mount"), mounts)
+        mounts.append(d["mount"])
         check_layout(d.get("layout", "single"), len(d["disks"]), d.get("filesystem", "zfs"))
         seen += d["disks"]
     if len(seen) != len(set(seen)):
