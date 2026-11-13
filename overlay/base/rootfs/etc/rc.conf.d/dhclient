@@ -1,0 +1,12 @@
+# rc.conf.d/dhclient — base rc.conf.d fragment, named after the service.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# rc.d/dhclient, which devd starts when a link comes up, loads only this
+# fragment, not the one of netif: without it, no interface is "DHCP-enabled"
+# for it and nothing asks for an address. The interface lines stay in one
+# place, rc.conf.d/netif (the template's and the ones the installer writes),
+# and are read here as well.
+if [ -r /etc/rc.conf.d/netif ]; then
+	. /etc/rc.conf.d/netif
+fi

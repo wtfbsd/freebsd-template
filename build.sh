@@ -262,7 +262,7 @@ case $MOTD in *[[:cntrl:]]*) die 'MOTD contains control characters' ;; esac
 # git ref of a repository URL; neither means the stand-in launcher
 # the merged main of the installer-template: the default INSTALLER_REF;
 # INSTALLER_REF=none builds the stand-in launcher instead
-INSTALLER_REF_DEFAULT=f2e9c48b051f473029ef44a78264b2239ff73141
+INSTALLER_REF_DEFAULT=b76dbd31decc023ebe24183b905c34583f3c19c9
 INSTALLER_REF=${INSTALLER_REF:-}
 INSTALLER_URL=${INSTALLER_URL:-https://github.com/wtfbsd/installer-template.git}
 INSTALLER_DIR=${INSTALLER_DIR:-}
@@ -281,7 +281,7 @@ case $INSTALLER_DIR in *[[:space:]]*) die "INSTALLER_DIR may not contain whitesp
 # the artwork: a pre-rendered pack of the artwork template, by commit and
 # variant, checked against its sha256 (pinned here for the template's own
 # product; ARTWORK_SHA256 for any other). ARTWORK_REF=none: no branding.
-ARTWORK_REF_DEFAULT=353ef29aa000eda6c1f274774170a7a691768490
+ARTWORK_REF_DEFAULT=5aaea01b082938f3c6816cd5b881699e62d3d9dd
 ARTWORK_REF=${ARTWORK_REF:-$ARTWORK_REF_DEFAULT}
 ARTWORK_VARIANT=${ARTWORK_VARIANT:-default}
 ARTWORK_SHA256=${ARTWORK_SHA256:-}
@@ -415,7 +415,19 @@ rmrf() { # rmrf <path> <guardroot> — rm -rf only for non-empty paths under roo
 	[ -n "${2:-}" ] || die 'rmrf: empty guard root'
 	[ "$1" != "$2" ] || die "rmrf: refusing guard root itself: $1"
 	case $1 in "$2"/*) ;; *) die "rmrf: refusing path outside $2: $1" ;; esac
+	# a link is removed as a link: its target, which may be outside the
+	# guard root, is never followed (neither by chflags nor by rm)
+	if [ -L "$1" ]; then
+		rm -f -- "$1" || die "rmrf: cannot remove the link $1"
+		return 0
+	fi
 	[ -d "$1" ] || return 0
+	# a FreeBSD stage holds files with the schg flag (the kernel, libc,
+	# init): rm -rf cannot remove them, so a rebuild in the same output
+	# directory failed. The flags are cleared first where chflags(1) exists.
+	if command -v chflags > /dev/null 2>&1; then
+		chflags -R noschg "$1" 2> /dev/null || :
+	fi
 	rm -rf -- "$1"
 }
 
@@ -844,6 +856,7 @@ live_stage() { # live_stage <stage> <work dir> — add the live layer for the IS
 			# rc.d/live_session names the medium of the live system in
 			# /var/run/wtfbsd-live-medium early in the boot: a live root in
 			# memory that does not name it offers no disk
+			printf 'LIVE_MEDIUM_REQUIRED=yes\n'
 		} > "$_lw/installer.conf" || die "cannot write $_lw/installer.conf"
 		set -- --conf "$_lw/installer.conf"
 		# the installer's look comes from the artwork; install-into-stage.sh
@@ -976,8 +989,8 @@ live_revert() { # live_revert <stage> <work dir> — take the live layer out aga
 
 artwork_pinned_sha() { # artwork_pinned_sha <pack name> — the pinned sha256, or nothing
 	case $1 in
-	examplebsd-353ef29aa000-default) echo 10f2507cd0bb325534157f073d79bc08da6a5e1ded34686ebe683a75a0a1d3e4 ;;
-	examplebsd-353ef29aa000-cyberpunk) echo 9e53a16fa3676daa9da8fa888fdfde9a7ac80b44bcf57ddac391e9f438bdcbd6 ;;
+	examplebsd-5aaea01b0829-default) echo f0753807e81daacc3dc7b24995d49e74b1fd61152035115b37888fe814176a12 ;;
+	examplebsd-5aaea01b0829-cyberpunk) echo 3c0d23914d8282a0eed89eacb66e80b8b7dada84492d52cc2415e85621d4f470 ;;
 	esac
 }
 
@@ -1184,6 +1197,79 @@ brand_spot() { # brand_spot <stage> <profile> <spot> — install one branding sp
 	esac
 }
 
+# slug_replace <from> <to> <in> <out> — copy <in> to <out>, with every
+# literal occurrence of <from> replaced by <to>. The two are strings, not
+# regular expressions: the name of a pack is data.
+slug_replace() { # slug_replace <from> <to> <in> <out>
+	[ -n "${1:-}" ] || die 'slug_replace: the string to replace is empty'
+	awk -v a="$1" -v b="$2" '
+		function rep(s,   i, out) {
+			out = ""
+			while ((i = index(s, a)) > 0) {
+				out = out substr(s, 1, i - 1) b
+				s = substr(s, i + length(a))
+			}
+			return out s
+		}
+		{ print rep($0) }
+	' "$3" > "$4" || die "cannot write $4"
+}
+
+# The wallpaper helper of the artwork pack: an autostart entry of the Xfce
+# session and the script it runs, which fills in the wallpaper on every
+# output that has none yet. The Xfce of FreeBSD reads its autostart entries
+# from /usr/local/etc/xdg/autostart. The paths are fixed:
+#   /usr/local/etc/xdg/autostart/<slug>-wallpaper.desktop       (0644)
+#   /usr/local/share/<slug>/xfce/session/<slug>-wallpaper.sh    (0755)
+# The Exec= line of the entry is written here, so it always names the
+# script that is installed, whatever the slug of the pack is.
+#
+# install_wallpaper <stage> <pack root> — the pack holds the two files as
+# out/xfce/autostart/<packslug>-wallpaper.desktop and
+# out/xfce/session/<packslug>-wallpaper.sh (<packslug>: name= of PACK).
+install_wallpaper() { # install_wallpaper <stage> <pack root>
+	_sw=$1
+	_sp=$2
+	_sl=$DISTRO_SLUG
+	[ -f "$_sp/PACK" ] || die "the artwork pack has no PACK file ($_sp)"
+	_ps=$(sed -n 's/^name=//p' "$_sp/PACK" | head -n 1)
+	chk '^[a-z0-9][a-z0-9-]*$' "$_ps" 'the name of the artwork pack is not a slug'
+	_sd="$_sp/out/xfce/autostart/$_ps-wallpaper.desktop"
+	_ss="$_sp/out/xfce/session/$_ps-wallpaper.sh"
+	_hd=no
+	if [ -e "$_sd" ] || [ -L "$_sd" ]; then _hd=yes; fi
+	_hs=no
+	if [ -e "$_ss" ] || [ -L "$_ss" ]; then _hs=yes; fi
+	# a pack of an older artwork template ships no helper
+	[ "$_hd$_hs" != nono ] || return 0
+	[ "$_hd" = yes ] || die "the artwork pack holds the session helper of the wallpaper but no autostart entry: ship both $_sd and $_ss, or neither"
+	[ "$_hs" = yes ] || die "the artwork pack holds the autostart entry of the wallpaper but no session helper: ship both $_sd and $_ss, or neither"
+	# a link in the pack can name a file outside the pack: refused, not
+	# followed, on every directory of the path inside the pack as well
+	for _wl in out out/xfce out/xfce/autostart out/xfce/session; do
+		[ ! -L "$_sp/$_wl" ] || die "the wallpaper helper of the pack is reached through a link ($_sp/$_wl)"
+	done
+	[ ! -L "$_sd" ] || die "the autostart entry of the wallpaper of the pack is a link ($_sd)"
+	[ ! -L "$_ss" ] || die "the session helper of the wallpaper of the pack is a link ($_ss)"
+	# a FIFO or a device would block or mislead the copy
+	[ -f "$_sd" ] || die "the autostart entry of the wallpaper of the pack is not a regular file ($_sd)"
+	[ -f "$_ss" ] || die "the session helper of the wallpaper of the pack is not a regular file ($_ss)"
+	_ddst="$_sw/usr/local/etc/xdg/autostart/$_sl-wallpaper.desktop"
+	_sdst="$_sw/usr/local/share/$_sl/xfce/session/$_sl-wallpaper.sh"
+	mkdir -p "$_sw/usr/local/etc/xdg/autostart" "$_sw/usr/local/share/$_sl/xfce/session" \
+		|| die 'cannot create the directories of the wallpaper helper'
+	slug_replace "$_ps" "$_sl" "$_sd" "$_ddst"
+	_exec="Exec=/bin/sh \"/usr/local/share/$_sl/xfce/session/$_sl-wallpaper.sh\""
+	awk -v e="$_exec" '
+		/^Exec=/ { if (!done) { print e; done = 1 } next }
+		{ print }
+		END { if (!done) print e }
+	' "$_ddst" > "$_ddst.new" && mv "$_ddst.new" "$_ddst" \
+		|| die 'cannot write the autostart entry of the wallpaper'
+	slug_replace "$_ps" "$_sl" "$_ss" "$_sdst"
+	chmod 0644 "$_ddst" && chmod 0755 "$_sdst" || die 'cannot set the modes of the wallpaper helper'
+}
+
 brand_stage() { # brand_stage <stage> <profile> — every spot the artwork marks supported on FreeBSD
 	_bt=$(spots_freebsd "$ART/branding/spots.tsv") || die "$ART/branding/spots.tsv: a column is missing (spot, freebsd, rendered)"
 	# the identity file first: the stamps read it
@@ -1199,6 +1285,9 @@ brand_stage() { # brand_stage <stage> <profile> — every spot the artwork marks
 		*) die "installing the branding spot $_spot failed" ;;
 		esac
 	done || exit 1
+	# the desktop (and the live session built from its stage) fills in the
+	# wallpaper on every output with the pack's helper
+	[ "$2" != desktop ] || install_wallpaper "$1" "$ART"
 	if [ -x "$1/usr/local/bin/gtk-update-icon-cache" ] && [ -z "${PKG_ABI:-}" ]; then
 		chroot "$1" /usr/local/bin/gtk-update-icon-cache -q -f /usr/local/share/icons/hicolor \
 			|| die 'gtk-update-icon-cache in the stage failed'

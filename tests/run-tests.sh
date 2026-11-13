@@ -4245,7 +4245,7 @@ conf ninst 'PROFILE="desktop"'
 sh "$repo/build.sh" -n -c "$work/ninst.conf" -o "$work/out" > "$_n/dry-inst.log" 2>&1
 conf ninone 'PROFILE="desktop"' 'INSTALLER_REF="none"'
 sh "$repo/build.sh" -n -c "$work/ninone.conf" -o "$work/out" > "$_n/dry-none.log" 2>&1
-if grep -q 'git checkout --detach f2e9c48b051f473029ef44a78264b2239ff73141' "$_n/dry-inst.log" &&
+if grep -q 'git checkout --detach b76dbd31decc023ebe24183b905c34583f3c19c9' "$_n/dry-inst.log" &&
 	grep -q 'no installer-template: the stand-in launcher' "$_n/dry-none.log" && ! grep -q 'git clone' "$_n/dry-none.log"; then
 	ok "build.sh: the installer-template defaults to its pinned merged main; INSTALLER_REF=none keeps the stand-in"
 else
@@ -4343,6 +4343,13 @@ cat > "$_bp/out/xfce/xfconf/xfce4-desktop.xml" <<'XFD'
 </channel>
 XFD
 printf 'ExampleBSD art motd\n' > "$_bp/out/console/motd.template"
+# the pack's wallpaper helper: an autostart entry and the script it runs,
+# both named after the pack's slug (name= of PACK)
+mkdir -p "$_bp/out/xfce/autostart" "$_bp/out/xfce/session"
+printf '[Desktop Entry]\nType=Application\nName=ExampleBSD wallpaper\nExec=/bin/sh "/somewhere/else/examplebsd-wallpaper.sh"\nOnlyShowIn=XFCE;\n' \
+	> "$_bp/out/xfce/autostart/examplebsd-wallpaper.desktop"
+printf '#!/bin/sh\nIMAGE_DEFAULT=/usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png\n' \
+	> "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
 # the identity scripts of the pack: identity-file.sh prints its arguments as
 # the file; identity-stamp.sh copies the image and logs that it stamped it
 cat > "$_bp/scripts/identity-file.sh" <<'IDF'
@@ -4365,7 +4372,7 @@ printf '#!/bin/sh\necho 16.0-CURRENT\n' > "$_b/stage/bin/freebsd-version"
 printf 'default:\\\n\t:cb:ce:ck:lc:fd#1000:im=\\r\\n%%s/%%m (%%h) (%%t)\\r\\n\\r\\n:sp#1200:\\\n\t:if=/etc/issue:\n\nstd.9600:\\\n\t:im=other:\n' > "$_b/stage/etc/gettytab"
 : > "$_b/stage/usr/local/share/fonts/dejavu/DejaVuSans.ttf"
 {
-	for _fn in rmrf artwork_pinned_sha sha256_of fetch_artwork spots_freebsd stamp_identity brand_identity brand_spot brand_stage; do
+	for _fn in rmrf chk artwork_pinned_sha sha256_of fetch_artwork spots_freebsd stamp_identity brand_identity brand_spot slug_replace install_wallpaper brand_stage; do
 		awk "/^$_fn\\(\\) \\{/,/^\\}/" "$repo/build.sh"
 	done
 } > "$_b/f.sh"
@@ -4433,19 +4440,117 @@ else
 	no "branding: the desktop backdrop also names the monitor \"default\" (scfb, vesa), the pack's monitors kept"
 	sed 's/^/      | /' "$_xd" 2> /dev/null | head -30
 fi
+# the wallpaper helper of the pack: the Xfce session of FreeBSD reads its
+# autostart entries from /usr/local/etc/xdg/autostart; the Exec= line is
+# the template's own and names the script that is installed
+_wd="$_bs/usr/local/etc/xdg/autostart/examplebsd-wallpaper.desktop"
+_ws="$_bs/usr/local/share/examplebsd/xfce/session/examplebsd-wallpaper.sh"
+_wmode() { ls -l "$1" 2> /dev/null | cut -c1-10; }
+if [ -f "$_wd" ] && [ -f "$_ws" ] && [ "$(_wmode "$_wd")" = -rw-r--r-- ] && [ "$(_wmode "$_ws")" = -rwxr-xr-x ] &&
+	[ "$(grep -c '^Exec=' "$_wd")" -eq 1 ] &&
+	grep -qx 'Exec=/bin/sh "/usr/local/share/examplebsd/xfce/session/examplebsd-wallpaper.sh"' "$_wd" &&
+	grep -qx 'OnlyShowIn=XFCE;' "$_wd"; then
+	ok "branding: the pack's wallpaper helper is installed (autostart 0644 in /usr/local/etc/xdg, script 0755, Exec= names it)"
+else
+	no "branding: the pack's wallpaper helper is installed (autostart 0644 in /usr/local/etc/xdg, script 0755, Exec= names it)"
+	sed 's/^/      | /' "$_wd" 2> /dev/null | head -8
+fi
 if grep -q 'im=\\r\\nExampleBSD (%h) (%t)' "$_bs/etc/gettytab" && grep -q ':im=other:' "$_bs/etc/gettytab" &&
 	grep -qx 'Welcome to ExampleBSD' "$_bs/etc/motd.template"; then
 	ok "branding: the default getty banner and the motd are the product's (other gettytab entries untouched)"
 else
 	no "branding: the default getty banner and the motd are the product's (other gettytab entries untouched)"
 fi
+rm -f "$_wd" "$_ws"
 BRAND_VERSION='' _brun noversion appliance
+if [ "$_brc" -eq 0 ] && [ ! -e "$_wd" ] && [ ! -e "$_ws" ]; then
+	ok "branding: the appliance gets no wallpaper helper"
+else
+	no "branding: the appliance gets no wallpaper helper (rc=$_brc)"
+fi
 if [ "$_brc" -eq 0 ] && grep -q '^VERSION=20[0-9][0-9]\.[01][0-9]$' "$_bs/usr/local/share/examplebsd/identity" &&
 	grep -q '^BUILD=20[0-9][0-9]-' "$_bs/usr/local/share/examplebsd/identity"; then
 	ok "branding: without PRODUCT_VERSION the version is the build's year.month and the build date is set"
 else
 	no "branding: without PRODUCT_VERSION the version is the build's year.month and the build date is set"
 fi
+mv "$_bp/out/xfce/session/examplebsd-wallpaper.sh" "$_b/helper.sh"
+ln -s /etc/master.passwd "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+_brun wlink desktop
+if [ "$_brc" -ne 0 ] && grep -q 'session helper of the wallpaper of the pack is a link' "$_b/wlink.log"; then
+	ok "branding: a wallpaper helper that is a link in the pack is refused, not followed"
+else
+	no "branding: a wallpaper helper that is a link in the pack is refused, not followed (rc=$_brc)"
+fi
+rm -f "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+_brun whalf desktop
+if [ "$_brc" -ne 0 ] && grep -q 'autostart entry of the wallpaper but no session helper' "$_b/whalf.log"; then
+	ok "branding: a pack with the wallpaper entry but not its script fails the build"
+else
+	no "branding: a pack with the wallpaper entry but not its script fails the build (rc=$_brc)"
+fi
+mv "$_b/helper.sh" "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+# a helper that is not a regular file (a FIFO would block the copy) is refused
+mv "$_bp/out/xfce/session/examplebsd-wallpaper.sh" "$_b/helper.sh"
+mkfifo "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+_brun wfifo desktop
+if [ "$_brc" -ne 0 ] && grep -q 'session helper of the wallpaper of the pack is not a regular file' "$_b/wfifo.log"; then
+	ok "branding: a wallpaper helper that is not a regular file is refused"
+else
+	no "branding: a wallpaper helper that is not a regular file is refused (rc=$_brc)"
+fi
+rm -f "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+mv "$_b/helper.sh" "$_bp/out/xfce/session/examplebsd-wallpaper.sh"
+# a symbolic link anywhere on the path inside the pack is refused, not
+# only on the last component: a linked directory can lead outside the pack
+mv "$_bp/out/xfce/session" "$_b/session.real"
+ln -s "$_b/session.real" "$_bp/out/xfce/session"
+_brun wdirlink desktop
+if [ "$_brc" -ne 0 ] && grep -q 'wallpaper helper of the pack is reached through a link' "$_b/wdirlink.log"; then
+	ok "branding: a wallpaper helper reached through a linked directory of the pack is refused"
+else
+	no "branding: a wallpaper helper reached through a linked directory of the pack is refused (rc=$_brc)"
+fi
+rm -f "$_bp/out/xfce/session"
+mv "$_b/session.real" "$_bp/out/xfce/session"
+# a pack whose slug is not the product's: both files are renamed, the
+# pack's slug is gone from them and the product's is in
+_wp="$_b/otherpack"
+mkdir -p "$_wp/out/xfce/autostart" "$_wp/out/xfce/session" "$_b/wstage"
+printf 'name=packslug\nvariant=default\n' > "$_wp/PACK"
+printf '[Desktop Entry]\nName=packslug wallpaper\nExec=/bin/sh /x/packslug-wallpaper.sh\n' > "$_wp/out/xfce/autostart/packslug-wallpaper.desktop"
+printf '#!/bin/sh\nIMAGE_DEFAULT=/usr/local/share/packslug/wallpapers/wallpaper-1-1920x1080.png\n' > "$_wp/out/xfce/session/packslug-wallpaper.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	DISTRO_SLUG=examplebsd
+	. "$_b/f.sh"
+	install_wallpaper "$_b/wstage" "$_wp"
+) > "$_b/wslug.log" 2>&1
+_brc=$?
+_wsd="$_b/wstage/usr/local/etc/xdg/autostart/examplebsd-wallpaper.desktop"
+_wss="$_b/wstage/usr/local/share/examplebsd/xfce/session/examplebsd-wallpaper.sh"
+if [ "$_brc" -eq 0 ] && [ -f "$_wsd" ] && [ -f "$_wss" ] && ! grep -q packslug "$_wsd" "$_wss" &&
+	grep -qx 'Name=examplebsd wallpaper' "$_wsd" &&
+	grep -qx 'IMAGE_DEFAULT=/usr/local/share/examplebsd/wallpapers/wallpaper-1-1920x1080.png' "$_wss" &&
+	[ ! -e "$_b/wstage/usr/local/etc/xdg/autostart/packslug-wallpaper.desktop" ]; then
+	ok "branding: a pack with another slug gets its wallpaper helper renamed and rewritten to the product's slug"
+else
+	no "branding: a pack with another slug gets its wallpaper helper renamed and rewritten to the product's slug (rc=$_brc)"
+	sed 's/^/      | /' "$_b/wslug.log" | head -5
+fi
+# a pack of an older artwork template has no helper: the desktop is branded
+# all the same, with no helper installed
+mv "$_bp/out/xfce/autostart" "$_b/autostart.keep"
+mv "$_bp/out/xfce/session" "$_b/session.keep"
+rm -f "$_wd" "$_ws"
+_brun wnone desktop
+if [ "$_brc" -eq 0 ] && [ ! -e "$_wd" ] && [ ! -e "$_ws" ]; then
+	ok "branding: a pack without a wallpaper helper still brands the desktop, and none is installed"
+else
+	no "branding: a pack without a wallpaper helper still brands the desktop, and none is installed (rc=$_brc)"
+fi
+mv "$_b/autostart.keep" "$_bp/out/xfce/autostart"
+mv "$_b/session.keep" "$_bp/out/xfce/session"
 printf 'brand-new-spot\tx\tx\t/usr/local/x\tn/a\tn/a\tn/a\tn/a\tx\tx\tx\tx\n' >> "$_bp/branding/spots.tsv"
 _brun newspot desktop
 if [ "$_brc" -ne 0 ] && grep -q 'brand-new-spot supported on FreeBSD and this template does not install it' "$_b/newspot.log"; then
@@ -4465,17 +4570,105 @@ fi
 printf 'not the pack\n' > "$_b/fake.tar.xz"
 (
 	die() { echo "die: $*" >&2; exit 1; }
-	OUT="$_b/fo" DISTRO_SLUG=examplebsd ARTWORK_REF=353ef29aa000eda6c1f274774170a7a691768490
+	OUT="$_b/fo" DISTRO_SLUG=examplebsd ARTWORK_REF=5aaea01b082938f3c6816cd5b881699e62d3d9dd
 	ARTWORK_VARIANT=default ARTWORK_PACK="$_b/fake.tar.xz" ARTWORK_SHA256='' ARTWORK_URL=x
 	mkdir -p "$OUT"
 	. "$_b/f.sh"
 	fetch_artwork
 ) > "$_b/sha.log" 2>&1
 _brc=$?
-if [ "$_brc" -ne 0 ] && grep -q 'not the pinned 10f2507cd0bb325534157f073d79bc08da6a5e1ded34686ebe683a75a0a1d3e4: refusing it' "$_b/sha.log"; then
+if [ "$_brc" -ne 0 ] && grep -q 'not the pinned f0753807e81daacc3dc7b24995d49e74b1fd61152035115b37888fe814176a12: refusing it' "$_b/sha.log"; then
 	ok "branding: an artwork pack whose sha256 is not the pinned one is refused"
 else
 	no "branding: an artwork pack whose sha256 is not the pinned one is refused (rc=$_brc)"
+fi
+# ------------------------------------------------------------------
+# the licensed-software catalogue: the installer reads only version 1 with
+# the keys version, items and notices, and refuses any other key, so the
+# Additional software page shows nothing at all
+# ------------------------------------------------------------------
+_cat="$repo/overlay/base/rootfs/usr/local/share/@SLUG@/licensed-software.json"
+if command -v python3 > /dev/null 2>&1; then
+	if python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+sys.exit(0 if isinstance(d, dict) and d.get("version") == 1 and isinstance(d.get("items"), list)
+	and not set(d) - {"version", "items", "notices"} else 1)' "$_cat" 2> /dev/null; then
+		ok "the licensed-software catalogue has only the keys the installer reads (version 1, items, notices)"
+	else
+		no "the licensed-software catalogue has only the keys the installer reads (version 1, items, notices)"
+	fi
+else
+	# the installer itself needs python3: a host without it cannot vouch
+	# for the catalogue, and says so instead of passing quietly
+	no "the licensed-software catalogue has only the keys the installer reads (no python3 to read it)"
+fi
+# ------------------------------------------------------------------
+# DHCP: rc.d/dhclient (started by devd on link-up) loads only its own
+# rc.conf.d fragment, so it has to see the interface lines of netif, both
+# the template's ifconfig_DEFAULT and the lines firstboot_user writes
+# ------------------------------------------------------------------
+_dh="$repo/overlay/base/rootfs/etc/rc.conf.d/dhclient"
+_dt="$work/dhcp"
+mkdir -p "$_dt"
+for _nf in base firstboot; do
+	if [ "$_nf" = base ]; then
+		cp "$repo/overlay/base/rootfs/etc/rc.conf.d/netif" "$_dt/netif"
+		_want=ifconfig_DEFAULT
+	else
+		printf '# written by firstboot_user from the installer\nifconfig_em0="DHCP"\n' > "$_dt/netif"
+		_want=ifconfig_em0
+	fi
+	_got=$(
+		if [ -f "$_dh" ]; then
+			sed "s|/etc/rc.conf.d/netif|$_dt/netif|g" "$_dh" > "$_dt/dhclient"
+			unset ifconfig_DEFAULT ifconfig_em0
+			. "$_dt/dhclient"
+			eval "printf '%s' \"\${$_want:-}\""
+		fi
+	)
+	if [ "$_got" = DHCP ]; then
+		ok "rc.conf.d/dhclient sees the DHCP interface lines of netif ($_nf: $_want)"
+	else
+		no "rc.conf.d/dhclient sees the DHCP interface lines of netif ($_nf: $_want)"
+	fi
+done
+# ------------------------------------------------------------------
+# a rebuild in the same output directory: the stage of FreeBSD holds
+# files with the schg flag, which rm -rf cannot remove, so rmrf clears the
+# flags first where chflags(1) exists
+# ------------------------------------------------------------------
+_rf="$work/rmrf"
+mkdir -p "$_rf/bin" "$_rf/out/stage/sbin"
+: > "$_rf/out/stage/sbin/init"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/chflags.log"\n' "$_rf" > "$_rf/bin/chflags"
+chmod 755 "$_rf/bin/chflags"
+awk '/^rmrf\(\) \{/,/^\}/' "$repo/build.sh" > "$_rf/f.sh"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	PATH="$_rf/bin:$PATH"
+	. "$_rf/f.sh"
+	rmrf "$_rf/out/stage" "$_rf/out"
+) > "$_rf/log" 2>&1
+if grep -qx -- "-R noschg $_rf/out/stage" "$_rf/chflags.log" 2> /dev/null && [ ! -e "$_rf/out/stage" ]; then
+	ok "rmrf clears the file flags (chflags -R noschg) before it removes a stage"
+else
+	no "rmrf clears the file flags (chflags -R noschg) before it removes a stage"
+fi
+# a link under the output directory is removed as a link: its target, which
+# may be outside, never has its flags touched
+mkdir -p "$_rf/outside"
+ln -s "$_rf/outside" "$_rf/out/linked"
+: > "$_rf/chflags.log"
+(
+	die() { echo "die: $*" >&2; exit 1; }
+	PATH="$_rf/bin:$PATH"
+	. "$_rf/f.sh"
+	rmrf "$_rf/out/linked" "$_rf/out"
+) >> "$_rf/log" 2>&1
+if [ ! -s "$_rf/chflags.log" ] && [ ! -e "$_rf/out/linked" ] && [ ! -L "$_rf/out/linked" ] && [ -d "$_rf/outside" ]; then
+	ok "rmrf removes a link as a link, without touching the flags of its target"
+else
+	no "rmrf removes a link as a link, without touching the flags of its target"
 fi
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

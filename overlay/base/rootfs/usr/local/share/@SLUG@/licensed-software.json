@@ -1,5 +1,4 @@
 {
   "version": 1,
-  "comment": "The optional software whose licence needs the user's acceptance (the Additional software page of the installer). Empty in the template: the default package lists hold only software that may be redistributed with a notice. A product adds items here, never to packages.list.",
   "items": []
 }

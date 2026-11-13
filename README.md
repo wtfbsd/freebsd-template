@@ -243,7 +243,11 @@ module locked) reach the installed system through the first-boot conf.
 `/usr/local/share/<slug>/licensed-software.json`, and is recorded as
 `/var/db/<slug>/licenses-accepted.json`. The catalogue is empty in the
 template: nothing in the default package lists needs a licence to be
-accepted.
+accepted. A product adds software whose licence the user has to accept as
+items of that catalogue, never to `packages.list`. The installer reads only
+the keys `version` (1), `items` and `notices`, and refuses a catalogue with
+any other key, so explanations go here, not into the file. The format of
+an item is in the README of the installer-template (lib/licensed.py).
 
 `-H HASHFILE` names a mode 0600 file holding the crypt(3) hash of the
 password (`$6$` or `$2b$`): the cleartext never touches the disk or the

@@ -40,7 +40,10 @@ ISOs. License: BSD-2-Clause (see `LICENSE`).
 - Files staged with a literal `@SLUG@` in their **name** are renamed by
   `build.sh` to the slug.
 - `rc.conf.d` fragments are named **after their service**: rc(8) only reads
-  `/etc/rc.conf.d/<service-name>`.
+  `/etc/rc.conf.d/<service-name>`. A variable that more than one service
+  reads needs every one of them to see it: `ifconfig_*` lives in
+  `rc.conf.d/netif`, and `rc.conf.d/dhclient` sources that file, because
+  rc.d/dhclient (started by devd on link-up) reads only its own fragment.
 - `build.sh` locks root in the staged image and leaves a `/firstboot` sentinel
   so the first-boot scripts run once.
 - Any `rm -rf` in `build.sh` is guarded: only paths validated non-empty and
