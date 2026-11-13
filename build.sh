@@ -281,7 +281,7 @@ case $INSTALLER_DIR in *[[:space:]]*) die "INSTALLER_DIR may not contain whitesp
 # the artwork: a pre-rendered pack of the artwork template, by commit and
 # variant, checked against its sha256 (pinned here for the template's own
 # product; ARTWORK_SHA256 for any other). ARTWORK_REF=none: no branding.
-ARTWORK_REF_DEFAULT=ce8e9714a2b47e3f17ff36ea647dbcc02f4399ac
+ARTWORK_REF_DEFAULT=2e86db4e6df87d4d5affdab620c3f8ccbb88e4a7
 ARTWORK_REF=${ARTWORK_REF:-$ARTWORK_REF_DEFAULT}
 ARTWORK_VARIANT=${ARTWORK_VARIANT:-default}
 ARTWORK_SHA256=${ARTWORK_SHA256:-}
@@ -994,8 +994,8 @@ live_revert() { # live_revert <stage> <work dir> — take the live layer out aga
 
 artwork_pinned_sha() { # artwork_pinned_sha <pack name> — the pinned sha256, or nothing
 	case $1 in
-	examplebsd-ce8e9714a2b4-default) echo cf0b37d9a793f8f16cc78f2a82122fac28087253cc27cac384357fd6a6d85ce7 ;;
-	examplebsd-ce8e9714a2b4-cyberpunk) echo fd02f48114c0e969ed92584953062da72b1923c759b0dff2701fd201cc248669 ;;
+	examplebsd-2e86db4e6df8-default) echo efba8dc2b825a7daf367ac2c2c11ff685bb1329555483b360722e2d34529209b ;;
+	examplebsd-2e86db4e6df8-cyberpunk) echo 488d3c5a2be8a7e4a68e5e118300b786487233a5d4651f4637f7285e87b4829e ;;
 	esac
 }
 
