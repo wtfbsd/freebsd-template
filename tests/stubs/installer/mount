@@ -13,11 +13,36 @@
 
 printf 'mount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
+# With $STUB_GEOM (the device directory of the run, see the gpart stub) a
+# mount is remembered in $STUB_GEOM/.mounts ("device dir type options
+# partition", the partition behind a GPT label or the device itself) and
+# shows in the table; the umount stub takes it out again.
+if [ -n "${STUB_GEOM:-}" ] && [ $# -ge 2 ] && [ "$1" != -p ]; then
+	_t=ufs
+	_o=rw
+	while [ $# -gt 2 ]; do
+		case $1 in
+		-t) _t=$2; shift ;;
+		-o) _o=$2; shift ;;
+		esac
+		shift
+	done
+	_p=${1#/dev/}
+	case $_p in
+	gpt/*) [ -f "$STUB_GEOM/.labels/${_p#gpt/}" ] && _p=$(cat "$STUB_GEOM/.labels/${_p#gpt/}") ;;
+	esac
+	printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$_t" "$_o" "$_p" >> "$STUB_GEOM/.mounts"
+	exit 0
+fi
+
 _table() {
 	if [ -n "${STUB_MOUNT_ROOT:-}" ]; then
 		printf '%s\n' "$STUB_MOUNT_ROOT"
 	fi
 	printf 'devfs\t/dev\tdevfs\trw\t0\t0\n'
+	if [ -n "${STUB_GEOM:-}" ] && [ -f "$STUB_GEOM/.mounts" ]; then
+		awk -F '\t' '{ printf "%s\t%s\t%s\t%s\t0\t0\n", $1, $2, $3, $4 }' "$STUB_GEOM/.mounts"
+	fi
 	printf 'tmpfs\t/tmp\ttmpfs\trw\t0\t0\n'
 }
 if [ "$*" = -p ]; then

@@ -2053,6 +2053,16 @@ irun() {
 	chmod +x "$_ir_bin/examplebsd-install"
 	: > "$_ir_log"
 	printf 'test image\n' > "$_ir_img"
+	# the GEOM state of the run (partition tables, GPT labels, GELI, pools,
+	# mounts; see the gpart stub) lives in its device directory: a fresh
+	# copy of the fake /dev, or IR_GEOM, which a test seeds and keeps
+	if [ -n "${IR_GEOM:-}" ]; then
+		_ir_dev=$IR_GEOM
+	else
+		_ir_dev="$INSTDIR/$_ir_n.dev"
+		rm -rf "$_ir_dev"
+		cp -R "$INSTDIR/dev" "$_ir_dev"
+	fi
 	if [ "$_ir_m" = default ]; then
 		INSTALL_MNT=
 	else
@@ -2062,7 +2072,9 @@ irun() {
 	PATH="$_ir_bin:$PATH" STUB_LOG="$_ir_log" \
 		STUB_BSDDIALOG_RC="${IR_BSDDIALOG_RC:-0}" \
 		STUB_MOUNT_ROOT="${IR_MOUNT_ROOT:-}" STUB_GLABEL="${IR_GLABEL:-}" \
-		INSTALL_DEVDIR="$INSTDIR/dev" INSTALL_ZONEINFO="$INSTDIR/zoneinfo" \
+		INSTALL_DEVDIR="$_ir_dev" STUB_GEOM="$_ir_dev" INSTALL_ZONEINFO="$INSTDIR/zoneinfo" \
+		INSTALL_PASSWD="${IR_PASSWD:-$repo/tests/fixtures/installer/passwd}" \
+		TMPDIR="${IR_TMPDIR:-${TMPDIR:-/tmp}}" STUB_ZPOOL_FAIL="${IR_ZPOOL_FAIL:-}" STUB_GELI_FAIL="${IR_GELI_FAIL:-}" \
 		INSTALL_KEYMAPS="$INSTDIR/keymaps" INSTALL_MANIFEST="${IR_MANIFEST:-$INSTDIR/no-manifest}" \
 		INSTALL_PLANNER="$INSTDIR/install-plan" INSTALL_LOCALES="$INSTDIR/locales" \
 		INSTALL_CATALOGUE="$INSTDIR/catalogue.json" INSTALL_SRCROOT="${IR_SRCROOT:-}" \
@@ -3639,7 +3651,7 @@ irun sep "$INSTDIR/mnt-sep" -p "$work/plan-sep.json" -u wtfuser -H "$work/o.hash
 if [ -n "$_nopy" ] || { [ "$_ir_rc" -eq 0 ] &&
 	grep -q "^zpool create .* examplebsd_root gpt/zfs0 *$" "$INSTDIR/sep.log" &&
 	grep -q "^zpool create -f -o altroot=$INSTDIR/mnt-sep -O mountpoint=/data .* data gpt/data-nvd0 *$" "$INSTDIR/sep.log" &&
-	! grep -q '^geli' "$INSTDIR/sep.log" && ! grep -q '^dd ' "$INSTDIR/sep.log"; }; then
+	! grep -Eq '^geli (init|attach)' "$INSTDIR/sep.log" && ! grep -q '^dd ' "$INSTDIR/sep.log"; }; then
 	ok "install -p (copy): \"use the disks separately\" makes the system pool and a data pool on /data$_nopy"
 else
 	no "install -p (copy): \"use the disks separately\" makes the system pool and a data pool on /data (rc=$_ir_rc)"
@@ -4698,5 +4710,333 @@ if grep -qx 'netif restart' "$_nr/calls" 2> /dev/null && grep -qx 'dhclient quie
 else
 	no "firstboot_user: after the netif restart, dhclient is asked for every interface (quietstart skips the ones not on DHCP)"
 fi
+# ------------------------------------------------------------------
+# (k9) installer: other disks, the passphrase, a failed run and a rerun,
+#      the accounts of the system, the confirmation of a plan
+# ------------------------------------------------------------------
+# The stubs keep the GEOM state of a run in its device directory (see the
+# gpart stub): partition tables, GPT labels, GELI providers, pools, mounts.
+# A test seeds it with what another disk, or an earlier run, left there.
+# _k9seed <dir> <disk> <index> <label=partition...> — a partition table on
+# <disk> (its last index) and the GPT labels of its partitions
+_k9seed() {
+	_k9d=$1 _k9disk=$2
+	mkdir -p "$_k9d/.gpart/$_k9disk" "$_k9d/.labels" "$_k9d/gpt"
+	echo "$3" > "$_k9d/.gpart/$_k9disk/n"
+	shift 3
+	for _k9l in "$@"; do
+		printf '%s\n' "${_k9l#*=}" > "$_k9d/.labels/${_k9l%%=*}"
+		printf '%s\n' "${_k9l#*=}" > "$_k9d/gpt/${_k9l%%=*}"
+	done
+}
+# _k9disk <dir> <label> — the disk of the partition a GPT label names
+_k9disk() { sed -e 's/p[0-9]*$//' "$1/.labels/${2%.eli}" 2> /dev/null; }
+# _k9clean <dir> — nothing attached, imported or mounted is left in the state
+_k9clean() {
+	! ls "$1"/.geli/* > /dev/null 2>&1 && ! ls "$1"/.pools/* > /dev/null 2>&1 && [ ! -s "$1/.mounts" ]
+}
+# _k9refused <name> <ERE of the ERROR line> — the run failed with that ERROR
+# line, before any partition, file system, GELI provider or pool was made
+_k9refused() {
+	[ "$_ir_rc" -ne 0 ] && tail -n 1 "$INSTDIR/$1.out" | grep -Eq "^ERROR $2" &&
+		! grep -Eq '^(dd .*of=|gpart (create|add|bootcode)|newfs_msdos|geli (init|attach)|zpool create)' "$INSTDIR/$1.log"
+}
+if [ -n "$_nopy" ]; then
+	ok "installer (k9): other disks, passphrase, cleanup, system accounts$_nopy"
+else
+	IR_SRCROOT=$_cs
+	# 1. another disk (ada1, an earlier install) carries gpt/gptzfsboot0,
+	#    efiboot0, swap0 and zfs0. GEOM makes no second provider with a
+	#    name that exists: a new gpt/zfs0 on vtbd0 would leave /dev/gpt/zfs0
+	#    on ada1, and geli, zpool and fstab would all use the other disk
+	_k9g="$INSTDIR/k9other.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4 gptzfsboot0=ada1p1 efiboot0=ada1p2 swap0=ada1p3 zfs0=ada1p4
+	IR_GEOM=$_k9g
+	irun k9other "$INSTDIR/mnt-k9other" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GEOM=''
+	_k9l="$INSTDIR/k9other.log"
+	_k9fs="$INSTDIR/mnt-k9other/etc/fstab"
+	_k9bad=''
+	for _k9x in $(sed -n 's|^/dev/gpt/\([^[:space:]]*\)[[:space:]].*|\1|p' "$_k9fs" 2> /dev/null); do
+		case $(_k9disk "$_k9g" "$_k9x") in vtbd0 | nvd0) ;; *) _k9bad="$_k9bad $_k9x" ;; esac
+	done
+	if [ "$_ir_rc" -eq 0 ] && [ "$(grep -c '^geli-target init ' "$_k9l")" -eq 2 ] &&
+		! grep -q '^geli-target .* ada1' "$_k9l" && [ "$(grep -c '^zpool-vdev examplebsd_root ' "$_k9l")" -eq 2 ] &&
+		! grep -q '^zpool-vdev .* ada1' "$_k9l"; then
+		ok "install -p (copy): with gpt/zfs0 on another disk, GELI and the pool use only the disks of the plan"
+	else
+		no "install -p (copy): with gpt/zfs0 on another disk, GELI and the pool use only the disks of the plan (rc=$_ir_rc)"
+		grep -E '^(geli-target|zpool-vdev|ERROR)' "$_k9l" "$INSTDIR/k9other.out" 2> /dev/null | sed 's/^/      | /' | head -6
+	fi
+	if [ "$_ir_rc" -eq 0 ] && [ -z "$_k9bad" ] && [ "$(grep -c '^/dev/gpt/efiboot[0-9]*[[:space:]]' "$_k9fs")" -eq 2 ] &&
+		[ "$(grep -c '^/dev/gpt/swap[0-9]*\.eli[[:space:]]' "$_k9fs")" -eq 2 ] &&
+		[ "$(cat "$_k9g/.labels/zfs0")" = ada1p4 ] && [ "$(cat "$_k9g/.labels/efiboot0")" = ada1p2 ]; then
+		ok "install -p (copy): fstab mounts the EFI partitions and swaps by the labels made on the disks of the plan, the other disk's labels stay"
+	else
+		no "install -p (copy): fstab mounts the EFI partitions and swaps by the labels made on the disks of the plan (other disk:$_k9bad)"
+	fi
+	# 2. a label the installer took as free that GEOM gives to another disk
+	#    (no /dev/gpt node to see beforehand): the label is checked against
+	#    the partition just made, and the run stops before anything is written
+	#    to the new partitions (the table of the disk of the plan is made)
+	_k9g="$INSTDIR/k9hidden.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4
+	mkdir -p "$_k9g/.labels"
+	echo ada1p4 > "$_k9g/.labels/zfs0"
+	IR_GEOM=$_k9g
+	irun k9hidden "$INSTDIR/mnt-k9hidden" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GEOM=''
+	if [ "$_ir_rc" -ne 0 ] && tail -n 1 "$INSTDIR/k9hidden.out" | grep -q '^ERROR .*gpt/zfs0' &&
+		! grep -Eq '^(gpart bootcode|newfs_msdos|geli (init|attach)|zpool create)' "$INSTDIR/k9hidden.log"; then
+		ok "install -p (copy): a GPT label that resolves to another disk's partition stops the run before any boot code, file system, GELI provider or pool is made"
+	else
+		no "install -p (copy): a GPT label that resolves to another disk's partition stops the run before any boot code, file system, GELI provider or pool is made (rc=$_ir_rc)"
+		sed 's/^/      | /' "$INSTDIR/k9hidden.out" 2> /dev/null | tail -2
+	fi
+
+	# 3. the GELI passphrase: the loader reads 7-bit ASCII and at most 255
+	#    characters; the newline at the end of the file is not part of it
+	printf 'p\303\244sswort-lang\n' > "$work/k9.pass-utf8"
+	awk 'BEGIN { s = ""; for (i = 0; i < 256; i++) s = s "a"; print s }' > "$work/k9.pass-256"
+	printf '1234567\n' > "$work/k9.pass-7"
+	awk 'BEGIN { s = ""; for (i = 0; i < 255; i++) s = s "b"; print s }' > "$work/k9.pass-255"
+	printf '12345678' > "$work/k9.pass-8"
+	chmod 600 "$work"/k9.pass-*
+	for _k9p in utf8 256 7; do
+		irun "k9pass$_k9p" "$INSTDIR/mnt-k9pass$_k9p" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" \
+			-E "$work/k9.pass-$_k9p" -y --progress
+		if _k9refused "k9pass$_k9p" 'the passphrase must be 8 to 255 printable ASCII characters$'; then
+			ok "install -E: a passphrase of the kind $_k9p is refused before anything is written"
+		else
+			no "install -E: a passphrase of the kind $_k9p is refused before anything is written (rc=$_ir_rc)"
+			tail -n 1 "$INSTDIR/k9pass$_k9p.out" 2> /dev/null | sed 's/^/      | /'
+		fi
+	done
+	for _k9p in 255 8; do
+		irun "k9pass$_k9p" "$INSTDIR/mnt-k9pass$_k9p" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" \
+			-E "$work/k9.pass-$_k9p" -y --progress
+		if [ "$_ir_rc" -eq 0 ]; then
+			ok "install -E: a passphrase of $_k9p printable characters is taken"
+		else
+			no "install -E: a passphrase of $_k9p printable characters is taken (rc=$_ir_rc)"
+			tail -n 1 "$INSTDIR/k9pass$_k9p.out" 2> /dev/null | sed 's/^/      | /'
+		fi
+	done
+
+	# 4. a run that fails leaves nothing of its own: its GELI providers
+	#    detached, its pools exported, its mounts gone, no key file
+	_k9t="$work/k9tmp"
+	mkdir -p "$_k9t"
+	IR_TMPDIR=$_k9t
+	IR_GELI_FAIL='^attach .*zfs1$'
+	irun k9failgeli "$INSTDIR/mnt-k9failgeli" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GELI_FAIL=''
+	if [ "$_ir_rc" -ne 0 ] && grep -q '^geli attach .*zfs0$' "$INSTDIR/k9failgeli.log" && _k9clean "$INSTDIR/k9failgeli.dev" &&
+		! ls "$_k9t"/installkey* > /dev/null 2>&1; then
+		ok "install: a run that fails at the second GELI attach detaches the first and leaves no key file"
+	else
+		no "install: a run that fails at the second GELI attach detaches the first and leaves no key file (rc=$_ir_rc)"
+		ls -A "$INSTDIR/k9failgeli.dev/.geli" "$_k9t" 2> /dev/null | sed 's/^/      | /' | head -4
+	fi
+	# a TMPDIR with a space in it: the key file is still the one removed
+	_k9ts="$work/k9 tmp"
+	mkdir -p "$_k9ts"
+	IR_TMPDIR=$_k9ts
+	IR_GELI_FAIL='^attach .*zfs1$'
+	irun k9failsp "$INSTDIR/mnt-k9failsp" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GELI_FAIL=''
+	IR_TMPDIR=$_k9t
+	if [ "$_ir_rc" -ne 0 ] && _k9clean "$INSTDIR/k9failsp.dev" && ! ls "$_k9ts"/installkey* > /dev/null 2>&1; then
+		ok "install: a failed run removes its key file from a TMPDIR with a space in its name"
+	else
+		no "install: a failed run removes its key file from a TMPDIR with a space in its name (rc=$_ir_rc)"
+	fi
+	# a TMPDIR with a newline in it: refused before anything is made
+	IR_TMPDIR="$work/k9
+tmp"
+	irun k9tmpnl "$INSTDIR/mnt-k9tmpnl" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_TMPDIR=$_k9t
+	if _k9refused k9tmpnl 'TMPDIR and INSTALL_MNT may not hold a control character$'; then
+		ok "install: a TMPDIR with a newline in it is refused before anything is written"
+	else
+		no "install: a TMPDIR with a newline in it is refused before anything is written (rc=$_ir_rc)"
+	fi
+	_pplan k9data '{"version":1,"mode":"erase","usage":"separate","disks":["vtbd0"],"layout":"single","filesystem":"zfs","encryption":{"enabled":true},"swap_mb":0,"data":[{"name":"data","disks":["nvd0"],"layout":"single","filesystem":"zfs","mount":"/data"}]}'
+	IR_ZPOOL_FAIL=data
+	irun k9faildata "$INSTDIR/mnt-k9faildata" -p "$work/plan-k9data.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_ZPOOL_FAIL=''
+	if [ "$_ir_rc" -ne 0 ] && grep -q '^zpool create .* examplebsd_root ' "$INSTDIR/k9faildata.log" &&
+		_k9clean "$INSTDIR/k9faildata.dev" && ! ls "$_k9t"/installkey* > /dev/null 2>&1; then
+		ok "install: a run that fails at the data pool exports the root pool it made and detaches its GELI provider"
+	else
+		no "install: a run that fails at the data pool exports the root pool it made and detaches its GELI provider (rc=$_ir_rc)"
+		ls -A "$INSTDIR/k9faildata.dev/.pools" "$INSTDIR/k9faildata.dev/.geli" 2> /dev/null | sed 's/^/      | /' | head -4
+	fi
+	# on the live media the source is a nullfs mount: a run that fails
+	# after it unmounts it (here the source has no loader)
+	IR_SRCROOT=''
+	IR_MOUNT_ROOT='/dev/iso9660/EXAMPLEBSD / cd9660 ro 0 0'
+	IR_GLABEL='iso9660/EXAMPLEBSD  N/A  cd0'
+	irun k9failsrc "$INSTDIR/mnt-k9failsrc" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_MOUNT_ROOT=''
+	IR_GLABEL=''
+	IR_TMPDIR=''
+	if [ "$_ir_rc" -ne 0 ] && grep -q '^mount -t nullfs ' "$INSTDIR/k9failsrc.log" && _k9clean "$INSTDIR/k9failsrc.dev" &&
+		! ls -d "$_k9t"/installsrc* > /dev/null 2>&1; then
+		ok "install: a run that fails after the nullfs mount of the source unmounts it and removes its directory"
+	else
+		no "install: a run that fails after the nullfs mount of the source unmounts it and removes its directory (rc=$_ir_rc)"
+	fi
+	IR_SRCROOT=$_cs
+
+	# 5. a second run in the same live session: the first left its pool
+	#    imported and its GELI providers attached on the disks. They are
+	#    released first; a pool and a provider of another disk are not touched
+	_k9g="$INSTDIR/k9rerun.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4 zfs9=ada1p4
+	mkdir -p "$_k9g/.geli" "$_k9g/.pools"
+	echo 'gpt/zfs9 ada1p4' > "$_k9g/.geli/gpt_zfs9"
+	echo ada1p4 > "$_k9g/gpt/zfs9.eli"
+	echo '/dev/gpt/zfs9.eli ada1p4' > "$_k9g/.pools/tank"
+	# a file system left mounted on a disk of the plan, and one of the other disk
+	printf '/dev/vtbd0p2\t/k9/leftesp\tmsdosfs\trw\tvtbd0p2\n/dev/ada1p2\t/k9/otheresp\tmsdosfs\trw\tada1p2\n' > "$_k9g/.mounts"
+	IR_GEOM=$_k9g
+	irun k9first "$INSTDIR/mnt-k9first" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	_k9rc1=$_ir_rc
+	irun k9rerun "$INSTDIR/mnt-k9rerun" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GEOM=''
+	if [ "$_k9rc1" -eq 0 ] && [ "$_ir_rc" -eq 0 ] && [ -f "$_k9g/.pools/examplebsd_root" ] && [ -f "$_k9g/.pools/tank" ] &&
+		[ -f "$_k9g/.geli/gpt_zfs9" ] && ! grep -Eq '^(zpool export .*tank|geli detach .*zfs9)' "$INSTDIR/k9rerun.log" &&
+		grep -qx 'umount -f /k9/leftesp' "$INSTDIR/k9first.log" && ! grep -q 'otheresp' "$INSTDIR/k9first.log" "$INSTDIR/k9rerun.log" &&
+		grep -q '/k9/otheresp' "$_k9g/.mounts"; then
+		ok "install: a rerun in the same live session releases what the first run left on its disks, and nothing on another disk"
+	else
+		no "install: a rerun in the same live session releases what the first run left on its disks (rc=$_k9rc1/$_ir_rc)"
+		tail -n 1 "$INSTDIR/k9rerun.out" 2> /dev/null | sed 's/^/      | /'
+	fi
+
+	# a pool that is on a disk of the plan AND on another disk is not
+	#    exported: the run stops before anything is written
+	_k9g="$INSTDIR/k9shared.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4 zfs8=ada1p4
+	_k9seed "$_k9g" vtbd0 4 zfs7=vtbd0p4
+	mkdir -p "$_k9g/.pools"
+	printf '/dev/gpt/zfs7 vtbd0p4\n/dev/gpt/zfs8 ada1p4\n' > "$_k9g/.pools/tank"
+	IR_GEOM=$_k9g
+	irun k9shared "$INSTDIR/mnt-k9shared" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GEOM=''
+	if _k9refused k9shared 'the pool tank is also on ada1' && [ -f "$_k9g/.pools/tank" ] &&
+		! grep -q '^zpool export' "$INSTDIR/k9shared.log"; then
+		ok "install: a pool on a disk of the plan and on another disk is not exported; the run stops before anything is written"
+	else
+		no "install: a pool on a disk of the plan and on another disk is not exported (rc=$_ir_rc)"
+		tail -n 1 "$INSTDIR/k9shared.out" 2> /dev/null | sed 's/^/      | /'
+	fi
+	# the same with a file vdev outside the plan
+	printf '/dev/gpt/zfs7 vtbd0p4\n/k9/pool.img file\n' > "$_k9g/.pools/tank"
+	IR_GEOM=$_k9g
+	irun k9sharedf "$INSTDIR/mnt-k9sharedf" -p "$work/plan-gmirror.json" -u wtfuser -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	IR_GEOM=''
+	if _k9refused k9sharedf 'the pool tank is also on /k9/pool.img' && [ -f "$_k9g/.pools/tank" ]; then
+		ok "install: a pool on a disk of the plan and on a file is not exported either"
+	else
+		no "install: a pool on a disk of the plan and on a file is not exported either (rc=$_ir_rc)"
+		tail -n 1 "$INSTDIR/k9sharedf.out" 2> /dev/null | sed 's/^/      | /'
+	fi
+	# a data pool label and the swap label of an image install that another
+	#    disk has already: the next free name, on the disk of the plan
+	_k9g="$INSTDIR/k9datalab.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4 data-nvd0=ada1p1
+	IR_GEOM=$_k9g
+	irun k9datalab "$INSTDIR/mnt-k9datalab" -p "$work/plan-sep.json" -u wtfuser -H "$work/o.hash" -y --progress
+	IR_GEOM=''
+	if [ "$_ir_rc" -eq 0 ] && grep -q '^zpool create .* data gpt/data-nvd0-1 *$' "$INSTDIR/k9datalab.log" &&
+		grep -qx 'zpool-vdev data nvd0p1' "$INSTDIR/k9datalab.log"; then
+		ok "install -p (copy): a data pool label another disk has becomes data-nvd0-1, on the disk of the plan"
+	else
+		no "install -p (copy): a data pool label another disk has becomes data-nvd0-1, on the disk of the plan (rc=$_ir_rc)"
+		grep -E '^(zpool create|zpool-vdev)' "$INSTDIR/k9datalab.log" 2> /dev/null | sed 's/^/      | /'
+	fi
+	_k9g="$INSTDIR/k9swaplab.dev"
+	rm -rf "$_k9g"
+	cp -R "$INSTDIR/dev" "$_k9g"
+	_k9seed "$_k9g" ada1 4 examplebsdswap=ada1p3
+	mkdir -p "$INSTDIR/mnt-k9swaplab/etc"
+	: > "$INSTDIR/mnt-k9swaplab/etc/fstab"
+	IR_GEOM=$_k9g
+	irun k9swaplab "$INSTDIR/mnt-k9swaplab" -p "$work/plan-swap.json" -u wtfuser -H "$work/o.hash" -y --progress
+	IR_GEOM=''
+	if [ "$_ir_rc" -eq 0 ] && grep -q "$(printf '^/dev/gpt/examplebsdswap-1.eli\tnone\tswap')" "$INSTDIR/mnt-k9swaplab/etc/fstab" &&
+		[ "$(_k9disk "$_k9g" examplebsdswap-1)" = vtbd0 ] && ! grep -q '/dev/gpt/examplebsdswap\.eli' "$INSTDIR/mnt-k9swaplab/etc/fstab"; then
+		ok "install -p (image): a swap label another disk has becomes examplebsdswap-1, on the disk of the plan"
+	else
+		no "install -p (image): a swap label another disk has becomes examplebsdswap-1, on the disk of the plan (rc=$_ir_rc)"
+	fi
+	# 6. the user name may not be an account of the system being installed
+	for _k9u in root operator daemon nobody www; do
+		irun "k9user$_k9u" "$INSTDIR/mnt-k9user$_k9u" -d vtbd0 -u "$_k9u" -H "$work/o.hash" -y --progress
+		if _k9refused "k9user$_k9u" "the user name $_k9u is an account of the system$"; then
+			ok "install -u $_k9u: an account of the system is refused before anything is written"
+		else
+			no "install -u $_k9u: an account of the system is refused before anything is written (rc=$_ir_rc)"
+		fi
+	done
+	# a passwd that cannot be read (here a directory) is not an empty one
+	mkdir -p "$work/k9.passwd-dir"
+	IR_PASSWD="$work/k9.passwd-dir"
+	irun k9pwdir "$INSTDIR/mnt-k9pwdir" -d vtbd0 -u wtfuser -H "$work/o.hash" -y --progress
+	IR_PASSWD=''
+	if _k9refused k9pwdir 'cannot read '; then
+		ok "install -u: a passwd that cannot be read stops the run before anything is written"
+	else
+		no "install -u: a passwd that cannot be read stops the run before anything is written (rc=$_ir_rc)"
+	fi
+	# the copy install reads the accounts of the source it copies
+	_k9cs="$work/k9copysrc"
+	rm -rf "$_k9cs"
+	cp -R "$_cs" "$_k9cs"
+	printf 'svcacct:*:400:400:A service:/nonexistent:/usr/sbin/nologin\n' > "$_k9cs/etc/passwd"
+	IR_SRCROOT=$_k9cs
+	irun k9usersrc "$INSTDIR/mnt-k9usersrc" -p "$work/plan-gmirror.json" -u svcacct -H "$work/o.hash" -E "$work/o.pass" -y --progress
+	if _k9refused k9usersrc 'the user name svcacct is an account of the system$'; then
+		ok "install -p (copy) -u: an account of the copied system is refused before anything is written"
+	else
+		no "install -p (copy) -u: an account of the copied system is refused before anything is written (rc=$_ir_rc)"
+	fi
+	IR_SRCROOT=$_cs
+	# the image install reads the accounts of the image once it is on the disk
+	mkdir -p "$INSTDIR/mnt-k9userimg/etc"
+	printf 'imgacct:*:401:401:An image account:/nonexistent:/usr/sbin/nologin\n' > "$INSTDIR/mnt-k9userimg/etc/passwd"
+	irun k9userimg "$INSTDIR/mnt-k9userimg" -d vtbd0 -u imgacct -H "$work/o.hash" -y --progress
+	if [ "$_ir_rc" -ne 0 ] && tail -n 1 "$INSTDIR/k9userimg.out" | grep -q '^ERROR the user name imgacct is an account of the system$' &&
+		[ ! -e "$INSTDIR/mnt-k9userimg/boot/firstboot-user.conf" ] && _k9clean "$INSTDIR/k9userimg.dev" &&
+		grep -q '^zpool export -f examplebsd_root' "$INSTDIR/k9userimg.log"; then
+		ok "install -d -u: an account of the image on the disk is refused, no first-boot conf written, its pool and mount released"
+	else
+		no "install -d -u: an account of the image on the disk is refused, no first-boot conf written, its pool and mount released (rc=$_ir_rc)"
+	fi
+
+	# 7. without -y a plan asks once, naming every disk it erases
+	irun k9ask "$INSTDIR/mnt-k9ask" -p "$work/plan-sep.json" -u wtfuser -H "$work/o.hash"
+	if grep -q 'ALL DATA ON .*/dev/vtbd0' "$INSTDIR/k9ask.err" && grep -q 'ALL DATA ON .*/dev/nvd0' "$INSTDIR/k9ask.err" &&
+		! grep -Eq '^gpart (create|add)' "$INSTDIR/k9ask.log"; then
+		ok "install -p without -y: the confirmation names every disk of the plan (/dev/vtbd0 and /dev/nvd0)"
+	else
+		no "install -p without -y: the confirmation names every disk of the plan (/dev/vtbd0 and /dev/nvd0)"
+		grep 'ALL DATA' "$INSTDIR/k9ask.err" 2> /dev/null | sed 's/^/      | /'
+	fi
+	IR_SRCROOT=''
+fi
+# ---- end of (k9) ----
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

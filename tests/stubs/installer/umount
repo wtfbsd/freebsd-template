@@ -3,7 +3,18 @@
 #
 # Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
 #
-# Logs its arguments to $STUB_LOG.
+# Logs its arguments to $STUB_LOG. With $STUB_GEOM (see the mount stub)
+# the mount of the directory is taken out of $STUB_GEOM/.mounts, and a
+# directory that is not mounted is refused, as umount(8) does.
 
 printf 'umount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+if [ -n "${STUB_GEOM:-}" ]; then
+	for _a in "$@"; do _dir=$_a; done
+	_m="$STUB_GEOM/.mounts"
+	if ! awk -F '\t' -v d="$_dir" '$2 == d || $1 == d { f = 1 } END { exit !f }' "$_m" 2> /dev/null; then
+		echo "umount: $_dir: not a file system root directory" >&2
+		exit 1
+	fi
+	awk -F '\t' -v d="$_dir" '!($2 == d || $1 == d)' "$_m" > "$_m.new" && mv "$_m.new" "$_m"
+fi
 exit 0

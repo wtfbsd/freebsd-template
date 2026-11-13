@@ -31,7 +31,9 @@
 #
 # Every destructive step is guarded: the target must be a real disk,
 # must never be the disk holding the running root (the live media), and is
-# confirmed interactively unless -y is given.
+# confirmed interactively unless -y is given. A run that fails takes away
+# what it made (mounts, pools, GELI providers, the key file); a new run
+# first releases what an earlier one left on its disks, and on no other.
 
 set -u
 
@@ -172,6 +174,25 @@ usage() {
 is_username() {
 	printf '%s\n' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'
 }
+
+# is_account <name> <passwd file> — is <name> an account in that passwd(5)
+# file? A file that is not there names no account; one that cannot be read
+# stops the run (not looking is not finding nothing)
+is_account() {
+	[ -e "$2" ] || return 1
+	[ -f "$2" ] || die "cannot read $2"
+	_ia_user="$1" awk -F: '$1 == ENVIRON["_ia_user"] { f = 1 } END { exit !f }' "$2"
+	case $? in
+	0) return 0 ;;
+	1) return 1 ;;
+	*) die "cannot read $2" ;;
+	esac
+}
+# the accounts of the system being installed: the passwd of the live system
+# (the same base as the image; INSTALL_PASSWD in the tests). A copy install
+# checks the passwd of its source again, an image install the passwd of the
+# image once it is on the disk.
+passwd_file=${INSTALL_PASSWD:-/etc/passwd}
 
 keyprefix() {
 	case $1 in
@@ -352,13 +373,136 @@ root_disks() {
 	esac
 }
 
+# dev_disk <device> — the disk under a device: /dev/ada0p4, a GEOM label
+# (gpt/zfs0, resolved with glabel(8)) or either with a .eli on top; nothing
+# (and a non-zero status) when it cannot be told
+dev_disk() {
+	_dn=${1#/dev/}
+	_dn=${_dn%.eli}
+	case $_dn in
+	*/*)
+		_dn=$(glabel status -s 2> /dev/null | awk -v l="$_dn" '$1 == l { print $3; exit }')
+		[ -n "$_dn" ] || return 1
+		;;
+	esac
+	disk_of "$_dn"
+}
+
+# release_disks <disks...> — what an earlier run in this live session left
+# on these disks: its pools exported, its file systems unmounted, its GELI
+# providers detached, so that the disks can be partitioned again. A pool, a
+# mount or a provider that is not on one of these disks is left alone, and a
+# pool that is on one of them AND on another disk stops the run: exporting
+# it would take it from the other disk too. Unlike release_own (the cleanup
+# of a failed run, which does what it can), an export, unmount or detach
+# that fails stops the run, and so does a pool or mount listing that fails.
+# A GELI provider or mount it cannot resolve still holds the disk: the kernel
+# then refuses the dd of an image install and the gpart create of a copy
+# install ("Device busy", "File exists") and the run stops there.
+release_disks() {
+	# a listing that fails is not an empty one
+	_rpl=$(zpool list -H -o name) || die 'cannot list the imported pools (zpool list)'
+	_rmp=$(mount -p) || die 'cannot list the mounts (mount -p)'
+	for _rp in $_rpl; do
+		_rin=''
+		_rout=''
+		# every device of the pool: a file vdev, or anything that is not
+		# a disk of this install, counts as another disk
+		for _rv in $(zpool status -P "$_rp" 2> /dev/null | awk '$1 ~ /^\// { print $1 }'); do
+			case $_rv in
+			/dev/*) _rd=$(dev_disk "$_rv") || _rd=$_rv ;;
+			*) _rd=$_rv ;;
+			esac
+			if inlist "$_rd" "$@"; then
+				_rin=$_rd
+			else
+				_rout=$_rd
+			fi
+		done
+		[ -n "$_rin" ] || continue
+		[ -z "$_rout" ] || die "the pool $_rp is also on $_rout, not a disk of this install: export it first"
+		warn "exporting the pool $_rp, left on $_rin"
+		zpool export -f "$_rp" || die "cannot export the pool $_rp on $_rin"
+	done
+	# mount -p writes a space or a tab in a path as \040 or \011 (fstab(5))
+	_rms=$(printf '%s\n' "$_rmp" | awk '$1 ~ /^\/dev\// { print $1, $2 }' | while read -r _rv _rm; do
+		_rm=$(printf '%s\n' "$_rm" | sed -e 's/\\040/ /g' -e 's/\\011/	/g')
+		_rd=$(dev_disk "$_rv") || continue
+		! inlist "$_rd" "$@" || printf '%s\n' "$_rm"
+	done)
+	while IFS= read -r _rm; do
+		[ -n "$_rm" ] || continue
+		warn "unmounting $_rm"
+		umount -f "$_rm" || die "cannot unmount $_rm"
+	done <<MOUNTS
+$_rms
+MOUNTS
+	for _rv in $(geli status -s 2> /dev/null | awk '$1 ~ /\.eli$/ { print $1 }'); do
+		_rd=$(dev_disk "$_rv") || continue
+		inlist "$_rd" "$@" || continue
+		warn "detaching $_rv"
+		geli detach "$_rv" || die "cannot detach $_rv on $_rd"
+	done
+}
+
 if [ -t 0 ]; then
 	_rootstty=$(stty -g)
 fi
 _ddpid=''
-trap '[ -n "$_rootstty" ] && stty "$_rootstty"' EXIT
-# a signal stops the installer, and the image writer it may have started
-trap '[ -z "$_ddpid" ] || kill "$_ddpid" 2> /dev/null; die "interrupted"' HUP INT TERM
+_cppid=''
+# what this run made, so that a run that fails takes it away again: its
+# mounts, pools and GELI providers, its temporary files and directories.
+case ${TMPDIR:-}$mnt in
+*[[:cntrl:]]*) die 'TMPDIR and INSTALL_MNT may not hold a control character' ;;
+esac
+# Only these: what was there before the run, on any disk, is not touched.
+# One record a line, "<kind>:<item>", read a line at a time: a path with a
+# space or a glob character in it (TMPDIR, INSTALL_MNT) stays one path, and
+# a path with a newline or another control character is refused below.
+nl='
+'
+owned=''
+own_add() { # own_add <kind> <item> — this run made <item> (a mount, pool, eli, file or dir)
+	owned="$1:$2$nl$owned"
+}
+own_drop() { # own_drop <kind> <item> — <item> is gone, or stays on purpose
+	owned=$(printf '%s' "$owned" | _od_rec="$1:$2" awk '$0 != ENVIRON["_od_rec"]')
+	[ -z "$owned" ] || owned="$owned$nl"
+}
+release_own() { # a run that fails: what it made goes, the last made first
+	for _op in $_ddpid $_cppid; do
+		kill "$_op" 2> /dev/null
+	done
+	# the stages of the pipeline die with it (SIGPIPE): wait for them, so
+	# that nothing still writes under what is taken away below
+	wait 2> /dev/null
+	# the mounts, then the pools, then the GELI providers under them, then
+	# the files and the directories (the list holds the last made first)
+	for _ok in mount pool eli file dir; do
+		while IFS= read -r _oi; do
+			[ "${_oi%%:*}" = "$_ok" ] || continue
+			_om=${_oi#*:}
+			case $_ok in
+			mount) umount -f "$_om" < /dev/null || warn "cannot unmount $_om" ;;
+			pool) zpool export -f "$_om" < /dev/null || warn "cannot export the pool $_om" ;;
+			eli) geli detach "$_om" < /dev/null || warn "cannot detach $_om" ;;
+			file) rm -f "$_om" || warn "cannot remove $_om" ;;
+			dir) rmdir "$_om" 2> /dev/null ;;
+			esac
+		done <<OWNED
+$owned
+OWNED
+	done
+	owned=''
+}
+on_exit() { # on_exit <status> — a run that fails cleans up; the terminal is restored
+	[ "$1" -eq 0 ] || release_own
+	[ -z "$_rootstty" ] || stty "$_rootstty"
+}
+trap 'on_exit $?' EXIT
+# a signal stops the installer, and the image writer or the copy it may
+# have started (the exit cleans up what the run made)
+trap 'for _sp in $_ddpid $_cppid; do kill "$_sp" 2> /dev/null; done; die "interrupted"' HUP INT TERM
 
 nets=''
 nets6=''
@@ -481,14 +625,22 @@ PLAN
 	[ -n "$disk" ] || die 'disk plan: no disk'
 fi
 # the passphrase of the disk encryption: required exactly when the plan
-# encrypts; one line, 8..1024 bytes, never on a command line
+# encrypts, never on a command line. The loader asks it at boot: it reads
+# 7-bit ASCII (getchar() & 0177) and keeps at most GELI_PW_MAXLEN - 1 = 255
+# characters, so the passphrase is 8 to 255 printable ASCII characters; the
+# one newline that may end the file is not part of it
 if [ "$encrypt" = yes ]; then
 	[ -n "$passfile" ] || die 'the plan encrypts the system: -E PASSPHRASEFILE is needed'
 	private_file "$passfile" passphrase
 	_pl=$(wc -c < "$passfile" | tr -d ' ')
-	[ "$_pl" -ge 8 ] && [ "$_pl" -le 1025 ] || die 'the passphrase must be 8 to 1024 bytes'
-	[ "$(tr -d '\000' < "$passfile" | wc -c | tr -d ' ')" = "$_pl" ] || die 'the passphrase may not hold a NUL byte'
-	[ "$(wc -l < "$passfile" | tr -d ' ')" -le 1 ] || die 'the passphrase is one line'
+	# the bytes that are not printable ASCII (a newline among them)
+	_pb=$(LC_ALL=C tr -d ' -~' < "$passfile" | wc -c | tr -d ' ')
+	if [ "$_pb" -eq 1 ] && [ "$(tail -c 1 "$passfile" | od -An -tx1 | tr -d ' \n')" = 0a ]; then
+		_pl=$((_pl - 1))
+		_pb=0
+	fi
+	[ "$_pb" -eq 0 ] && [ "$_pl" -ge 8 ] && [ "$_pl" -le 255 ] \
+		|| die 'the passphrase must be 8 to 255 printable ASCII characters'
 else
 	[ -z "$passfile" ] || die '-E is given but the plan has no disk encryption'
 fi
@@ -572,6 +724,7 @@ fi
 
 if [ -n "$user" ]; then
 	is_username "$user" || die "bad username: $user (must match ^[a-z_][a-z0-9_-]{0,31}\$)"
+	! is_account "$user" "$passwd_file" || die "the user name $user is an account of the system"
 fi
 if [ -n "$hostname" ]; then
 	is_hostname "$hostname" || die "bad host name: $hostname"
@@ -622,12 +775,15 @@ if [ -z "$user" ]; then
 		case ${_u:-} in
 		'') continue ;;
 		esac
-		if is_username "$_u"; then
+		if is_account "$_u" "$passwd_file"; then
+			warn "$_u is an account of the system; try again"
+		elif is_username "$_u"; then
 			user=$_u
 			[ -n "$fullname" ] && [ "$fullname" != "$user" ] || fullname=$_u
 			break
+		else
+			warn 'bad username ([a-z_][a-z0-9_-]{0,31}); try again'
 		fi
-		warn 'bad username ([a-z_][a-z0-9_-]{0,31}); try again'
 	done
 	_prev_keys=$keys
 	while :; do
@@ -757,8 +913,11 @@ if [ "$installpath" = copy ]; then
 	[ "$imagefs" = zfs ] || die 'a copy install needs a ZFS image'
 fi
 
+# the disks this run erases
+erase=$disk
+[ "$installpath" != copy ] || erase=$alldisks
 if [ "$assume" -ne 1 ]; then
-	printf 'ALL DATA ON /dev/%s WILL BE DESTROYED, type yes: ' "$disk" >&2
+	printf 'ALL DATA ON %s WILL BE DESTROYED, type yes: ' "$(for _d in $erase; do printf '/dev/%s ' "$_d"; done | sed 's/ $//')" >&2
 	IFS= read -r _a || die 'aborted'
 	[ "${_a:-}" = yes ] || die 'cancelled'
 fi
@@ -782,6 +941,64 @@ zpool_spec() { # zpool_spec <layout> <devices...> — the vdev words of a pool
 	esac
 }
 
+# gpt_index, gpt_label and gpt_add answer in a global (gidx, glab,
+# gpart_prov), read right after the call: they die on an error, which a
+# command substitution would hide in a subshell.
+#
+# gpt_index <first> — gidx: the first index N, from <first> on, for which none of
+# /dev/gpt/gptzfsboot<N>, efiboot<N>, swap<N> and zfs<N> exists (as
+# bsdinstall's zfsboot does): GEOM makes no second provider with a name that
+# exists, so a label another disk already has would name THAT disk
+gpt_index() {
+	gidx=$1
+	while [ -e "$devdir/gpt/gptzfsboot$gidx" ] || [ -e "$devdir/gpt/efiboot$gidx" ] ||
+		[ -e "$devdir/gpt/swap$gidx" ] || [ -e "$devdir/gpt/zfs$gidx" ]; do
+		gidx=$((gidx + 1))
+	done
+}
+
+# gpt_label <base> — glab: <base>, or <base>-<N> with the first N that no
+# /dev/gpt node has
+gpt_label() {
+	glab=$1
+	_gn=0
+	while [ -e "$devdir/gpt/$glab" ]; do
+		_gn=$((_gn + 1))
+		glab=$1-$_gn
+	done
+}
+
+# gpt_add <disk> <label> <gpart add options...> — add a partition with the
+# GPT label <label> and check, before anything is written to it, that
+# /dev/gpt/<label> is that partition and not one of another disk;
+# gpart_prov is the partition (ada0p4)
+gpt_add() {
+	_gad=$1
+	_gal=$2
+	shift 2
+	_gao=$(gpart add "$@" -l "$_gal" "$_gad") || die "gpart add $_gal on $_gad failed"
+	gpart_prov=${_gao%% *}
+	case $gpart_prov in
+	"$_gad"p[0-9]*) ;;
+	*) die "gpart add on $_gad named no partition: $_gao" ;;
+	esac
+	gpt_check "$_gal" "$gpart_prov"
+}
+
+# gpt_check <label> <partition> — /dev/gpt/<label> is <partition>
+gpt_check() {
+	_gct=0
+	while :; do
+		_gcc=$(glabel status -s 2> /dev/null | awk -v l="gpt/$1" '$1 == l { print $3; exit }')
+		[ -z "$_gcc" ] || break
+		# GEOM tastes the new partition right after gpart: a moment at most
+		_gct=$((_gct + 1))
+		[ "$_gct" -lt 5 ] || break
+		sleep 1
+	done
+	[ "$_gcc" = "$2" ] || die "gpt/$1 is ${_gcc:-missing}, not the new partition $2: another disk has the label"
+}
+
 copy_install() {
 	pool=$(cat "${img%/*}/system.pool" 2> /dev/null)
 	printf '%s\n' "$pool" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*$' || die "no root pool name next to $img"
@@ -798,84 +1015,143 @@ copy_install() {
 		_rtyp=$(mount -p | awk '$2 == "/" { print $3; exit }')
 		[ "$_rtyp" = cd9660 ] || die 'a copy install runs from the live media (its root is not cd9660)'
 		srcmnt=$(mktemp -d -t installsrc) || die 'mktemp failed'
+		own_add dir "$srcmnt"
 		mount -t nullfs -o ro / "$srcmnt" || die 'cannot mount the live root read-only (nullfs)'
+		own_add mount "$srcmnt"
 		srcroot=$srcmnt
 	fi
 	[ -f "$srcroot/boot/loader.efi" ] || die "no /boot/loader.efi in $srcroot"
-	# an earlier run in this live session may have left the pool imported
+	# the accounts of the system that is copied (the files the live layer
+	# replaced come back from orig/)
+	_srcpw=$srcroot/etc/passwd
+	[ ! -f "${img%/*}/orig/etc/passwd" ] || _srcpw=${img%/*}/orig/etc/passwd
+	! is_account "$user" "$_srcpw" || die "the user name $user is an account of the system"
+	# what an earlier run in this live session left on the disks
+	release_disks $alldisks
 	if zpool list -H -o name "$pool" > /dev/null 2>&1; then
-		zpool export -f "$pool" || die "zpool export $pool failed"
+		die "a pool named $pool is imported from another disk: export it first"
 	fi
 	keyfile=''
 	if [ "$encrypt" = yes ]; then
 		# geli reads every byte of the file: the newline goes, the loader
 		# prompt has none
 		keyfile=$(mktemp -t installkey) || die 'mktemp failed'
+		own_add file "$keyfile"
 		chmod 600 "$keyfile"
 		printf '%s' "$(cat "$passfile")" > "$keyfile" || die 'cannot copy the passphrase'
 	fi
 	step 5 'Partitioning the disks'
-	_i=0
+	# every disk of the plan loses its partition table first, so that its
+	# old labels are free again before any new one is chosen
+	for _d in $alldisks; do
+		gpart destroy -F "$_d" > /dev/null 2>&1 || :
+	done
+	# the partitions of every system disk, each GPT label checked against
+	# the partition it was given, before anything is written to them
+	_gnext=0
+	_sysparts=''
 	zdevs=''
 	swaplabels=''
+	for _d in $sysdisks; do
+		gpt_index "$_gnext"
+		_gnext=$((gidx + 1))
+		gpart create -s gpt "$_d" > /dev/null || die "gpart create on $_d failed"
+		gpt_add "$_d" "gptzfsboot$gidx" -t freebsd-boot -s 512k
+		_bootp=$gpart_prov
+		gpt_add "$_d" "efiboot$gidx" -t efi -a 1m -s 260m
+		_espp=$gpart_prov
+		if [ "$swap_mb" -gt 0 ]; then
+			gpt_add "$_d" "swap$gidx" -t freebsd-swap -a 1m -s "${swap_mb}m"
+			swaplabels="$swaplabels swap$gidx"
+		fi
+		gpt_add "$_d" "zfs$gidx" -t freebsd-zfs -a 1m
+		_sysparts="$_sysparts $_d:${_bootp#"$_d"p}:$_espp:$gidx"
+	done
+	# the boot code, the EFI partition and the GELI provider of every disk
 	_secsz=512
 	[ "$sector4k" != yes ] || _secsz=4096
-	for _d in $sysdisks; do
-		gpart destroy -F "$_d" > /dev/null 2>&1 || :
-		gpart create -s gpt "$_d" || die "gpart create on $_d failed"
-		gpart add -t freebsd-boot -s 512k -l "gptzfsboot$_i" "$_d" || die "gpart add freebsd-boot on $_d failed"
-		gpart bootcode -b "$srcroot/boot/pmbr" -p "$srcroot/boot/gptzfsboot" -i 1 "$_d" || die "gpart bootcode on $_d failed"
-		gpart add -t efi -a 1m -s 260m -l "efiboot$_i" "$_d" || die "gpart add efi on $_d failed"
-		newfs_msdos -F 32 -c 1 -L EFISYS "/dev/${_d}p2" > /dev/null || die "newfs_msdos on ${_d}p2 failed"
+	_esplabels=''
+	for _sp in $_sysparts; do
+		_d=${_sp%%:*}
+		_sp=${_sp#*:}
+		_bi=${_sp%%:*}
+		_sp=${_sp#*:}
+		_espp=${_sp%%:*}
+		gidx=${_sp#*:}
+		gpart bootcode -b "$srcroot/boot/pmbr" -p "$srcroot/boot/gptzfsboot" -i "$_bi" "$_d" || die "gpart bootcode on $_d failed"
+		newfs_msdos -F 32 -c 1 -L EFISYS "/dev/$_espp" > /dev/null || die "newfs_msdos on $_espp failed"
 		_esp=$(mktemp -d -t installesp) || die 'mktemp failed'
-		mount -t msdosfs "/dev/${_d}p2" "$_esp" || die "cannot mount the EFI partition of $_d"
+		own_add dir "$_esp"
+		mount -t msdosfs "/dev/$_espp" "$_esp" || die "cannot mount the EFI partition of $_d"
+		own_add mount "$_esp"
 		mkdir -p "$_esp/EFI/BOOT" && cp "$srcroot/boot/loader.efi" "$_esp/EFI/BOOT/BOOTX64.EFI" \
-			|| { umount "$_esp"; die "cannot install the EFI loader on $_d"; }
-		umount "$_esp" || warn "umount $_esp failed"
+			|| die "cannot install the EFI loader on $_d"
+		umount "$_esp" || die "cannot unmount the EFI partition of $_d"
+		own_drop mount "$_esp"
 		rmdir "$_esp" 2> /dev/null || :
-		if [ "$swap_mb" -gt 0 ]; then
-			gpart add -t freebsd-swap -a 1m -s "${swap_mb}m" -l "swap$_i" "$_d" || die "gpart add swap on $_d failed"
-			swaplabels="$swaplabels swap$_i"
-		fi
-		gpart add -t freebsd-zfs -a 1m -l "zfs$_i" "$_d" || die "gpart add freebsd-zfs on $_d failed"
-		_zd=gpt/zfs$_i
+		own_drop dir "$_esp"
+		_esplabels="$_esplabels efiboot$gidx"
+		_zd=gpt/zfs$gidx
 		if [ "$encrypt" = yes ]; then
 			# -b: the passphrase is asked at boot, -g: the loader asks it
 			geli init -b -g -e AES-XTS -l 256 -s "$_secsz" -J "$keyfile" "/dev/$_zd" > /dev/null \
 				|| die "geli init on $_zd failed"
 			geli attach -j "$keyfile" "/dev/$_zd" || die "geli attach of $_zd failed"
 			_zd=$_zd.eli
+			own_add eli "/dev/$_zd"
 		fi
 		zdevs="$zdevs $_zd"
-		_i=$((_i + 1))
 	done
-	[ -z "$keyfile" ] || { rm -f "$keyfile"; keyfile=''; }
+	if [ -n "$keyfile" ]; then
+		rm -f "$keyfile"
+		own_drop file "$keyfile"
+		keyfile=''
+	fi
 	step 15 'Making the ZFS pool'
 	set -- -f -o altroot="$mnt" -O mountpoint=/ -O compression=lz4 -O atime=off
 	[ "$sector4k" != yes ] || set -- "$@" -o ashift=12
 	# shellcheck disable=SC2046
 	zpool create "$@" "$pool" $(zpool_spec "$layout" $zdevs) || die "zpool create $pool ($layout) failed"
+	own_add pool "$pool"
 	zpool set bootfs="$pool" "$pool" || die "zpool set bootfs on $pool failed"
 	mkdir -p "$mnt/etc/zfs" "$mnt/boot/zfs"
 	zpool set cachefile="$mnt/etc/zfs/zpool.cache" "$pool" || warn "cannot set the cache file of $pool"
-	printf '%s' "$datapools" | while IFS='|' read -r _dn _dlay _dmnt _ddisks; do
+	# the data pools, in this shell (not a pipeline) so that a failure
+	# stops the run and what it made is known
+	_oifs=$IFS
+	IFS='
+'
+	set -f
+	for _dline in $datapools; do
+		IFS='|'
+		# shellcheck disable=SC2086
+		set -- $_dline
+		IFS=$_oifs
+		_dn=${1:-}
+		_dlay=${2:-}
+		_dmnt=${3:-}
+		_ddisks=${4:-}
 		[ -n "$_dn" ] || continue
 		_dz=''
 		for _d in $(printf '%s' "$_ddisks" | tr ',' ' '); do
-			gpart destroy -F "$_d" > /dev/null 2>&1 || :
-			gpart create -s gpt "$_d" || die "gpart create on $_d failed"
-			gpart add -t freebsd-zfs -a 1m -l "$_dn-$_d" "$_d" || die "gpart add freebsd-zfs on $_d failed"
-			_dz="$_dz gpt/$_dn-$_d"
+			gpart create -s gpt "$_d" > /dev/null || die "gpart create on $_d failed"
+			gpt_label "$_dn-$_d"
+			gpt_add "$_d" "$glab" -t freebsd-zfs -a 1m
+			_dz="$_dz gpt/$glab"
 		done
 		# shellcheck disable=SC2046
 		zpool create -f -o altroot="$mnt" -O mountpoint="$_dmnt" -O compression=lz4 -O atime=off \
 			"$_dn" $(zpool_spec "$_dlay" $_dz) || die "zpool create $_dn ($_dlay) failed"
+		own_add pool "$_dn"
 		zpool set cachefile="$mnt/etc/zfs/zpool.cache" "$_dn" || warn "cannot set the cache file of $_dn"
-	done || exit 1
+	done
+	IFS=$_oifs
+	set +f
 	step 20 'Copying the system'
 	# the paths of the live layer are left out; tar matches them as written
 	# in the list ("./usr/local/share/...")
 	_cpst=$(mktemp -t install) || die 'mktemp failed'
+	own_add file "$_cpst"
 	{ (cd "$srcroot" && tar -cf - -X "$livepaths" .) || echo fail > "$_cpst"; } \
 		| (cd "$mnt" && tar -xpf -) &
 	_cppid=$!
@@ -892,9 +1168,11 @@ copy_install() {
 			_last=$_pct
 		fi
 	done
-	wait "$_cppid" || die 'copying the system failed'
+	wait "$_cppid" || { _cppid=''; die 'copying the system failed'; }
+	_cppid=''
 	[ ! -s "$_cpst" ] || die "reading the system from $srcroot failed"
 	rm -f "$_cpst"
+	own_drop file "$_cpst"
 	# the files the live layer replaced come back as the image has them
 	if [ -d "${img%/*}/orig" ]; then
 		(cd "${img%/*}/orig" && tar -cf - .) | (cd "$mnt" && tar -xpf -) \
@@ -911,14 +1189,15 @@ copy_install() {
 	# every system disk has an EFI partition with the volume label EFISYS:
 	# with two or more the label is ambiguous, and an EFI partition left
 	# unmounted shows as a volume icon on the desktop. Each is mounted by
-	# its GPT label: the first on /boot/efi, the others on /boot/efi1...
+	# the GPT label it was given: the first on /boot/efi, the others on
+	# /boot/efi1...
 	_esps=''
 	_i=0
-	for _d in $sysdisks; do
+	for _el in $_esplabels; do
 		_emp=/boot/efi
 		[ "$_i" -eq 0 ] || _emp=/boot/efi$_i
 		mkdir -p "$mnt$_emp" || die "cannot make $_emp"
-		_esps="$_esps$(printf '/dev/gpt/efiboot%s\t%s\tmsdosfs\trw,failok\t2\t2' "$_i" "$_emp")
+		_esps="$_esps$(printf '/dev/gpt/%s\t%s\tmsdosfs\trw,failok\t2\t2' "$_el" "$_emp")
 "
 		_i=$((_i + 1))
 	done
@@ -931,8 +1210,13 @@ copy_install() {
 			|| die 'cannot write the GELI loader setting'
 	fi
 	if [ -n "$srcmnt" ]; then
-		umount "$srcmnt" || warn "umount $srcmnt failed"
-		rmdir "$srcmnt" 2> /dev/null || :
+		if umount "$srcmnt"; then
+			own_drop mount "$srcmnt"
+			rmdir "$srcmnt" 2> /dev/null || :
+			own_drop dir "$srcmnt"
+		else
+			warn "umount $srcmnt failed"
+		fi
 	fi
 	ftype=zfscopy
 }
@@ -943,6 +1227,8 @@ if [ "$installpath" = copy ]; then
 	copy_install
 else
 
+# what an earlier run in this live session left on the disk
+release_disks "$disk"
 ddstatus=''
 if dd if=/dev/null of=/dev/null status=progress 2>/dev/null; then
 	ddstatus=status=progress
@@ -951,6 +1237,7 @@ step 5 "Writing the system to /dev/$disk"
 echo "Writing $img to /dev/$disk ..." >&2
 # set -o pipefail is not POSIX: check xz separately via a status file
 _xzst=$(mktemp -t install) || die 'mktemp failed'
+own_add file "$_xzst"
 if [ "$progress" -eq 1 ]; then
 	# the pipeline runs in the background; dd's status=progress lines
 	# (bytes written so far) are read from its log and turned into
@@ -958,6 +1245,7 @@ if [ "$progress" -eq 1 ]; then
 	_total=$(xz --robot -l "$img" 2>/dev/null | awk -F '\t' '$1 == "totals" { print $5; exit }')
 	case $_total in '' | *[!0-9]*) _total=0 ;; esac
 	_ddlog=$(mktemp -t install) || die 'mktemp failed'
+	own_add file "$_ddlog"
 	{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus 2> "$_ddlog" &
 	_ddpid=$!
 	_last=5
@@ -980,11 +1268,13 @@ if [ "$progress" -eq 1 ]; then
 	}
 	_ddpid=''
 	rm -f "$_ddlog"
+	own_drop file "$_ddlog"
 else
 	{ xz -dc "$img" || echo fail > "$_xzst"; } | dd "of=/dev/$disk" bs=1m $ddstatus || die "dd to /dev/$disk failed"
 fi
 [ ! -s "$_xzst" ] || die "xz -dc $img failed"
 rm -f "$_xzst"
+own_drop file "$_xzst"
 sync
 
 step 72 'Growing the partition table'
@@ -999,7 +1289,10 @@ lastidx=$(gpart show /dev/"$disk" \
 [ -n "$lastidx" ] || die 'could not determine the last partition index (gpart show)'
 # swap (the plan's swap_mb) goes at the end of the disk, aligned to 1 MiB,
 # and the root partition grows up to it
-swaplabel='@SLUG@swap'
+# the GPT label of the swap: @SLUG@swap, or @SLUG@swap-<N> when another
+# disk has that one (the label would name the other disk's partition)
+gpt_label '@SLUG@swap'
+swaplabel=$glab
 if [ "$swap_mb" -gt 0 ]; then
 	_secsz=$(diskinfo "$disk" 2> /dev/null | awk '{ print $2; exit }')
 	case $_secsz in '' | *[!0-9]* | 0) _secsz=512 ;; esac
@@ -1008,8 +1301,9 @@ if [ "$swap_mb" -gt 0 ]; then
 	_align=$((1048576 / _secsz))
 	_sstart=$((_end - swap_mb * (1048576 / _secsz)))
 	_sstart=$((_sstart - _sstart % _align))
-	gpart add -t freebsd-swap -l "$swaplabel" -b "$_sstart" -s "${swap_mb}M" /dev/"$disk" \
+	_gao=$(gpart add -t freebsd-swap -l "$swaplabel" -b "$_sstart" -s "${swap_mb}M" /dev/"$disk") \
 		|| die "gpart add of $swap_mb MiB of swap failed (the disk may be too small)"
+	gpt_check "$swaplabel" "${_gao%% *}"
 fi
 gpart resize -i "$lastidx" /dev/"$disk" || die "gpart resize -i $lastidx failed"
 ptype=$(gpart show /dev/"$disk" \
@@ -1023,18 +1317,21 @@ case $ptype in
 freebsd-ufs)
 	growfs -y "/dev/${disk}p${lastidx}" || die 'growfs failed'
 	mount "/dev/${disk}p${lastidx}" "$mnt" || die "mount /dev/${disk}p${lastidx} failed"
+	own_add mount "$mnt"
 	ftype=ufs
 	;;
 freebsd-zfs)
 	pool=$(zpool import -d "/dev/${disk}p${lastidx}" 2>/dev/null | awk '/pool:/ { print $2 }')
 	[ -n "$pool" ] || die 'zpool import: could not read the pool name'
 	zpool import -f -N -R "$mnt" "$pool" || die "zpool import $pool failed"
+	own_add pool "$pool"
 	zpool online -e "$pool" "/dev/${disk}p${lastidx}" || die "zpool online -e $pool failed"
 	# the root dataset of the pool keeps its own mountpoint (/<pool>),
 	# so under the altroot above it would land in <mnt>/<pool> and the
 	# first-boot config would be written into an empty directory: the
 	# dataset is mounted on the mount point itself
 	mount -t zfs "$pool" "$mnt" || die "mount -t zfs $pool $mnt failed"
+	own_add mount "$mnt"
 	ftype=zfs
 	;;
 *) die "unexpected type of partition $lastidx: $ptype" ;;
@@ -1093,6 +1390,8 @@ fi
 # ---- first-boot config (same format rc.d/firstboot_user parses) ------------
 
 step 90 'Writing the first boot settings'
+# the accounts of the system now on the disk
+! is_account "$user" "$mnt/etc/passwd" || die "the user name $user is an account of the system"
 dst=$mnt/boot/firstboot-user.conf
 _oldumask=$(umask)
 umask 077 # no world-readable window on the password hash
