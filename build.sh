@@ -940,9 +940,14 @@ live_manifest() { # live_manifest <stage> <work dir> <install dir> <system KiB>
 	# the name of the root pool and the size of the system
 	_ms=$1 _mw=$2 _mi=$3
 	live_snapshot "$_ms" "$_mw/.live-mid"
-	LC_ALL=C comm -13 "$_mw/.live-before" "$_mw/.live-mid" > "$_mi/live-paths" \
+	LC_ALL=C comm -13 "$_mw/.live-before" "$_mw/.live-mid" > "$_mw/.live-paths" \
 		|| die 'cannot list the paths of the live layer'
-	rm -f "$_mw/.live-mid"
+	# the install command reads the list with bsdtar -X, which matches a
+	# pattern at any component of a path ("./conf" drops every conf/ of
+	# the system) unless it starts with ^; the glob characters are escaped
+	sed -e 's/[][*?$\\]/\\&/g' -e 's/^/^/' "$_mw/.live-paths" > "$_mi/live-paths" \
+		|| die 'cannot anchor the paths of the live layer'
+	rm -f "$_mw/.live-mid" "$_mw/.live-paths"
 	mkdir -p "$_mi/orig" || die "cannot create $_mi/orig"
 	cp -Rp "$LIVE_BACKUP/." "$_mi/orig/" || die "cannot copy the originals to $_mi/orig"
 	# mkisoimages.sh writes the cd9660 root line into the stage's fstab

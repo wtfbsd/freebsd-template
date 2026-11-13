@@ -56,6 +56,10 @@
 # the password stays '*' (the pw useradd default) so SSH key login works.
 # pw lock is WRONG here: a locked account cannot ssh at all.
 #
+# USERNAME must not be an account yet: one that is in /etc/passwd before
+# this runs (root, operator, daemon ...) is left as it is, with no
+# password, keys, doas rule or autologin, and a note says so.
+#
 # doas: WHEEL=yes puts the user in wheel; the overlay ships
 # /usr/local/etc/doas.conf with "permit persist :wheel".
 #
@@ -250,11 +254,76 @@ fbu_install_keys() {
 	)
 }
 
+# fbu_account_exists <name> — is <name> an account of the system already
+# (in <root>/etc/passwd)? 0 yes, 1 no, anything else: it could not be
+# read. The first boot creates the account it is given; one that is there
+# before it (root, operator, daemon ...) is not its own.
+fbu_account_exists() {
+	[ -f "$_r/etc/passwd" ] && [ -r "$_r/etc/passwd" ] || return 2
+	u="$1" awk -F: '$1 == ENVIRON["u"] { f = 1 } END { exit !f }' "$_r/etc/passwd"
+}
+
+# fbu_account — create the account and give it its password, keys and
+# doas rule (the variables of firstboot_user_start)
+fbu_account() {
+	set -- -n "$_user" -c "${_full:-$_user}" -s /bin/sh -m
+	if [ "$_wheel" = yes ]; then
+		set -- "$@" -G wheel
+	fi
+	if ! pw useradd "$@"; then
+		note "pw useradd $_user failed"
+		return 1
+	fi
+	note "created user $_user (shell /bin/sh, wheel=$_wheel)"
+
+	if [ -n "$_hash" ]; then
+		# pw(8) -H 0: read the encrypted password from stdin so the hash
+		# never appears in argv or in the command line
+		if printf '%s\n' "$_hash" | pw usermod -n "$_user" -H 0; then
+			note "password hash applied to $_user"
+		else
+			note "pw usermod -H 0 failed for $_user"
+			return 1
+		fi
+	else
+		# no hash: the password stays '*' — key login works, and the
+		# account is deliberately NOT pw-locked: locked accounts cannot
+		# ssh at all.
+		note "no PASSWORD_HASH: password of $_user stays '*' (key-only login)"
+	fi
+
+	# /etc/passwd is 7 fields: the home directory is field 6
+	# (the FULLNAME value is validated to never contain ':', so -F: is safe)
+	_home=$(u="$_user" awk -F: '$1 == ENVIRON["u"] { print $6 }' "$_r/etc/passwd")
+	case $_home in
+	/*) ;;
+	*) _home="/home/$_user" ;;
+	esac
+	_home=$_r$_home
+	if ! fbu_install_keys "$_user" "$_home" "${_keys#?}"; then
+		return 1
+	fi
+	note "installed $_nkeys SSH key(s) for $_user at $_home/.ssh/authorized_keys"
+
+	# key-only wheel user (no password to type): let doas accept the
+	# SSH-authenticated session, otherwise the account could never get root
+	if [ "$_wheel" = yes ] && [ "$_nopass" = yes ] && [ -n "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
+		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf" \
+			|| { note "cannot write the doas rule of $_user"; return 1; }
+		note "doas: $_user may run commands as root without a password (DOAS_NOPASS=yes)"
+	fi
+	if [ "$_wheel" = yes ] && [ -z "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
+		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf" \
+			|| { note "cannot write the doas rule of $_user"; return 1; }
+		note "doas: key-only wheel user $_user may run commands as root without a password"
+	fi
+}
+
 firstboot_user_start() {
 	local _conf="$firstboot_user_conf"
 	local _k _l _v _user _full _keys _nkeys _hash _wheel _home _n
 	local _host _tz _kmap _r _xl _nopass _nets _ni _nv _na _ng _gw
-	local _nets6 _dns _wifi _locale _clock _rhash _autologin _update _n6 _g6
+	local _nets6 _dns _wifi _locale _clock _rhash _autologin _update _n6 _g6 _takeuser
 	_r=$firstboot_user_root
 	if ! root_writable; then
 		echo 'firstboot_user: read-only root (live media), skipped'
@@ -610,64 +679,28 @@ $_v"
 			return 1
 		fi
 	fi
-	if [ "$_autologin" = yes ] && [ -d "$_r/usr/local/etc/lightdm/lightdm.conf.d" ]; then
+	# the account: made here, or left alone when it exists already; the
+	# autologin only for an account made here, once it is made
+	fbu_account_exists "$_user"
+	case $? in
+	0)
+		_takeuser=no
+		note "user $_user exists already: left as it is (no password, keys, doas rule or autologin)"
+		;;
+	1) _takeuser=yes ;;
+	*)
+		note "cannot read $_r/etc/passwd: no account made"
+		return 1
+		;;
+	esac
+	if [ "$_takeuser" = yes ]; then
+		fbu_account || return 1
+	fi
+	if [ "$_autologin" = yes ] && [ "$_takeuser" = yes ] && [ -d "$_r/usr/local/etc/lightdm/lightdm.conf.d" ]; then
 		printf '# written by firstboot_user from the installer\n[Seat:*]\nautologin-user=%s\nautologin-user-timeout=0\n' "$_user" \
 			> "$_r/usr/local/etc/lightdm/lightdm.conf.d/40-autologin.conf" \
 			|| { note 'cannot write the LightDM autologin'; return 1; }
 		note "LightDM logs $_user in automatically"
-	fi
-
-	# the account
-	if ! pw usershow -n "$_user" > /dev/null 2>&1; then
-		set -- -n "$_user" -c "${_full:-$_user}" -s /bin/sh -m
-		if [ "$_wheel" = yes ]; then
-			set -- "$@" -G wheel
-		fi
-		if ! pw useradd "$@"; then
-			note "pw useradd $_user failed"
-			return 1
-		fi
-		note "created user $_user (shell /bin/sh, wheel=$_wheel)"
-	fi
-
-	if [ -n "$_hash" ]; then
-		# pw(8) -H 0: read the encrypted password from stdin so the hash
-		# never appears in argv or in the command line
-		if printf '%s\n' "$_hash" | pw usermod -n "$_user" -H 0; then
-			note "password hash applied to $_user"
-		else
-			note "pw usermod -H 0 failed for $_user"
-			return 1
-		fi
-	else
-		# no hash: the password stays '*' — key login works, and the
-		# account is deliberately NOT pw-locked: locked accounts cannot
-		# ssh at all.
-		note "no PASSWORD_HASH: password of $_user stays '*' (key-only login)"
-	fi
-
-	# /etc/passwd is 7 fields: the home directory is field 6
-	# (the FULLNAME value is validated to never contain ':', so -F: is safe)
-	_home=$(u="$_user" awk -F: '$1 == ENVIRON["u"] { print $6 }' "$_r/etc/passwd")
-	case $_home in
-	/*) ;;
-	*) _home="/home/$_user" ;;
-	esac
-	_home=$_r$_home
-	if ! fbu_install_keys "$_user" "$_home" "${_keys#?}"; then
-		return 1
-	fi
-	note "installed $_nkeys SSH key(s) for $_user at $_home/.ssh/authorized_keys"
-
-	# key-only wheel user (no password to type): let doas accept the
-	# SSH-authenticated session, otherwise the account could never get root
-	if [ "$_wheel" = yes ] && [ "$_nopass" = yes ] && [ -n "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
-		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf"
-		note "doas: $_user may run commands as root without a password (DOAS_NOPASS=yes)"
-	fi
-	if [ "$_wheel" = yes ] && [ -z "$_hash" ] && [ -f "$_r/usr/local/etc/doas.conf" ]; then
-		printf 'permit nopass %s\n' "$_user" >> "$_r/usr/local/etc/doas.conf"
-		note "doas: key-only wheel user $_user may run commands as root without a password"
 	fi
 
 	# the package update: once, in the background, when the network is up;
