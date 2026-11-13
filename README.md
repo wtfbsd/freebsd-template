@@ -288,7 +288,8 @@ builds without branding.
   banner and `/etc/issue`, the LightDM greeter background and theme, the
   xdm logo and colours, the installer header, side panel and palette, the
   wallpapers, the icons and the Xfce theme. A supported spot this template
-  does not know fails the build.
+  does not know fails the build. The pinned pack's Xfce panel file
+  defines one panel along the top, in the format read by xfce4-panel.
 - `/usr/local/share/<slug>/identity` holds PRODUCT, VERSION
   (`PRODUCT_VERSION`, or the build's year.month), BASE (`FreeBSD` and the
   release of the built userland, from the stage's `freebsd-version`),
