@@ -262,7 +262,7 @@ case $MOTD in *[[:cntrl:]]*) die 'MOTD contains control characters' ;; esac
 # git ref of a repository URL; neither means the stand-in launcher
 # the merged main of the installer-template: the default INSTALLER_REF;
 # INSTALLER_REF=none builds the stand-in launcher instead
-INSTALLER_REF_DEFAULT=b76dbd31decc023ebe24183b905c34583f3c19c9
+INSTALLER_REF_DEFAULT=f77bb78a9a67799511f84582f855e904bdd141e7
 INSTALLER_REF=${INSTALLER_REF:-}
 INSTALLER_URL=${INSTALLER_URL:-https://github.com/wtfbsd/installer-template.git}
 INSTALLER_DIR=${INSTALLER_DIR:-}

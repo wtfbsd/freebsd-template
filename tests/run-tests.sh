@@ -4245,7 +4245,7 @@ conf ninst 'PROFILE="desktop"'
 sh "$repo/build.sh" -n -c "$work/ninst.conf" -o "$work/out" > "$_n/dry-inst.log" 2>&1
 conf ninone 'PROFILE="desktop"' 'INSTALLER_REF="none"'
 sh "$repo/build.sh" -n -c "$work/ninone.conf" -o "$work/out" > "$_n/dry-none.log" 2>&1
-if grep -q 'git checkout --detach b76dbd31decc023ebe24183b905c34583f3c19c9' "$_n/dry-inst.log" &&
+if grep -q 'git checkout --detach f77bb78a9a67799511f84582f855e904bdd141e7' "$_n/dry-inst.log" &&
 	grep -q 'no installer-template: the stand-in launcher' "$_n/dry-none.log" && ! grep -q 'git clone' "$_n/dry-none.log"; then
 	ok "build.sh: the installer-template defaults to its pinned merged main; INSTALLER_REF=none keeps the stand-in"
 else
@@ -4669,6 +4669,34 @@ if [ ! -s "$_rf/chflags.log" ] && [ ! -e "$_rf/out/linked" ] && [ ! -L "$_rf/out
 	ok "rmrf removes a link as a link, without touching the flags of its target"
 else
 	no "rmrf removes a link as a link, without touching the flags of its target"
+fi
+# ------------------------------------------------------------------
+# firstboot_user restarts netif after it writes the interface lines: the
+# stop kills a dhclient that devd had started, and netif starts none again
+# (only with synchronous_dhclient), while a link that stays up raises no new
+# LINK_UP for devd. So the block itself asks dhclient for every interface.
+# ------------------------------------------------------------------
+_nr="$work/netifrestart"
+mkdir -p "$_nr/rcd" "$_nr/bin"
+for _sv in netif routing dhclient; do
+	printf '#!/bin/sh\nprintf "%s %%s\\n" "$*" >> "%s/calls"\n' "$_sv" "$_nr" > "$_nr/rcd/$_sv"
+	chmod 755 "$_nr/rcd/$_sv"
+done
+printf '#!/bin/sh\n[ "$1" = -l ] && echo "em0 lo0 wlan0"\n' > "$_nr/bin/ifconfig"
+chmod 755 "$_nr/bin/ifconfig"
+sed -n '/# netif-restart-begin/,/# netif-restart-end/p' "$repo/overlay/base/rootfs/etc/rc.d/firstboot_user" |
+	sed "s|/etc/rc.d/|$_nr/rcd/|g" > "$_nr/block.sh"
+(
+	note() { :; }
+	PATH="$_nr/bin:$PATH"
+	. "$_nr/block.sh"
+) > /dev/null 2>&1
+if grep -qx 'netif restart' "$_nr/calls" 2> /dev/null && grep -qx 'dhclient quietstart em0' "$_nr/calls" &&
+	grep -qx 'dhclient quietstart wlan0' "$_nr/calls" &&
+	[ "$(grep -n '' "$_nr/calls" | grep 'netif restart' | cut -d: -f1)" -lt "$(grep -n '' "$_nr/calls" | grep 'dhclient quietstart em0' | cut -d: -f1)" ]; then
+	ok "firstboot_user: after the netif restart, dhclient is asked for every interface (quietstart skips the ones not on DHCP)"
+else
+	no "firstboot_user: after the netif restart, dhclient is asked for every interface (quietstart skips the ones not on DHCP)"
 fi
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -570,8 +570,17 @@ $_v"
 	if [ -n "$_nets$_nets6$_wifi$_dns" ]; then
 		note "network: ${_nets:- DHCP}${_nets6:+ IPv6:$_nets6}${_wifi:+ Wi-Fi on $_wifi}${_dns:+ DNS:$_dns}"
 		if [ -z "$_r" ]; then
+			# netif-restart-begin
 			/etc/rc.d/netif restart > /dev/null 2>&1 || note 'netif restart failed'
 			/etc/rc.d/routing restart > /dev/null 2>&1 || :
+			# the stop of netif killed the dhclient devd had started, and
+			# netif starts none (only with synchronous_dhclient); a link
+			# that stayed up raises no new LINK_UP. quietstart refuses an
+			# interface that is not on DHCP or already has a dhclient.
+			for _di in $(ifconfig -l); do
+				/etc/rc.d/dhclient quietstart "$_di" > /dev/null 2>&1 || :
+			done
+			# netif-restart-end
 		fi
 	fi
 
