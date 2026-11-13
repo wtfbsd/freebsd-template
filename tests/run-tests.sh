@@ -4589,14 +4589,14 @@ fi
 printf 'not the pack\n' > "$_b/fake.tar.xz"
 (
 	die() { echo "die: $*" >&2; exit 1; }
-	OUT="$_b/fo" DISTRO_SLUG=examplebsd ARTWORK_REF=ce8e9714a2b47e3f17ff36ea647dbcc02f4399ac
+	OUT="$_b/fo" DISTRO_SLUG=examplebsd ARTWORK_REF=2e86db4e6df87d4d5affdab620c3f8ccbb88e4a7
 	ARTWORK_VARIANT=default ARTWORK_PACK="$_b/fake.tar.xz" ARTWORK_SHA256='' ARTWORK_URL=x
 	mkdir -p "$OUT"
 	. "$_b/f.sh"
 	fetch_artwork
 ) > "$_b/sha.log" 2>&1
 _brc=$?
-if [ "$_brc" -ne 0 ] && grep -q 'not the pinned cf0b37d9a793f8f16cc78f2a82122fac28087253cc27cac384357fd6a6d85ce7: refusing it' "$_b/sha.log"; then
+if [ "$_brc" -ne 0 ] && grep -q 'not the pinned efba8dc2b825a7daf367ac2c2c11ff685bb1329555483b360722e2d34529209b: refusing it' "$_b/sha.log"; then
 	ok "branding: an artwork pack whose sha256 is not the pinned one is refused"
 else
 	no "branding: an artwork pack whose sha256 is not the pinned one is refused (rc=$_brc)"
