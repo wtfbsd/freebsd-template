@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# installer-apply — the stand-in root helper of the live ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Live ISO only: the one command the live user may run as root (doas, no
+# environment kept). The installer-template's install-into-stage.sh
+# replaces it with its own GTK-free helper; this stand-in runs the text
+# installer on the terminal it is given, and takes no arguments.
+
+[ $# -eq 0 ] || { echo 'installer-apply: the stand-in takes no arguments' >&2; exit 2; }
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+exec /usr/local/sbin/@SLUG@-install

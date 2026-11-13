@@ -9,11 +9,141 @@
 
 printf 'zpool %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
+# With $STUB_GEOM (the device directory of the run, see the gpart stub)
+# the stub keeps the pools that are imported, $STUB_GEOM/.pools/<pool>,
+# one line "/dev/<vdev> <partition>" per device: create, import, list,
+# status -P and export work on them. Every device of a created pool is
+# logged as "zpool-vdev <pool> <partition>", the partition its name
+# resolved to. $STUB_ZPOOL_FAIL names a pool whose create fails.
+if [ -n "${STUB_GEOM:-}" ]; then
+	_G=$STUB_GEOM
+	_prov() { # the partition behind a device name (a label, .eli or not)
+		_pn=${1%.eli}
+		case $_pn in
+		gpt/*)
+			[ -f "$_G/.labels/${_pn#gpt/}" ] || return 1
+			cat "$_G/.labels/${_pn#gpt/}"
+			;;
+		*) printf '%s\n' "$_pn" ;;
+		esac
+	}
+	case $1 in
+	create)
+		shift
+		_pool=''
+		while [ $# -gt 0 ]; do
+			case $1 in
+			-f) ;;
+			-o | -O) shift ;;
+			*)
+				_pool=$1
+				shift
+				break
+				;;
+			esac
+			shift
+		done
+		if [ -f "$_G/.pools/$_pool" ]; then
+			echo "cannot create '$_pool': pool already exists" >&2
+			exit 1
+		fi
+		if [ "${STUB_ZPOOL_FAIL:-}" = "$_pool" ]; then
+			echo "cannot create '$_pool': injected failure" >&2
+			exit 1
+		fi
+		_lines=''
+		for _v in "$@"; do
+			case $_v in mirror | raidz1 | raidz2 | raidz3) continue ;; esac
+			if [ ! -e "$_G/$_v" ] && [ ! -f "$_G/.labels/${_v#gpt/}" ]; then
+				echo "cannot open '$_v': no such GEOM provider" >&2
+				exit 1
+			fi
+			_p=$(_prov "$_v") || { echo "cannot open '$_v'" >&2; exit 1; }
+			printf 'zpool-vdev %s %s\n' "$_pool" "$_p" >> "${STUB_LOG:-/dev/null}"
+			_lines="$_lines/dev/$_v $_p
+"
+		done
+		mkdir -p "$_G/.pools"
+		printf '%s' "$_lines" > "$_G/.pools/$_pool"
+		exit 0
+		;;
+	list)
+		_want=''
+		for _a in "$@"; do _want=$_a; done
+		case $_want in list | name) _want='' ;; esac
+		if [ -n "$_want" ]; then
+			[ -f "$_G/.pools/$_want" ] || { echo "cannot open '$_want': no such pool" >&2; exit 1; }
+			printf '%s\n' "$_want"
+			exit 0
+		fi
+		for _f in "$_G"/.pools/*; do
+			[ -f "$_f" ] && printf '%s\n' "${_f##*/}"
+		done
+		exit 0
+		;;
+	status)
+		for _a in "$@"; do _want=$_a; done
+		[ -f "$_G/.pools/$_want" ] || { echo "cannot open '$_want': no such pool" >&2; exit 1; }
+		printf '  pool: %s\n state: ONLINE\nconfig:\n\n\tNAME STATE READ WRITE CKSUM\n\t%s ONLINE 0 0 0\n' "$_want" "$_want"
+		awk '{ printf "\t  %s ONLINE 0 0 0\n", $1 }' "$_G/.pools/$_want"
+		exit 0
+		;;
+	export)
+		for _a in "$@"; do _want=$_a; done
+		[ -f "$_G/.pools/$_want" ] || { echo "cannot open '$_want': no such pool" >&2; exit 1; }
+		rm -f "$_G/.pools/$_want"
+		exit 0
+		;;
+	import)
+		# the import of one pool (the last argument): with -d <device> the
+		# pool is the one on that device, and that is the device it keeps.
+		# Without -d, ZFS takes any pool of that name on the system: with
+		# $STUB_ZPOOL_SAMENAME another disk holds one, and it is that one.
+		_dev=''
+		_prev=''
+		for _a in "$@"; do
+			[ "$_prev" = '-d' ] && _dev=$_a
+			_prev=$_a
+			_want=$_a
+		done
+		case $_want in -* | import | "$_dev") _want='' ;; esac
+		if [ -n "$_want" ]; then
+			# a pool named by its id is the pool of the import table
+			case $_want in 1234567890123456789) _want=examplebsd_root ;; esac
+			mkdir -p "$_G/.pools"
+			if [ -n "$_dev" ]; then
+				printf '%s %s\n' "$_dev" "${_dev#/dev/}" > "$_G/.pools/$_want"
+			elif [ -n "${STUB_ZPOOL_SAMENAME:-}" ]; then
+				printf '/dev/ada9p4 ada9p4\n' > "$_G/.pools/$_want"
+			else
+				printf '/dev/vtbd0p3 vtbd0p3\n' > "$_G/.pools/$_want"
+			fi
+			exit 0
+		fi
+		;;
+	online)
+		# online -e <pool> <device>: the device must be a vdev of that pool
+		for _a in "$@"; do _want=$_a; done
+		_pool=''
+		for _a in "$@"; do
+			case $_a in online | -e | "$_want") ;; *) _pool=$_a ;; esac
+		done
+		[ -f "$_G/.pools/$_pool" ] || { echo "cannot open '$_pool': no such pool" >&2; exit 1; }
+		if ! awk -v d="$_want" '$1 == d { f = 1 } END { exit !f }' "$_G/.pools/$_pool"; then
+			echo "cannot expand $_want: couldn't find device \"$_want\" in pool \"$_pool\"" >&2
+			exit 1
+		fi
+		exit 0
+		;;
+	esac
+fi
+
 case $1 in
 import)
 	if [ "$2" = '-d' ]; then
 		cat <<'TABLE'
    pool: examplebsd_root
+     id: 1234567890123456789
      state: ONLINE
     status: One or more devices could not be opened.
     action: Attach the missing device and online it.

@@ -43,6 +43,18 @@
 #   PORTS      the ports tree of KMOD_REBUILD (default /usr/ports)
 #   KEEP_DEBUG yes keeps /usr/lib/debug (kernel.debug and the debug files
 #              of world) in the image (default no: they are removed)
+#   ALLOW_UNBRANDED_INSTALLER  yes builds the live ISO although the
+#              installer-template refuses the artwork (its own look, with a
+#              warning); default no: the build fails
+#
+# The desktop ISO is a live system (overlay/live, see [6b]): it boots the
+# Xfce desktop as the user "live" with the installer open first. The
+# installer comes from the installer-template, named in product.conf:
+#   INSTALLER_DIR  a local checkout, copied into the build
+#   INSTALLER_REF  a git ref of INSTALLER_URL, cloned into the build
+# Unset, INSTALLER_REF is the installer-template's merged main (pinned in
+# this file); INSTALLER_REF=none carries a stand-in launcher that runs the
+# text installer in a terminal instead.
 
 set -eu
 
@@ -112,7 +124,9 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # case.
 KNOWN_KEYS='DISTRO_OS DISTRO_NAME DISTRO_SLUG DISTRO_ARCH FILESYSTEM_ROOT
 ZFS_DATA_POOL ZFS_POOL_NAME PROFILE PACKAGE_SET INSTALLER MOTD BRAND_COLOR
-BRAND_URL CI_ENABLED PUBLISH_METHOD PUBLISH_TARGET PUBLISHER_ORG'
+BRAND_URL CI_ENABLED PUBLISH_METHOD PUBLISH_TARGET PUBLISHER_ORG
+INSTALLER_REF INSTALLER_URL INSTALLER_DIR PRODUCT_VERSION ARTWORK_VARIANT
+ARTWORK_REF ARTWORK_SHA256 ARTWORK_PACK'
 for _k in $KNOWN_KEYS; do unset "$_k"; done
 while IFS= read -r _line || [ -n "$_line" ]; do
 	case $_line in '' | '#'*) continue ;; esac
@@ -171,6 +185,14 @@ while IFS= read -r _line || [ -n "$_line" ]; do
 	PUBLISH_METHOD) PUBLISH_METHOD=$_v ;;
 	PUBLISH_TARGET) PUBLISH_TARGET=$_v ;;
 	PUBLISHER_ORG) PUBLISHER_ORG=$_v ;;
+	INSTALLER_REF) INSTALLER_REF=$_v ;;
+	INSTALLER_URL) INSTALLER_URL=$_v ;;
+	INSTALLER_DIR) INSTALLER_DIR=$_v ;;
+	PRODUCT_VERSION) PRODUCT_VERSION=$_v ;;
+	ARTWORK_VARIANT) ARTWORK_VARIANT=$_v ;;
+	ARTWORK_REF) ARTWORK_REF=$_v ;;
+	ARTWORK_SHA256) ARTWORK_SHA256=$_v ;;
+	ARTWORK_PACK) ARTWORK_PACK=$_v ;;
 	esac
 done < "$CONF"
 
@@ -236,6 +258,44 @@ MOTD=${MOTD:-built from the wtfbsd templates}
 case $MOTD in *[[:cntrl:]]*) die 'MOTD contains control characters' ;; esac
 [ "$(printf %s "$MOTD" | wc -c)" -le 120 ] || die 'MOTD too long (max 120)'
 
+# the installer-template of the live desktop ISO: a local directory, or a
+# git ref of a repository URL; neither means the stand-in launcher
+# the merged main of the installer-template: the default INSTALLER_REF;
+# INSTALLER_REF=none builds the stand-in launcher instead
+INSTALLER_REF_DEFAULT=f77bb78a9a67799511f84582f855e904bdd141e7
+INSTALLER_REF=${INSTALLER_REF:-}
+INSTALLER_URL=${INSTALLER_URL:-https://github.com/wtfbsd/installer-template.git}
+INSTALLER_DIR=${INSTALLER_DIR:-}
+if [ -z "$INSTALLER_REF" ] && [ -z "$INSTALLER_DIR" ]; then
+	INSTALLER_REF=$INSTALLER_REF_DEFAULT
+fi
+[ "$INSTALLER_REF" != none ] || INSTALLER_REF=''
+[ -z "$INSTALLER_REF" ] || [ -z "$INSTALLER_DIR" ] \
+	|| die 'INSTALLER_REF and INSTALLER_DIR do not go together: name one installer-template'
+if [ -n "$INSTALLER_REF" ]; then
+	chk '^[A-Za-z0-9_][A-Za-z0-9._/-]*$' "$INSTALLER_REF" 'INSTALLER_REF must be a git ref or commit (letters, digits, . _ / -; not starting with -)'
+	chk '^(https|file)://[A-Za-z0-9._~/:@%+-]+$' "$INSTALLER_URL" 'INSTALLER_URL must be an https:// or file:// URL'
+fi
+case $INSTALLER_DIR in *[[:space:]]*) die "INSTALLER_DIR may not contain whitespace: $INSTALLER_DIR" ;; esac
+
+# the artwork: a pre-rendered pack of the artwork template, by commit and
+# variant, checked against its sha256 (pinned here for the template's own
+# product; ARTWORK_SHA256 for any other). ARTWORK_REF=none: no branding.
+ARTWORK_REF_DEFAULT=5aaea01b082938f3c6816cd5b881699e62d3d9dd
+ARTWORK_REF=${ARTWORK_REF:-$ARTWORK_REF_DEFAULT}
+ARTWORK_VARIANT=${ARTWORK_VARIANT:-default}
+ARTWORK_SHA256=${ARTWORK_SHA256:-}
+ARTWORK_PACK=${ARTWORK_PACK:-}
+ARTWORK_URL=${ARTWORK_URL:-https://github.com/wtfbsd/artwork-template/releases/download}
+PRODUCT_VERSION=${PRODUCT_VERSION:-}
+if [ "$ARTWORK_REF" != none ]; then
+	chk '^[0-9a-f]{12,40}$' "$ARTWORK_REF" 'ARTWORK_REF must be a commit of the artwork template (12 to 40 hex digits) or none'
+	chk '^[a-z][a-z0-9-]*$' "$ARTWORK_VARIANT" 'ARTWORK_VARIANT must match ^[a-z][a-z0-9-]*$'
+	[ -z "$ARTWORK_SHA256" ] || chk '^[0-9a-f]{64}$' "$ARTWORK_SHA256" 'ARTWORK_SHA256 must be 64 hex digits'
+	case $ARTWORK_PACK in *[[:space:]]*) die "ARTWORK_PACK may not contain whitespace: $ARTWORK_PACK" ;; esac
+fi
+[ -z "$PRODUCT_VERSION" ] || chk '^[0-9A-Za-z][0-9A-Za-z.+-]*$' "$PRODUCT_VERSION" 'PRODUCT_VERSION must match ^[0-9A-Za-z][0-9A-Za-z.+-]*$'
+
 # optional -u/-k: bake a firstboot-user.conf (mode 600) into the staged
 # image with USERNAME=USER and one SSH_KEY= line per line of PUBKEYFILE.
 # Validation is identical to rc.d/firstboot_user, in the dry run too.
@@ -298,6 +358,11 @@ KERNCONF=${KERNCONF:-GENERIC}
 # KEEP_DEBUG=yes keeps the standalone debug files of world and kernel
 # (/usr/lib/debug, kernel.debug) in the image; the default removes them
 KEEP_DEBUG=${KEEP_DEBUG:-no}
+ALLOW_UNBRANDED_INSTALLER=${ALLOW_UNBRANDED_INSTALLER:-no}
+case $ALLOW_UNBRANDED_INSTALLER in
+yes | no) ;;
+*) die "ALLOW_UNBRANDED_INSTALLER must be yes or no (got: $ALLOW_UNBRANDED_INSTALLER)" ;;
+esac
 case $KEEP_DEBUG in
 yes | no) ;;
 *) die "KEEP_DEBUG must be yes or no (got: $KEEP_DEBUG)" ;;
@@ -350,7 +415,19 @@ rmrf() { # rmrf <path> <guardroot> — rm -rf only for non-empty paths under roo
 	[ -n "${2:-}" ] || die 'rmrf: empty guard root'
 	[ "$1" != "$2" ] || die "rmrf: refusing guard root itself: $1"
 	case $1 in "$2"/*) ;; *) die "rmrf: refusing path outside $2: $1" ;; esac
+	# a link is removed as a link: its target, which may be outside the
+	# guard root, is never followed (neither by chflags nor by rm)
+	if [ -L "$1" ]; then
+		rm -f -- "$1" || die "rmrf: cannot remove the link $1"
+		return 0
+	fi
 	[ -d "$1" ] || return 0
+	# a FreeBSD stage holds files with the schg flag (the kernel, libc,
+	# init): rm -rf cannot remove them, so a rebuild in the same output
+	# directory failed. The flags are cleared first where chflags(1) exists.
+	if command -v chflags > /dev/null 2>&1; then
+		chflags -R noschg "$1" 2> /dev/null || :
+	fi
 	rm -rf -- "$1"
 }
 
@@ -420,14 +497,23 @@ own_overlay() { # own_overlay <stage> <overlay-rootfs-dir>
 
 rename_slug() { # rename_slug <stage> — rename every staged path whose NAME
 	# carries @SLUG@ (e.g. usr/local/sbin/@SLUG@-install,
-	# lightdm.conf.d/50-@SLUG@.conf) to the slug; -depth renames the
-	# children of a directory before the directory itself
-	find "$1" -depth -name '*@SLUG@*' | while IFS= read -r _sf; do
+	# lightdm.conf.d/50-@SLUG@.conf) to the slug. Every path under such
+	# a name moves on its own, into a directory of the slug that may
+	# already be there (usr/local/share/@SLUG@/live/@SLUG@-install.desktop
+	# joins the usr/local/share/<slug> of an earlier overlay): -depth
+	# visits the children of a directory before the directory itself,
+	# which is empty by then and goes
+	# the directories it makes are 0755 whatever the umask of the build
+	find "$1" -depth -path '*@SLUG@*' | (umask 022; while IFS= read -r _sf; do
 		_sf_new=$(printf %s "$_sf" | sed -e "s%@SLUG@%$DISTRO_SLUG%g")
-		if [ "$_sf" != "$_sf_new" ]; then
+		[ "$_sf" != "$_sf_new" ] || continue
+		if [ -d "$_sf" ] && [ ! -L "$_sf" ]; then
+			mkdir -p -- "$_sf_new" && rmdir -- "$_sf" || die "rename $_sf failed"
+		else
+			mkdir -p -- "$(dirname -- "$_sf_new")" || die "rename $_sf failed"
 			mv "$_sf" "$_sf_new" || die "rename $_sf failed"
 		fi
-	done
+	done)
 }
 
 strip_xspice_conf() { # strip_xspice_conf <stage>
@@ -670,6 +756,549 @@ check_kmods() { # check_kmods <stage> <src>
 KMOD_REBUILD=yes rebuilds them from the ports tree; ALLOW_KMOD_MISMATCH=yes builds anyway"
 }
 
+fetch_installer() { # fetch_installer <dir> — the installer-template, into <dir>
+	# INSTALLER_DIR is copied; INSTALLER_REF is cloned from INSTALLER_URL
+	# and checked out. Either way the tree must have install-into-stage.sh.
+	_fi=$1
+	rmrf "$_fi" "$OUT"
+	if [ -n "$INSTALLER_DIR" ]; then
+		[ -d "$INSTALLER_DIR" ] || die "INSTALLER_DIR: no such directory: $INSTALLER_DIR"
+		cp -R "$INSTALLER_DIR" "$_fi" || die "cannot copy $INSTALLER_DIR to $_fi"
+	else
+		command -v git > /dev/null 2>&1 || die 'INSTALLER_REF needs git (pkg install git-lite)'
+		git clone -q -- "$INSTALLER_URL" "$_fi" || die "git clone $INSTALLER_URL failed"
+		# a commit or a tag, or a branch of the remote
+		git -C "$_fi" -c advice.detachedHead=false checkout -q --detach "$INSTALLER_REF" 2> /dev/null \
+			|| git -C "$_fi" -c advice.detachedHead=false checkout -q --detach "origin/$INSTALLER_REF" \
+			|| die "git checkout $INSTALLER_REF of $INSTALLER_URL failed"
+	fi
+	[ -f "$_fi/install-into-stage.sh" ] \
+		|| die "the installer-template ${INSTALLER_DIR:-$INSTALLER_REF} has no install-into-stage.sh"
+}
+
+# The live layer of the desktop ISO (overlay/live). The raw image [6] is
+# written before any of it reaches the stage, and every path it adds is
+# taken out again after the ISO [7], so the installed system never has the
+# live user, the autologin or the installer autostart.
+#
+#   overlay/live/rootfs   copied over the stage (outside /etc)
+#   overlay/live/etc      copied over a COPY of the stage's /etc, which
+#                         goes into the ISO as /conf/base/etc.cpio.gz
+#
+# The root of the ISO is cd9660, read-only. rc(8) runs the stock
+# rc.initdiskless when /etc/diskless exists: it mounts a memory disk on
+# /etc, /var, /root and /home and unpacks /conf/base/<dir>.cpio.gz into
+# each, before any rc.d script runs (the same mechanism as NanoBSD and
+# diskless(8) machines). /tmp gets its memory disk from rc.d/tmp.
+LIVE_BACKUP=''
+# the one command the live user may run as root (doas.conf of the ISO)
+LIVE_APPLY=/usr/local/libexec/wtfbsd-installer/installer-apply
+
+live_snapshot() { # live_snapshot <stage> <file> — every path of the stage, sorted
+	(cd "$1" && find . -print) > "$2.unsorted" || die "find $1 failed"
+	LC_ALL=C sort "$2.unsorted" > "$2" || die "sort of the paths of $1 failed"
+	rm -f "$2.unsorted"
+}
+
+live_backup() { # live_backup <stage> <relpath> — keep a staged file the live layer changes
+	[ -f "$1/$2" ] && [ ! -L "$1/$2" ] || return 0
+	mkdir -p "$LIVE_BACKUP/$(dirname -- "$2")" || die "cannot create the backup of $2"
+	cp -p "$1/$2" "$LIVE_BACKUP/$2" || die "cannot keep a copy of $1/$2"
+}
+
+live_md_size() { # live_md_size <dir> — the size of the memory disk for <dir>
+	# twice what the stage holds, plus 256 MiB of room, in KiB (mdmfs -s)
+	_k=$(du -sk "$1" 2> /dev/null | awk '{ print $1 }')
+	case $_k in '' | *[!0-9]*) _k=0 ;; esac
+	printf '%sk\n' $((_k * 2 + 262144))
+}
+
+live_stage() { # live_stage <stage> <work dir> — add the live layer for the ISO
+	_ls=$1 _lw=$2
+	_lr="$ROOT/overlay/live/rootfs"
+	_le="$ROOT/overlay/live/etc"
+	[ -d "$_lr" ] && [ -d "$_le" ] || die "missing the live layer $ROOT/overlay/live/{rootfs,etc}"
+	LIVE_BACKUP="$_lw/.live-backup"
+	rmrf "$LIVE_BACKUP" "$OUT"
+	rmrf "$_lw/live-conf" "$OUT"
+	mkdir -p "$LIVE_BACKUP" "$_lw/live-conf"
+	live_snapshot "$_ls" "$_lw/.live-before"
+	# every staged file the layer replaces is kept, and the motd and
+	# doas.conf, which the ISO changes in place
+	(cd "$_lr" && find . -type f) | sed -e 's|^\./||' -e "s%@SLUG@%$DISTRO_SLUG%g" > "$_lw/.live-files" \
+		|| die "cannot list $_lr"
+	while IFS= read -r _lf; do
+		live_backup "$_ls" "$_lf"
+	done < "$_lw/.live-files"
+	live_backup "$_ls" usr/local/etc/doas.conf
+	live_backup "$_ls" etc/motd
+	# 1. the layer outside /etc, like the base and profile overlays
+	cp -Rp "$_lr/." "$_ls/" || die "cannot copy $_lr"
+	subst_overlay "$_ls" "$_lr"
+	rename_slug "$_ls" || die 'the @SLUG@ rename of the live layer failed'
+	own_overlay "$_ls" "$_lr"
+	# 2. the front ends of the installer (GTK, text) run as the live user;
+	#    the one thing it may run as root is the installer's GTK-free
+	#    helper, with the environment doas resets (no keepenv, no setenv):
+	#    a GUI running as root on the user's display would load modules
+	#    the user controls (XSETTINGS, GTK_MODULES)
+	{
+		printf '# live ISO only (build.sh [6b]): the one root command of the live user\n'
+		printf 'permit nopass live as root cmd %s\n' "$LIVE_APPLY"
+	} >> "$_ls/usr/local/etc/doas.conf" || die "cannot write $_ls/usr/local/etc/doas.conf"
+	# 3. the installer-template (it replaces the stand-in launcher), with
+	#    the product's installer.conf, the artwork (palette, sources) and
+	#    the catalogue of the licensed software
+	if [ -n "$INST_TREE" ]; then
+		{
+			printf 'PRODUCT_NAME=%s\nPRODUCT_SLUG=%s\nOS=freebsd\n' "$DISTRO_NAME" "$DISTRO_SLUG"
+			printf 'DEFAULT_KEYMAP=us\nDEFAULT_TZ=UTC\nMIN_DISK_GB=16\n'
+			# rc.d/live_session names the medium of the live system in
+			# /var/run/wtfbsd-live-medium early in the boot: a live root in
+			# memory that does not name it offers no disk
+			printf 'LIVE_MEDIUM_REQUIRED=yes\n'
+		} > "$_lw/installer.conf" || die "cannot write $_lw/installer.conf"
+		set -- --conf "$_lw/installer.conf"
+		# the installer's look comes from the artwork; install-into-stage.sh
+		# checks its palette with python3 on the build host
+		if [ -n "${ART:-}" ]; then
+			if command -v python3 > /dev/null 2>&1; then
+				set -- "$@" --artwork "$ART"
+			else
+				printf '%s\n' "WARNING: no python3 on the build host: the installer keeps its own look (install-into-stage.sh --artwork needs it)" >&2
+			fi
+		fi
+		if ! sh "$INST_TREE/install-into-stage.sh" "$_ls" "$@"; then
+			# the artwork is the one argument the installer may not take
+			# (a palette it does not know): once more without it, loudly
+			case " $*:$ALLOW_UNBRANDED_INSTALLER " in
+			*' --artwork '*':yes ')
+				printf '%s\n' "WARNING: the installer-template could not use the artwork $ART: it keeps its own look (ALLOW_UNBRANDED_INSTALLER=yes)" >&2
+				sh "$INST_TREE/install-into-stage.sh" "$_ls" --conf "$_lw/installer.conf" \
+					|| die "$INST_TREE/install-into-stage.sh $_ls failed"
+				;;
+			*' --artwork '*) die "$INST_TREE/install-into-stage.sh $_ls failed: the installer-template cannot use the artwork $ART (ALLOW_UNBRANDED_INSTALLER=yes builds an installer with its own look)" ;;
+			*) die "$INST_TREE/install-into-stage.sh $_ls failed" ;;
+			esac
+		fi
+		if [ -f "$_ls/usr/local/share/$DISTRO_SLUG/licensed-software.json" ]; then
+			mkdir -p "$_ls/usr/local/libexec/wtfbsd-installer/licences" \
+				&& cp "$_ls/usr/local/share/$DISTRO_SLUG/licensed-software.json" \
+					"$_ls/usr/local/libexec/wtfbsd-installer/licences/licensed-software.json" \
+				|| die 'cannot give the installer the catalogue of the licensed software'
+		fi
+		[ -x "$_ls/usr/local/bin/wtfbsd-installer" ] \
+			|| die "install-into-stage.sh left no launcher $_ls/usr/local/bin/wtfbsd-installer"
+		[ -x "$_ls$LIVE_APPLY" ] || die "install-into-stage.sh left no root helper $_ls$LIVE_APPLY"
+	fi
+	# 4. the live /etc: a copy of the stage's, with the live rc.d script
+	#    and rc.conf.d fragments, and the text installer on ttyu0
+	_lc="$_lw/live-conf"
+	cp -Rp "$_ls/etc" "$_lc/etc" || die "cannot copy $_ls/etc"
+	cp -Rp "$_le/." "$_lc/etc/" || die "cannot copy $_le"
+	subst_overlay "$_lc/etc" "$_le"
+	own_overlay "$_lc/etc" "$_le"
+	sed -E 's|^(ttyu0[[:space:]]+)"[^"]*"|\1"/usr/libexec/getty live.tui"|' "$_lc/etc/ttys" > "$_lc/ttys.new" \
+		&& cat "$_lc/ttys.new" > "$_lc/etc/ttys" && rm -f "$_lc/ttys.new" || die 'cannot write the live /etc/ttys'
+	grep -Eq '^ttyu0[[:space:]]+"/usr/libexec/getty live.tui"' "$_lc/etc/ttys" \
+		|| die 'the live /etc/ttys has no ttyu0 line to give the text installer'
+	printf '\n# live ISO only (build.sh [6b]): the text installer on the serial console\nlive.tui:\\\n\t:al=root:lo=/usr/local/libexec/%s/live-tui:tc=3wire:\n' \
+		"$DISTRO_SLUG" >> "$_lc/etc/gettytab" || die 'cannot write the live /etc/gettytab'
+	# the stage's fstab is the one of the raw image (a UFS root line):
+	# mkisoimages.sh writes the cd9660 line into the stage only while it
+	# packs the ISO, and mount -a would try to remount / from it
+	printf '/dev/iso9660/%s\t/\tcd9660\tro\t0\t0\n' "$VOL" > "$_lc/etc/fstab" \
+		|| die 'cannot write the live /etc/fstab'
+	mkdir -p "$_lc/home"
+	# 5. the archives rc.initdiskless unpacks, and the size of each
+	#    memory disk. The name must end in .cpio.gz for rc.initdiskless;
+	#    it unpacks them with tar(1), which reads either format.
+	mkdir -p "$_ls/conf/base" || die "cannot create $_ls/conf/base"
+	for _ld in etc var root home; do
+		mkdir -p "$_ls/conf/base/$_ld"
+		case $_ld in
+		etc | home) _lsrc=$_lc ;;
+		*) _lsrc=$_ls ;;
+		esac
+		case $_ld in
+		home) printf '1g\n' > "$_ls/conf/base/$_ld/md_size" ;;
+		*) live_md_size "$_lsrc/$_ld" > "$_ls/conf/base/$_ld/md_size" ;;
+		esac
+		(cd "$_lsrc" && tar -czf "$_ls/conf/base/$_ld.cpio.gz" "$_ld") \
+			|| die "cannot write $_ls/conf/base/$_ld.cpio.gz"
+	done
+	# 6. the mount point of /home and the switch for rc.initdiskless
+	[ -d "$_ls/home" ] || mkdir "$_ls/home" || die "cannot create $_ls/home"
+	: > "$_ls/etc/diskless" || die "cannot create $_ls/etc/diskless"
+	return 0
+}
+
+live_manifest() { # live_manifest <stage> <work dir> <install dir> <system KiB>
+	# what a copy install needs to copy the system from the ISO's root and
+	# leave the live layer behind: every path the layer added (the install
+	# directory itself among them), the originals of the files it replaced,
+	# the name of the root pool and the size of the system
+	_ms=$1 _mw=$2 _mi=$3
+	live_snapshot "$_ms" "$_mw/.live-mid"
+	LC_ALL=C comm -13 "$_mw/.live-before" "$_mw/.live-mid" > "$_mw/.live-paths" \
+		|| die 'cannot list the paths of the live layer'
+	# the install command reads the list with bsdtar -X, which matches a
+	# pattern at any component of a path ("./conf" drops every conf/ of
+	# the system) unless it starts with ^; the glob characters are escaped
+	sed -e 's/[][*?$\\]/\\&/g' -e 's/^/^/' "$_mw/.live-paths" > "$_mi/live-paths" \
+		|| die 'cannot anchor the paths of the live layer'
+	rm -f "$_mw/.live-mid" "$_mw/.live-paths"
+	mkdir -p "$_mi/orig" || die "cannot create $_mi/orig"
+	cp -Rp "$LIVE_BACKUP/." "$_mi/orig/" || die "cannot copy the originals to $_mi/orig"
+	# mkisoimages.sh writes the cd9660 root line into the stage's fstab
+	# while it packs the ISO: the installed system gets the image's own
+	mkdir -p "$_mi/orig/etc" && cp -p "$_ms/etc/fstab" "$_mi/orig/etc/fstab" \
+		|| die "cannot keep the fstab of the image"
+	printf '%s\n' "$ROOT_POOL" > "$_mi/system.pool"
+	printf '%s\n' "$4" > "$_mi/system.kb"
+}
+
+live_revert() { # live_revert <stage> <work dir> — take the live layer out again
+	_rs=$1 _rw=$2
+	[ -f "$_rw/.live-before" ] || die "live_revert: no snapshot $_rw/.live-before"
+	live_snapshot "$_rs" "$_rw/.live-after"
+	# the paths the layer added, the deepest first
+	LC_ALL=C comm -13 "$_rw/.live-before" "$_rw/.live-after" | LC_ALL=C sort -r > "$_rw/.live-new" \
+		|| die 'cannot compare the paths of the stage'
+	while IFS= read -r _rp; do
+		_rt="$_rs/${_rp#./}"
+		# a symlink the layer added is removed itself, never followed:
+		# only the directory it is in has to be in the stage
+		if [ -L "$_rt" ]; then
+			in_stage "$_rs" "$(dirname -- "$_rt")"
+		else
+			in_stage "$_rs" "$_rt"
+		fi
+		if [ -d "$_rt" ] && [ ! -L "$_rt" ]; then
+			rmdir -- "$_rt" || die "cannot remove $_rt"
+		else
+			rm -f -- "$_rt" || die "cannot remove $_rt"
+		fi
+	done < "$_rw/.live-new"
+	# the files it replaced come back
+	(cd "$LIVE_BACKUP" && find . -type f) | sed 's|^\./||' > "$_rw/.live-kept" || die "cannot list $LIVE_BACKUP"
+	while IFS= read -r _rf; do
+		in_stage "$_rs" "$_rs/$_rf"
+		cp -p "$LIVE_BACKUP/$_rf" "$_rs/$_rf" || die "cannot restore $_rs/$_rf"
+	done < "$_rw/.live-kept"
+	rmrf "$LIVE_BACKUP" "$OUT"
+	rmrf "$_rw/live-conf" "$OUT"
+	rm -f "$_rw/.live-before" "$_rw/.live-after" "$_rw/.live-new" "$_rw/.live-kept" "$_rw/.live-files"
+	return 0
+}
+
+artwork_pinned_sha() { # artwork_pinned_sha <pack name> — the pinned sha256, or nothing
+	case $1 in
+	examplebsd-5aaea01b0829-default) echo f0753807e81daacc3dc7b24995d49e74b1fd61152035115b37888fe814176a12 ;;
+	examplebsd-5aaea01b0829-cyberpunk) echo 3c0d23914d8282a0eed89eacb66e80b8b7dada84492d52cc2415e85621d4f470 ;;
+	esac
+}
+
+sha256_of() { # sha256_of <file>
+	if command -v sha256 > /dev/null 2>&1; then sha256 -q "$1"; else sha256sum "$1" | cut -d' ' -f1; fi
+}
+
+ART=''
+fetch_artwork() { # fetch_artwork — the pack into $OUT/artwork, checked; sets ART
+	_an="$DISTRO_SLUG-$(printf %s "$ARTWORK_REF" | cut -c1-12)-$ARTWORK_VARIANT"
+	_aw="$OUT/artwork"
+	rmrf "$_aw" "$OUT"
+	mkdir -p "$_aw" || die "cannot create $_aw"
+	_af="$_aw/$_an.tar.xz"
+	if [ -n "$ARTWORK_PACK" ]; then
+		cp "$ARTWORK_PACK" "$_af" || die "cannot copy the artwork pack $ARTWORK_PACK"
+	else
+		_au="$ARTWORK_URL/pack-$(printf %s "$ARTWORK_REF" | cut -c1-12)/$_an.tar.xz"
+		if command -v fetch > /dev/null 2>&1; then
+			fetch -q -o "$_af" "$_au" || die "fetch $_au failed"
+		else
+			curl -fsSL -o "$_af" "$_au" || die "curl $_au failed"
+		fi
+	fi
+	_want=${ARTWORK_SHA256:-$(artwork_pinned_sha "$_an")}
+	[ -n "$_want" ] || die "no sha256 for the artwork pack $_an: set ARTWORK_SHA256 (the pack's .sha256 file)"
+	_have=$(sha256_of "$_af")
+	[ "$_have" = "$_want" ] || die "the artwork pack $_an has sha256 $_have, not the pinned $_want: refusing it"
+	tar -xJf "$_af" -C "$_aw" || die "cannot unpack $_af"
+	ART="$_aw/$_an"
+	[ -f "$ART/branding/spots.tsv" ] && [ -d "$ART/out" ] || die "the artwork pack $_an has no branding/spots.tsv or out/"
+	grep -qx "name=$DISTRO_SLUG" "$ART/PACK" && grep -qx "variant=$ARTWORK_VARIANT" "$ART/PACK" \
+		|| die "the artwork pack $_an is not for $DISTRO_SLUG / $ARTWORK_VARIANT (its PACK file)"
+}
+
+spots_freebsd() { # spots_freebsd <spots.tsv> — "spot<TAB>supported|no" for every row
+	# the columns are read by the names of the header row; a missing
+	# column fails the build
+	awk -F '\t' '
+		NR == 1 {
+			for (i = 1; i <= NF; i++) col[$i] = i
+			if (!("spot" in col) || !("freebsd" in col) || !("rendered" in col)) {
+				print "MISSING-COLUMN"; exit 1
+			}
+			next
+		}
+		$0 == "" { next }
+		{
+			f = $(col["freebsd"])
+			ok = (f ~ /^n\/a/ || f ~ /^check/ || f == "" || f == "-") ? "no" : "supported"
+			print $(col["spot"]) "\t" ok
+		}' "$1"
+}
+
+stamp_identity() { # stamp_identity <stage> <in.png> <out.png> [bottom px]
+	set -- "$1" "$2" "$3" "${4:-0}"
+	_sf=''
+	# the font: the family of the palette when the build host has fontconfig,
+	# else the DejaVu Sans file of the stage itself
+	if ! command -v fc-match > /dev/null 2>&1 && [ -f "$1/usr/local/share/fonts/dejavu/DejaVuSans.ttf" ]; then
+		_sf="$1/usr/local/share/fonts/dejavu/DejaVuSans.ttf"
+	fi
+	mkdir -p "$(dirname -- "$3")"
+	if [ -n "$_sf" ]; then
+		sh "$ART/scripts/identity-stamp.sh" --palette "$ART/palette.env" --variant "$ARTWORK_VARIANT" \
+			--font "$_sf" --bottom "$4" "$1/usr/local/share/$DISTRO_SLUG/identity" "$2" "$3" > /dev/null
+	else
+		sh "$ART/scripts/identity-stamp.sh" --palette "$ART/palette.env" --variant "$ARTWORK_VARIANT" \
+			--bottom "$4" "$1/usr/local/share/$DISTRO_SLUG/identity" "$2" "$3" > /dev/null
+	fi || die "identity-stamp.sh $2 failed"
+}
+
+brand_identity() { # brand_identity <stage> — /usr/local/share/<slug>/identity
+	_bs=$1
+	_ver=${PRODUCT_VERSION:-$(date -u +%Y.%m)}
+	_build=''
+	[ -n "$PRODUCT_VERSION" ] || _build=$(date -u +%Y-%m-%d)
+	# the base: the release of the userland that was built (freebsd-version
+	# of the stage reads it from the built world, not from this host)
+	_rel=$(sh "$_bs/bin/freebsd-version" -u 2> /dev/null)
+	[ -n "$_rel" ] || die "cannot read the release of the stage ($_bs/bin/freebsd-version -u)"
+	_lab=$(printf '%s' "$ARTWORK_VARIANT" | awk '{ print toupper(substr($0, 1, 1)) substr($0, 2) }')
+	mkdir -p "$_bs/usr/local/share/$DISTRO_SLUG"
+	sh "$ART/scripts/identity-file.sh" --product "$DISTRO_NAME" --version "$_ver" --base "FreeBSD $_rel" \
+		--variant "$_lab" --arch "$DISTRO_ARCH" ${_build:+--build "$_build"} \
+		> "$_bs/usr/local/share/$DISTRO_SLUG/identity" || die 'identity-file.sh failed'
+}
+
+brand_spot() { # brand_spot <stage> <profile> <spot> — install one branding spot
+	_bs=$1 _bp=$2 _o="$ART/out" _sl=$DISTRO_SLUG
+	case $3 in
+	identity-file) brand_identity "$_bs" ;;
+	loader-brand)
+		mkdir -p "$_bs/boot/lua" "$_bs/boot/images"
+		cp "$_o/boot/freebsd/gfx-$_sl.lua" "$_bs/boot/lua/gfx-$_sl.lua" \
+			&& cp "$_o/loader/$_sl-brand.png" "$_bs/boot/images/$_sl-brand.png" || return 1
+		;;
+	loader-logo)
+		mkdir -p "$_bs/boot/images"
+		cp "$_o/loader/$_sl-logo.png" "$_bs/boot/images/$_sl-logo.png" || return 1
+		;;
+	loader-menu-title | boot-splash)
+		mkdir -p "$_bs/boot/loader.conf.d" "$_bs/boot/images"
+		cp "$_o/boot/freebsd/loader.conf.fragment" "$_bs/boot/loader.conf.d/$_sl-brand.conf" \
+			&& cp "$_o/loader/splash.png" "$_bs/boot/images/$_sl-splash.png" || return 1
+		;;
+	motd)
+		# the artwork's text, then the product's own line
+		{ cat "$_o/console/motd.template" && printf '%s\n' "$MOTD"; } > "$_bs/etc/motd.template" \
+			&& cp "$_bs/etc/motd.template" "$_bs/etc/motd" || return 1
+		;;
+	login-issue)
+		cp "$_o/console/issue" "$_bs/etc/issue" || return 1
+		_im=$(sed -n 's/^[[:space:]]*:im=\(.*\):$/\1/p' "$_o/console/gettytab.fragment" | head -n 1)
+		[ -n "$_im" ] || return 1
+		_im=$(printf '%s' "$_im" | sed -e 's/[\\&|]/\\&/g')
+		sed -e "/^default:/,/[^\\\\]\$/ s|:im=[^:]*:|:im=$_im:|" "$_bs/etc/gettytab" > "$_bs/etc/gettytab.new" \
+			&& cat "$_bs/etc/gettytab.new" > "$_bs/etc/gettytab" && rm -f "$_bs/etc/gettytab.new" || return 1
+		;;
+	lightdm-background)
+		[ "$_bp" = desktop ] || return 0
+		stamp_identity "$_bs" "$_o/lightdm/greeter-1920x1080.png" \
+			"$_bs/usr/local/share/$_sl/lightdm/greeter-1920x1080.png"
+		;;
+	lightdm-theme)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/etc/lightdm" "$_bs/usr/local/share/themes/$_sl-greeter/gtk-3.0"
+		cp "$_o/lightdm/lightdm-gtk-greeter.conf" "$_bs/usr/local/etc/lightdm/lightdm-gtk-greeter.conf" \
+			&& cp "$_o/lightdm/greeter-gtk.css" "$_bs/usr/local/share/themes/$_sl-greeter/gtk-3.0/gtk.css" || return 1
+		;;
+	xdm-logo)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/share/$_sl/dm/pixmaps"
+		cp "$_o/dm/pixmaps/"*.xpm "$_bs/usr/local/share/$_sl/dm/pixmaps/" || return 1
+		;;
+	xdm-colours)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/etc/X11/xdm"
+		cp "$_o/dm/xdm/Xresources" "$_o/dm/xdm/Xsetup_0" "$_bs/usr/local/etc/X11/xdm/" || return 1
+		;;
+	installer-header | installer-sidebar)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/share/$_sl/installer"
+		cp "$_o/installer/${3#installer-}.png" "$_bs/usr/local/share/$_sl/installer/" || return 1
+		;;
+	installer-palette)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/share/$_sl/xfce"
+		cp "$_o/xfce/gtk-colors.css" "$_bs/usr/local/share/$_sl/xfce/gtk-colors.css" || return 1
+		;;
+	installer-name)
+		# the installer takes its title from its installer.conf
+		# (PRODUCT_NAME); bsdinstall, which reads OSNAME, is not used
+		:
+		;;
+	wallpapers)
+		[ "$_bp" = desktop ] || return 0
+		for _w in "$_o/wallpapers/"wallpaper-*.png; do
+			# the stamp keeps the 30 px bottom panel clear
+			stamp_identity "$_bs" "$_w" "$_bs/usr/local/share/$_sl/wallpapers/${_w##*/}" 30
+		done
+		mkdir -p "$_bs/usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml"
+		# xfdesktop 4.20 keys the backdrop by the output's name; the scfb
+		# and vesa drivers call theirs "default", which the pack does not
+		# list: the first backdrop of the pack is given to it as well
+		awk '
+			/<property name="monitordefault"/ { have = 1 }
+			{ line[++n] = $0 }
+			!img && /name="last-image"/ { img = $0 }
+			!sty && /name="image-style"/ { sty = $0 }
+			END {
+				for (i = 1; i <= n; i++) {
+					print line[i]
+					if (!have && img != "" && line[i] ~ /<property name="screen0" type="empty">/) {
+						sub(/^[ \t]*/, "", img); sub(/^[ \t]*/, "", sty)
+						print "      <property name=\"monitordefault\" type=\"empty\">"
+						print "        <property name=\"workspace0\" type=\"empty\">"
+						print "          " img
+						if (sty != "") print "          " sty
+						print "        </property>"
+						print "      </property>"
+					}
+				}
+			}' "$_o/xfce/xfconf/xfce4-desktop.xml" > "$_bs/usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml" \
+			|| return 1
+		;;
+	icon-distributor | icon-menu | icon-installer)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/share/icons"
+		cp -R "$_o/icons/hicolor" "$_bs/usr/local/share/icons/" || return 1
+		;;
+	xfce-theme)
+		[ "$_bp" = desktop ] || return 0
+		mkdir -p "$_bs/usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml" "$_bs/usr/local/share/themes/$DISTRO_NAME/xfwm4"
+		cp "$_o/xfce/xfconf/xfce4-panel.xml" "$_o/xfce/xfconf/xsettings.xml" \
+			"$_bs/usr/local/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/" \
+			&& cp "$_o/xfce/xfwm4-themerc" "$_bs/usr/local/share/themes/$DISTRO_NAME/xfwm4/themerc" || return 1
+		;;
+	identity-line)
+		# drawn by lightdm-background and wallpapers (the stamp)
+		:
+		;;
+	*) return 2 ;;
+	esac
+}
+
+# slug_replace <from> <to> <in> <out> — copy <in> to <out>, with every
+# literal occurrence of <from> replaced by <to>. The two are strings, not
+# regular expressions: the name of a pack is data.
+slug_replace() { # slug_replace <from> <to> <in> <out>
+	[ -n "${1:-}" ] || die 'slug_replace: the string to replace is empty'
+	awk -v a="$1" -v b="$2" '
+		function rep(s,   i, out) {
+			out = ""
+			while ((i = index(s, a)) > 0) {
+				out = out substr(s, 1, i - 1) b
+				s = substr(s, i + length(a))
+			}
+			return out s
+		}
+		{ print rep($0) }
+	' "$3" > "$4" || die "cannot write $4"
+}
+
+# The wallpaper helper of the artwork pack: an autostart entry of the Xfce
+# session and the script it runs, which fills in the wallpaper on every
+# output that has none yet. The Xfce of FreeBSD reads its autostart entries
+# from /usr/local/etc/xdg/autostart. The paths are fixed:
+#   /usr/local/etc/xdg/autostart/<slug>-wallpaper.desktop       (0644)
+#   /usr/local/share/<slug>/xfce/session/<slug>-wallpaper.sh    (0755)
+# The Exec= line of the entry is written here, so it always names the
+# script that is installed, whatever the slug of the pack is.
+#
+# install_wallpaper <stage> <pack root> — the pack holds the two files as
+# out/xfce/autostart/<packslug>-wallpaper.desktop and
+# out/xfce/session/<packslug>-wallpaper.sh (<packslug>: name= of PACK).
+install_wallpaper() { # install_wallpaper <stage> <pack root>
+	_sw=$1
+	_sp=$2
+	_sl=$DISTRO_SLUG
+	[ -f "$_sp/PACK" ] || die "the artwork pack has no PACK file ($_sp)"
+	_ps=$(sed -n 's/^name=//p' "$_sp/PACK" | head -n 1)
+	chk '^[a-z0-9][a-z0-9-]*$' "$_ps" 'the name of the artwork pack is not a slug'
+	_sd="$_sp/out/xfce/autostart/$_ps-wallpaper.desktop"
+	_ss="$_sp/out/xfce/session/$_ps-wallpaper.sh"
+	_hd=no
+	if [ -e "$_sd" ] || [ -L "$_sd" ]; then _hd=yes; fi
+	_hs=no
+	if [ -e "$_ss" ] || [ -L "$_ss" ]; then _hs=yes; fi
+	# a pack of an older artwork template ships no helper
+	[ "$_hd$_hs" != nono ] || return 0
+	[ "$_hd" = yes ] || die "the artwork pack holds the session helper of the wallpaper but no autostart entry: ship both $_sd and $_ss, or neither"
+	[ "$_hs" = yes ] || die "the artwork pack holds the autostart entry of the wallpaper but no session helper: ship both $_sd and $_ss, or neither"
+	# a link in the pack can name a file outside the pack: refused, not
+	# followed, on every directory of the path inside the pack as well
+	for _wl in out out/xfce out/xfce/autostart out/xfce/session; do
+		[ ! -L "$_sp/$_wl" ] || die "the wallpaper helper of the pack is reached through a link ($_sp/$_wl)"
+	done
+	[ ! -L "$_sd" ] || die "the autostart entry of the wallpaper of the pack is a link ($_sd)"
+	[ ! -L "$_ss" ] || die "the session helper of the wallpaper of the pack is a link ($_ss)"
+	# a FIFO or a device would block or mislead the copy
+	[ -f "$_sd" ] || die "the autostart entry of the wallpaper of the pack is not a regular file ($_sd)"
+	[ -f "$_ss" ] || die "the session helper of the wallpaper of the pack is not a regular file ($_ss)"
+	_ddst="$_sw/usr/local/etc/xdg/autostart/$_sl-wallpaper.desktop"
+	_sdst="$_sw/usr/local/share/$_sl/xfce/session/$_sl-wallpaper.sh"
+	mkdir -p "$_sw/usr/local/etc/xdg/autostart" "$_sw/usr/local/share/$_sl/xfce/session" \
+		|| die 'cannot create the directories of the wallpaper helper'
+	slug_replace "$_ps" "$_sl" "$_sd" "$_ddst"
+	_exec="Exec=/bin/sh \"/usr/local/share/$_sl/xfce/session/$_sl-wallpaper.sh\""
+	awk -v e="$_exec" '
+		/^Exec=/ { if (!done) { print e; done = 1 } next }
+		{ print }
+		END { if (!done) print e }
+	' "$_ddst" > "$_ddst.new" && mv "$_ddst.new" "$_ddst" \
+		|| die 'cannot write the autostart entry of the wallpaper'
+	slug_replace "$_ps" "$_sl" "$_ss" "$_sdst"
+	chmod 0644 "$_ddst" && chmod 0755 "$_sdst" || die 'cannot set the modes of the wallpaper helper'
+}
+
+brand_stage() { # brand_stage <stage> <profile> — every spot the artwork marks supported on FreeBSD
+	_bt=$(spots_freebsd "$ART/branding/spots.tsv") || die "$ART/branding/spots.tsv: a column is missing (spot, freebsd, rendered)"
+	# the identity file first: the stamps read it
+	brand_spot "$1" "$2" identity-file
+	printf '%s\n' "$_bt" | while IFS="$(printf '\t')" read -r _spot _sup; do
+		[ "$_sup" = supported ] || continue
+		[ "$_spot" != identity-file ] || continue
+		_brc=0
+		brand_spot "$1" "$2" "$_spot" || _brc=$?
+		case $_brc in
+		0) ;;
+		2) die "the artwork marks the spot $_spot supported on FreeBSD and this template does not install it" ;;
+		*) die "installing the branding spot $_spot failed" ;;
+		esac
+	done || exit 1
+	# the desktop (and the live session built from its stage) fills in the
+	# wallpaper on every output with the pack's helper
+	[ "$2" != desktop ] || install_wallpaper "$1" "$ART"
+	if [ -x "$1/usr/local/bin/gtk-update-icon-cache" ] && [ -z "${PKG_ABI:-}" ]; then
+		chroot "$1" /usr/local/bin/gtk-update-icon-cache -q -f /usr/local/share/icons/hicolor \
+			|| die 'gtk-update-icon-cache in the stage failed'
+	fi
+}
+
 abspath() { # abspath <path> — the absolute form of a path, without creating it
 	case $1 in
 	/*) printf '%s\n' "$1" ;;
@@ -717,6 +1346,38 @@ desktop | both)
 	;;
 esac
 
+# the installer-template of the live desktop ISO is fetched before hours
+# of buildworld, so that a bad ref or a missing directory fails at once
+INST_TREE=''
+case $PROF in
+desktop | both)
+	if [ -n "$INSTALLER_DIR" ] || [ -n "$INSTALLER_REF" ]; then
+		INST_TREE="$OUT/installer-template"
+		if [ "$DRY" -eq 1 ]; then
+			if [ -n "$INSTALLER_DIR" ]; then
+				printf '    + cp -R %s %s\n' "$INSTALLER_DIR" "$INST_TREE"
+			else
+				printf '    + git clone %s %s; git checkout --detach %s\n' "$INSTALLER_URL" "$INST_TREE" "$INSTALLER_REF"
+			fi
+		else
+			fetch_installer "$INST_TREE"
+		fi
+	fi
+	;;
+esac
+
+# the artwork pack, fetched and checked before buildworld as well
+if [ "$ARTWORK_REF" != none ]; then
+	if [ "$DRY" -eq 1 ]; then
+		printf '    + artwork %s-%s-%s.tar.xz from %s (sha256 checked), unpacked into %s/artwork\n' \
+			"$DISTRO_SLUG" "$(printf %s "$ARTWORK_REF" | cut -c1-12)" "$ARTWORK_VARIANT" "${ARTWORK_PACK:-$ARTWORK_URL}" "$OUT"
+	else
+		command -v magick > /dev/null 2>&1 || command -v convert > /dev/null 2>&1 \
+			|| die 'the branding stamps the identity line with ImageMagick: pkg install ImageMagick7-nox11 (or ARTWORK_REF=none)'
+		fetch_artwork
+	fi
+fi
+
 # --------------------------------------------------------------------------
 # plan header
 # --------------------------------------------------------------------------
@@ -726,8 +1387,20 @@ log 'plan:'
 log "  distro   $DISTRO_NAME ($DISTRO_SLUG), freebsd/$DISTRO_ARCH"
 log "  rootfs   $FILESYSTEM_ROOT (pool: $ROOT_POOL, data pool: $ZDP${ZFS_POOL_NAME:+ ($ZFS_POOL_NAME)})"
 log "  profile  $PROF (package set: $PACKAGE_SET, installer: $INSTALLER)"
+if [ -n "$INSTALLER_DIR" ]; then
+	log "  live     installer-template from $INSTALLER_DIR"
+elif [ -n "$INSTALLER_REF" ]; then
+	log "  live     installer-template $INSTALLER_REF of $INSTALLER_URL"
+else
+	log '  live     no installer-template: the stand-in launcher (text installer in a terminal)'
+fi
 log "  src      $SRC (unmodified; SRCCONF=$SRCCONF)"
 log "  out      $OUT  (jobs: $JOBS, kernel: $KERNCONF, rootsize: $ROOTSIZE)"
+if [ "$ARTWORK_REF" = none ]; then
+	log '  artwork  none'
+else
+	log "  artwork  $ARTWORK_VARIANT of $ARTWORK_REF (version ${PRODUCT_VERSION:-the build year.month})"
+fi
 
 case $PROF in both) profiles='appliance desktop' ;; *) profiles=$PROF ;; esac
 
@@ -801,6 +1474,11 @@ for p in $profiles; do
 	# the fstab of a ZFS root: the header line the stock installer writes
 	# and nothing else (the root dataset is mounted by the loader)
 	FSTAB_ZFS=$(printf '# Device\tMountpoint\tFStype\tOptions\tDump\tPass#')
+	# the EFI system partition (makefs volume label EFISYS, step [6]) on
+	# /boot/efi, as the stock installer mounts it: the desktop then counts
+	# it as a system mount and shows no volume icon for it; failok keeps a
+	# disk without that label booting
+	FSTAB_ESP=$(printf '/dev/msdosfs/EFISYS\t/boot/efi\tmsdosfs\trw,failok\t2\t2')
 	if [ "$DRY" -eq 1 ]; then
 		case $FILESYSTEM_ROOT in
 		zfs)
@@ -809,6 +1487,7 @@ for p in $profiles; do
 			;;
 		*) printf '    + etc/fstab: /dev/ufs/%s-root / ufs rw 1 1\n' "$DISTRO_SLUG" ;;
 		esac
+		printf '    + etc/fstab: %s\n' "$FSTAB_ESP"
 	else
 		case $FILESYSTEM_ROOT in
 		zfs)
@@ -821,6 +1500,8 @@ for p in $profiles; do
 			printf '/dev/ufs/%s-root\t/\tufs\trw\t1\t1\n' "$DISTRO_SLUG" > "$STAGE/etc/fstab"
 			;;
 		esac
+		printf '%s\n' "$FSTAB_ESP" >> "$STAGE/etc/fstab"
+		mkdir -p "$STAGE/boot/efi"
 	fi
 
 	# 3b. stock distribution leaves root with an EMPTY password: lock it.
@@ -894,6 +1575,20 @@ for p in $profiles; do
 		pkg_triggers "$STAGE"
 		strip_xspice_conf "$STAGE"
 		prune_stage "$STAGE"
+	fi
+
+	# 4b. branding: every spot of the artwork pack that FreeBSD supports
+	# (branding/spots.tsv), the identity file, the identity line stamped
+	# on the greeter background and the wallpapers
+	if [ "$ARTWORK_REF" = none ]; then
+		log '  [4b] branding: none (ARTWORK_REF=none)'
+	else
+		log "  [4b] branding: $ARTWORK_VARIANT of the artwork $ARTWORK_REF"
+		if [ "$DRY" -eq 1 ]; then
+			printf '    + identity -> %s/usr/local/share/%s/identity; every spot of branding/spots.tsv supported on FreeBSD\n' "$STAGE" "$DISTRO_SLUG"
+		else
+			brand_stage "$STAGE" "$p"
+		fi
 	fi
 	rimg=${img#"$OUT"/}
 	riso=${iso#"$OUT"/}
@@ -979,22 +1674,54 @@ for p in $profiles; do
 	# hint. The raw image [6] was built from the stage BEFORE system.img
 	# was copied in, so the finished .img stays as small as possible.
 	imgdir="$STAGE/usr/local/share/$DISTRO_SLUG/install"
-	log '  [6b] stage system.img + motd hint (ISO only)'
-	if [ "$DRY" -eq 1 ]; then
-		printf '    + mkdir -p %s; xz -c %s > %s/system.img.xz\n' "$imgdir" "$img" "$imgdir"
-		printf '    + append "Install to disk: run %s-install as root" to %s/etc/motd\n' "$DISTRO_SLUG" "$STAGE"
-		printf '    + write %s/etc/rc.local (ISO only: run the installer on the console)\n' "$STAGE"
-		printf '    + (after the ISO) rm -rf %s; rm etc/rc.local; restore /etc/motd\n' "$imgdir"
+	if [ "$p" = desktop ]; then
+		log '  [6b] live layer + system.img + motd hint (ISO only)'
 	else
+		log '  [6b] stage system.img + motd hint (ISO only)'
+	fi
+	if [ "$DRY" -eq 1 ]; then
+		if [ "$p" = desktop ]; then
+			printf '    + live layer: list every path of %s (to take the layer out after the ISO)\n' "$STAGE"
+			printf '    + cp -Rp %s/overlay/live/rootfs/. %s/ (autologin of live, installer autostart, launcher, icon); keep the files it replaces\n' "$ROOT" "$STAGE"
+			printf '    + append to %s/usr/local/etc/doas.conf: permit nopass live as root cmd /usr/local/libexec/wtfbsd-installer/installer-apply\n' "$STAGE"
+			if [ -n "$INST_TREE" ]; then
+				printf '    + sh %s/install-into-stage.sh %s\n' "$INST_TREE" "$STAGE"
+			else
+				printf '    + no installer-template: the stand-in launcher /usr/local/bin/wtfbsd-installer (text installer in a terminal)\n'
+			fi
+			printf '    + live /etc = %s/etc + %s/overlay/live/etc (rc.d/live_session); ttyu0 -> getty live.tui (text installer)\n' "$STAGE" "$ROOT"
+			printf '    + %s/conf/base/{etc,var,root,home}.cpio.gz + md_size; touch %s/etc/diskless (rc.initdiskless: memory disks)\n' "$STAGE" "$STAGE"
+		fi
+		printf '    + mkdir -p %s; xz -c %s > %s/system.img.xz; echo %s > %s/system.fs\n' "$imgdir" "$img" "$imgdir" "$FILESYSTEM_ROOT" "$imgdir"
+		printf '    + append "Install to disk: run %s-install as root" to %s/etc/motd\n' "$DISTRO_SLUG" "$STAGE"
+		if [ "$p" = desktop ]; then
+			printf '    + (after the ISO) rm -rf %s; restore /etc/motd; take the live layer out (every path it added; the files it replaced come back)\n' "$imgdir"
+		else
+			printf '    + write %s/etc/rc.local (ISO only: run the installer on the console)\n' "$STAGE"
+			printf '    + (after the ISO) rm -rf %s; rm etc/rc.local; restore /etc/motd\n' "$imgdir"
+		fi
+	else
+		# the desktop ISO is a live system: the layer goes in first, so
+		# that its list of the stage's paths is the one of the raw image
+		if [ "$p" = desktop ]; then
+			# the size of the system, for the progress of a copy install
+			_syskb=$(du -sk "$STAGE" | awk '{ print $1 }')
+			live_stage "$STAGE" "$PSUB"
+		fi
 		mkdir -p "$imgdir"
 		# xz: ISO9660 cannot hold a file over 4 GiB and the raw image is
 		# mostly zeroes; the installer streams it back with xz -dc
 		xz -T0 -c "$img" > "$imgdir/system.img.xz"
+		# the file system of the image, for the install command's check of
+		# a disk plan (it is the plan's filesystem this release installs)
+		printf '%s\n' "$FILESYSTEM_ROOT" > "$imgdir/system.fs"
 		cp "$STAGE/etc/motd" "$PSUB/.motd.iso"
 		printf 'Install to disk: run %s-install as root.\n' "$DISTRO_SLUG" >> "$STAGE/etc/motd"
 		# root is locked, so the live ISO starts the installer itself on
-		# the console (like stock FreeBSD install media); ISO only
-		cat > "$STAGE/etc/rc.local" <<RCLOCAL
+		# the console (like stock FreeBSD install media); ISO only. The
+		# desktop ISO runs it on ttyu0 from getty instead (live layer):
+		# /etc/rc.local would hold the boot, and LightDM, until it ends.
+		[ "$p" = desktop ] || cat > "$STAGE/etc/rc.local" <<RCLOCAL
 #!/bin/sh
 # ISO only (written by build.sh [6b]): run the installer on the console.
 exec < /dev/console > /dev/console 2>&1
@@ -1009,6 +1736,9 @@ while :; do
 	esac
 done
 RCLOCAL
+		if [ "$p" = desktop ]; then
+			live_manifest "$STAGE" "$PSUB" "$imgdir" "$_syskb"
+		fi
 	fi
 
 	# 7. ISO with the stock release script
@@ -1021,6 +1751,9 @@ RCLOCAL
 		rmrf "$imgdir" "$OUT"
 		rm -f "$STAGE/etc/rc.local"
 		mv "$PSUB/.motd.iso" "$STAGE/etc/motd"
+		if [ "$p" = desktop ]; then
+			live_revert "$STAGE" "$PSUB"
+		fi
 	fi
 
 	log "profile done: $p (kernel $KERNCONF, root $FILESYSTEM_ROOT)"

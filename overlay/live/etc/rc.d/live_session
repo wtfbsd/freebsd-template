@@ -1,0 +1,127 @@
+#!/bin/sh
+#
+# live_session — the user of the live desktop on the install ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Live ISO only (build.sh puts it into the ISO's /etc archive, never into
+# the raw image that is installed). /etc and /home are memory disks there
+# (rc.initdiskless, see build.sh), so the user is made on every boot of the
+# media:
+#
+#   * the user "live" with the first free uid from 1100, no password,
+#     a home under /home and no group beyond its own (and video, when the
+#     group exists, for the GPU devices)
+#   * the installer's autostart entry in its ~/.config/autostart, so the
+#     installer opens first in its session, and the "Install" icon on its
+#     desktop (both from the installer-template's install-into-stage.sh,
+#     or the stand-in of the live layer)
+#
+# It also names the device the live system was started from in
+# /var/run/wtfbsd-live-medium (root's, 0644, one line), which the installer
+# never offers as a target: the device of the root (mount -p, the cd9660
+# label of the ISO), else vfs.root.mountfrom.
+#
+# LightDM logs it in (lightdm.conf.d, live ISO only). It is not in wheel:
+# the installer's front ends run as this user, and doas.conf on the ISO
+# lets it run one command as root, the installer's GTK-free helper
+# /usr/local/libexec/wtfbsd-installer/installer-apply.
+
+# PROVIDE: live_session
+# REQUIRE: FILESYSTEMS
+# BEFORE: LOGIN
+# KEYWORD: nojail
+
+. /etc/rc.subr
+
+name=live_session
+rcvar=live_session_enable
+start_cmd=live_session_start
+stop_cmd=:
+
+load_rc_config "$name"
+
+: ${live_session_enable:="NO"}
+: ${live_session_user:="live"}
+: ${live_session_uid_min:="1100"}
+: ${live_session_autostart:="/usr/local/share/wtfbsd-installer/autostart/wtfbsd-installer.desktop"}
+: ${live_session_root:=""}  # the test suite points it at a directory of its own
+: ${live_session_medium_file:="/var/run/wtfbsd-live-medium"}
+: ${live_session_icon:="/usr/local/share/wtfbsd-installer/desktop/wtfbsd-installer.desktop"}
+
+note() { # note <msg> — to the console and to syslog
+	echo "live_session: $*"
+	logger -t live_session "$*"
+}
+
+live_medium_write() { # live_medium_write — the device the live system started from
+	local _dev _tmp
+	_dev=$(mount -p | awk '$2 == "/" { print $1; exit }')
+	case $_dev in
+	/dev/?*) ;;
+	*)
+		_dev=$(sysctl -n vfs.root.mountfrom 2> /dev/null)
+		_dev=${_dev#*:}
+		;;
+	esac
+	if ! printf '%s\n' "$_dev" | grep -Eq '^/dev/[A-Za-z0-9][A-Za-z0-9._/-]{0,123}$' || \
+		printf '%s' "$_dev" | grep -q '\.\.'; then
+		note "cannot tell the live medium (root device: ${_dev:-none})"
+		return 1
+	fi
+	_tmp="$live_session_medium_file.$$"
+	rm -f "$live_session_medium_file" "$_tmp"
+	(umask 022 && printf '%s\n' "$_dev" > "$_tmp") && chmod 644 "$_tmp" \
+		&& mv -f "$_tmp" "$live_session_medium_file" || {
+		note "cannot write $live_session_medium_file"
+		return 1
+	}
+	note "live medium: $_dev"
+}
+
+live_session_start() {
+	local _u _uid _home _g
+	live_medium_write || :
+	_u=$live_session_user
+	if ! [ -w "$live_session_root/etc" ]; then
+		note '/etc is read-only (the live /etc memory disk is missing): no live user'
+		return 1
+	fi
+	if ! pw usershow -n "$_u" > /dev/null 2>&1; then
+		_uid=$live_session_uid_min
+		while pw usershow -u "$_uid" > /dev/null 2>&1 || pw groupshow -g "$_uid" > /dev/null 2>&1; do
+			_uid=$((_uid + 1))
+		done
+		set -- -n "$_u" -u "$_uid" -c 'Live session' -m -s /bin/sh -w none
+		if pw groupshow -n video > /dev/null 2>&1; then
+			set -- "$@" -G video
+		fi
+		if ! pw useradd "$@"; then
+			note "pw useradd $_u failed"
+			return 1
+		fi
+		note "created the live user $_u (uid $_uid, no password)"
+	fi
+	_home=$(pw usershow -n "$_u" | awk -F: '{ print $9 }')
+	case $_home in /home/*) ;; *) note "unexpected home of $_u: $_home"; return 1 ;; esac
+	_g=$(id -g "$_u")
+	_home=$live_session_root$_home
+	if [ -f "$live_session_autostart" ]; then
+		mkdir -p "$_home/.config/autostart" \
+			&& cp "$live_session_autostart" "$_home/.config/autostart/" \
+			&& chown -R "$_u:$_g" "$_home/.config" \
+			|| note "could not put the installer into the autostart of $_u"
+	else
+		note "no $live_session_autostart: the installer does not open by itself"
+	fi
+	if [ -f "$live_session_icon" ]; then
+		mkdir -p "$_home/Desktop" \
+			&& cp "$live_session_icon" "$_home/Desktop/" \
+			&& chmod 755 "$_home/Desktop/${live_session_icon##*/}" \
+			&& chown -R "$_u:$_g" "$_home/Desktop" \
+			|| note "could not put the install icon on the desktop of $_u"
+	fi
+	return 0
+}
+
+run_rc_command "$1"

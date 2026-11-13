@@ -3,14 +3,51 @@
 #
 # Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
 #
-# Logs its arguments to $STUB_LOG. Without arguments it prints the
-# mount table of the live system (the root of the live image is a ramfs,
-# not a device under /dev, so the table has no entry for "/").
+# Logs its arguments to $STUB_LOG. With -p it prints the mount table of
+# the live system in the fstab(5) form ("device mountpoint type options
+# 0 0"); without arguments in the form of mount(8) itself ("device on
+# mountpoint (type, options)"). The root line comes from $STUB_MOUNT_ROOT
+# in the -p form (for example the cd9660 root of the live ISO); without
+# it the table has no entry for "/" (a ramfs root, not a device under
+# /dev).
 
 printf 'mount %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 
-if [ $# -eq 0 ]; then
-	printf 'devfs /dev devfs rw 0 0\n'
-	printf 'tmpfs /tmp tmpfs rw 0 0\n'
+# With $STUB_GEOM (the device directory of the run, see the gpart stub) a
+# mount is remembered in $STUB_GEOM/.mounts ("device dir type options
+# partition", the partition behind a GPT label or the device itself) and
+# shows in the table; the umount stub takes it out again.
+if [ -n "${STUB_GEOM:-}" ] && [ $# -ge 2 ] && [ "$1" != -p ]; then
+	_t=ufs
+	_o=rw
+	while [ $# -gt 2 ]; do
+		case $1 in
+		-t) _t=$2; shift ;;
+		-o) _o=$2; shift ;;
+		esac
+		shift
+	done
+	_p=${1#/dev/}
+	case $_p in
+	gpt/*) [ -f "$STUB_GEOM/.labels/${_p#gpt/}" ] && _p=$(cat "$STUB_GEOM/.labels/${_p#gpt/}") ;;
+	esac
+	printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$_t" "$_o" "$_p" >> "$STUB_GEOM/.mounts"
+	exit 0
+fi
+
+_table() {
+	if [ -n "${STUB_MOUNT_ROOT:-}" ]; then
+		printf '%s\n' "$STUB_MOUNT_ROOT"
+	fi
+	printf 'devfs\t/dev\tdevfs\trw\t0\t0\n'
+	if [ -n "${STUB_GEOM:-}" ] && [ -f "$STUB_GEOM/.mounts" ]; then
+		awk -F '\t' '{ printf "%s\t%s\t%s\t%s\t0\t0\n", $1, $2, $3, $4 }' "$STUB_GEOM/.mounts"
+	fi
+	printf 'tmpfs\t/tmp\ttmpfs\trw\t0\t0\n'
+}
+if [ "$*" = -p ]; then
+	_table
+elif [ $# -eq 0 ]; then
+	_table | awk '{ printf "%s on %s (%s, %s)\n", $1, $2, $3, $4 }'
 fi
 exit 0

@@ -1,0 +1,26 @@
+#!/bin/sh
+# glabel — test stub for glabel(8).
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Logs its arguments to $STUB_LOG. `glabel status -s` prints the table
+# in $STUB_GLABEL ("name state component" lines), empty without it, and
+# with $STUB_GEOM the GPT labels of the run (see the gpart stub).
+
+printf 'glabel %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+
+case "$*" in
+'status -s')
+	if [ -n "${STUB_GLABEL:-}" ]; then
+		printf '%s\n' "$STUB_GLABEL"
+	fi
+	# with $STUB_GEOM: the GPT labels the gpart stub made (or a test seeded)
+	if [ -n "${STUB_GEOM:-}" ]; then
+		for _l in "$STUB_GEOM"/.labels/*; do
+			[ -f "$_l" ] || continue
+			printf 'gpt/%s  N/A  %s\n' "${_l##*/}" "$(cat "$_l")"
+		done
+	fi
+	;;
+esac
+exit 0

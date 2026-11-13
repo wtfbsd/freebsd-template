@@ -44,3 +44,15 @@ xfce
 lightdm
 lightdm-gtk-greeter
 dbus
+# The live ISO's installer: the graphical one is GTK 3 through PyGObject
+# (installer-template; python3 is the interpreter its scripts name, xhost
+# lets it draw as root on the live user's display); xterm runs the text
+# installer on the display when the graphical one is not there.
+python3
+xhost
+py312-pygobject
+gtk3
+xterm
+# Colour emoji (the language flags of the installer, emoji in the desktop):
+# Noto Color Emoji, SIL Open Font License 1.1 (redistributable with notice)
+noto-emoji

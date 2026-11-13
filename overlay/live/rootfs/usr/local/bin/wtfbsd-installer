@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# wtfbsd-installer — the stand-in installer launcher of the live ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Live ISO only. When the image is built with the installer-template
+# (INSTALLER_REF or INSTALLER_DIR in product.conf), its install-into-stage.sh
+# replaces this file with the graphical installer's launcher. Without it,
+# this stand-in opens a full screen terminal on the display (or uses the
+# terminal it was started from). Closing the terminal leaves the live
+# desktop; the "Install @DISTRO_NAME@" icon opens it again.
+#
+# It runs as the live user, and so does the terminal: the only command the
+# live user may run as root (doas.conf of the ISO) is the helper below,
+# which here is the text installer.
+
+apply=/usr/local/libexec/wtfbsd-installer/installer-apply
+if [ -n "${DISPLAY:-}" ] && command -v xterm > /dev/null 2>&1; then
+	exec xterm -fullscreen -title 'Install @DISTRO_NAME@' -e /bin/sh -c \
+		"doas $apply; printf '\nPress Return to close this window. '; read _a"
+fi
+exec doas "$apply"

@@ -1,0 +1,9 @@
+# rc.conf.d/firstboot_user — off on the live ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# The live /etc is a writable memory disk, and the /firstboot sentinel of
+# the image is on the ISO: without this the first-boot provisioning would
+# run on every boot of the live media. The installed system has its own
+# rc.conf.d/firstboot_user (overlay/base), which turns it on. Live ISO only.
+firstboot_user_enable="NO"

@@ -1,0 +1,7 @@
+# rc.conf.d/live_session — the live session of the install ISO.
+#
+# Copyright (c) 2026 The wtfbsd contributors. BSD-2-Clause (see LICENSE).
+#
+# Only on the live ISO: build.sh puts the live layer (overlay/live) into
+# the ISO's /etc archive, never into the raw image that is installed.
+live_session_enable="YES"
