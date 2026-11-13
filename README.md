@@ -48,22 +48,28 @@ the live medium onto the new pool (FreeBSD 16.0-CURRENT).
 
 ![The ExampleBSD installer copying the system on FreeBSD 16.0-CURRENT](docs/screenshots/06-installing.png)
 
-**7. The first boot of the installed system**: the loader asks for the
+**7. Finished**: the system is installed; the installer asks to remove
+the medium and reboot, or to stay in the live system (FreeBSD
+16.0-CURRENT, 1024x768).
+
+![The ExampleBSD installer finished page on FreeBSD 16.0-CURRENT](docs/screenshots/07-finished.png)
+
+**8. The first boot of the installed system**: the loader asks for the
 GELI passphrase, once for both disks (FreeBSD 16.0-CURRENT).
 
-![The GELI passphrase prompt of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/07-geli-prompt.png)
+![The GELI passphrase prompt of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/08-geli-prompt.png)
 
-**8. The login screen**: the product's greeter, no autologin, no live user;
+**9. The login screen**: the product's greeter, no autologin, no live user;
 the full name comes from the installer (installed ExampleBSD on FreeBSD
 16.0-CURRENT).
 
-![The LightDM login screen of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/08-login-screen.png)
+![The LightDM login screen of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/09-login-screen.png)
 
-**9. The user's Xfce desktop** after the login, with the product's
-wallpaper and no volume icon for the EFI partitions (installed ExampleBSD on
-FreeBSD 16.0-CURRENT).
+**10. The user's Xfce desktop** after the login, with the product's
+wallpaper, no volume icon for the EFI partitions and an address by DHCP from
+the first boot (installed ExampleBSD on FreeBSD 16.0-CURRENT, 1024x768).
 
-![The Xfce desktop of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/09-user-desktop.png)
+![The Xfce desktop of the installed ExampleBSD on FreeBSD 16.0-CURRENT](docs/screenshots/10-user-desktop.png)
 
 ## Layout
 
