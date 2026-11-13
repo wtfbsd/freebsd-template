@@ -1321,9 +1321,16 @@ freebsd-ufs)
 	ftype=ufs
 	;;
 freebsd-zfs)
-	pool=$(zpool import -d "/dev/${disk}p${lastidx}" 2>/dev/null | awk '/pool:/ { print $2 }')
+	# the pool of the partition just written is imported from that
+	# partition and by its id: by name, ZFS takes any pool of that name,
+	# and another disk can hold one (an earlier install of the same
+	# product); the new disk is then not in the imported pool
+	_zt=$(zpool import -d "/dev/${disk}p${lastidx}" 2>/dev/null)
+	pool=$(printf '%s\n' "$_zt" | awk '$1 == "pool:" { print $2; exit }')
+	_zid=$(printf '%s\n' "$_zt" | awk '$1 == "id:" { print $2; exit }')
 	[ -n "$pool" ] || die 'zpool import: could not read the pool name'
-	zpool import -f -N -R "$mnt" "$pool" || die "zpool import $pool failed"
+	case $_zid in '' | *[!0-9]*) die "zpool import: could not read the id of the pool $pool" ;; esac
+	zpool import -d "/dev/${disk}p${lastidx}" -f -N -R "$mnt" "$_zid" || die "zpool import $pool ($_zid) failed"
 	own_add pool "$pool"
 	zpool online -e "$pool" "/dev/${disk}p${lastidx}" || die "zpool online -e $pool failed"
 	# the root dataset of the pool keeps its own mountpoint (/<pool>),

@@ -95,12 +95,45 @@ if [ -n "${STUB_GEOM:-}" ]; then
 		exit 0
 		;;
 	import)
-		if [ "$2" != '-d' ]; then
-			for _a in "$@"; do _want=$_a; done
+		# the import of one pool (the last argument): with -d <device> the
+		# pool is the one on that device, and that is the device it keeps.
+		# Without -d, ZFS takes any pool of that name on the system: with
+		# $STUB_ZPOOL_SAMENAME another disk holds one, and it is that one.
+		_dev=''
+		_prev=''
+		for _a in "$@"; do
+			[ "$_prev" = '-d' ] && _dev=$_a
+			_prev=$_a
+			_want=$_a
+		done
+		case $_want in -* | import | "$_dev") _want='' ;; esac
+		if [ -n "$_want" ]; then
+			# a pool named by its id is the pool of the import table
+			case $_want in 1234567890123456789) _want=examplebsd_root ;; esac
 			mkdir -p "$_G/.pools"
-			printf '/dev/vtbd0p3 vtbd0p3\n' > "$_G/.pools/$_want"
+			if [ -n "$_dev" ]; then
+				printf '%s %s\n' "$_dev" "${_dev#/dev/}" > "$_G/.pools/$_want"
+			elif [ -n "${STUB_ZPOOL_SAMENAME:-}" ]; then
+				printf '/dev/ada9p4 ada9p4\n' > "$_G/.pools/$_want"
+			else
+				printf '/dev/vtbd0p3 vtbd0p3\n' > "$_G/.pools/$_want"
+			fi
 			exit 0
 		fi
+		;;
+	online)
+		# online -e <pool> <device>: the device must be a vdev of that pool
+		for _a in "$@"; do _want=$_a; done
+		_pool=''
+		for _a in "$@"; do
+			case $_a in online | -e | "$_want") ;; *) _pool=$_a ;; esac
+		done
+		[ -f "$_G/.pools/$_pool" ] || { echo "cannot open '$_pool': no such pool" >&2; exit 1; }
+		if ! awk -v d="$_want" '$1 == d { f = 1 } END { exit !f }' "$_G/.pools/$_pool"; then
+			echo "cannot expand $_want: couldn't find device \"$_want\" in pool \"$_pool\"" >&2
+			exit 1
+		fi
+		exit 0
 		;;
 	esac
 fi
@@ -110,6 +143,7 @@ import)
 	if [ "$2" = '-d' ]; then
 		cat <<'TABLE'
    pool: examplebsd_root
+     id: 1234567890123456789
      state: ONLINE
     status: One or more devices could not be opened.
     action: Attach the missing device and online it.

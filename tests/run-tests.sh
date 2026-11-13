@@ -5293,5 +5293,21 @@ tmp"
 	IR_SRCROOT=''
 fi
 # ---- end of (k9) ----
+# ------------------------------------------------------------------
+# the image install imports the pool of the disk it just wrote: from that
+# device, by the id the import table gives, never by name, because another
+# disk may hold a pool of the same name (an earlier install). Imported by
+# name, ZFS takes that one, and zpool online -e of the new disk fails.
+# ------------------------------------------------------------------
+STUB_ZPOOL_SAMENAME=1 irun samename "$INSTDIR/mnt-samename" -y -u ciuser -k "$work/inst.pub"
+if [ "$_ir_rc" -eq 0 ] && grep -q '^zpool import .*-d /dev/vtbd0p3 .*1234567890123456789' "$INSTDIR/samename.log" &&
+	! grep -Eq '^zpool import -f -N -R [^ ]+ examplebsd_root *$' "$INSTDIR/samename.log" &&
+	grep -q '^zpool online -e examplebsd_root /dev/vtbd0p3' "$INSTDIR/samename.log"; then
+	ok "installer (image): the new pool is imported from its device by id, not by a name another disk may share"
+else
+	no "installer (image): the new pool is imported from its device by id, not by a name another disk may share (rc=$_ir_rc)"
+	grep '^zpool' "$INSTDIR/samename.log" 2> /dev/null | sed 's/^/      | /' | head -6
+	tail -2 "$INSTDIR/samename.out" 2> /dev/null | sed 's/^/      | /'
+fi
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
